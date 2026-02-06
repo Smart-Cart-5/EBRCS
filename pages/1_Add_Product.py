@@ -1,4 +1,5 @@
 import os
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 
 import faiss
@@ -11,6 +12,7 @@ from PIL import Image
 from torch.nn import functional as F
 from transformers import AutoImageProcessor, AutoModel, CLIPModel, CLIPProcessor
 
+from ui_theme import apply_theme
 
 DATA_DIR = "data"
 EMBEDDINGS_PATH = os.path.join(DATA_DIR, "embeddings.npy")
@@ -26,6 +28,8 @@ CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 
 DINO_WEIGHT = 0.7
 CLIP_WEIGHT = 0.3
+
+apply_theme(page_title="상품 등록", page_icon="🧩", current_nav="🏠 홈")
 
 
 def get_hf_token():
@@ -199,10 +203,12 @@ def build_or_load_index(weighted_db: np.ndarray) -> faiss.IndexFlatIP:
         index = faiss.read_index(FAISS_INDEX_PATH)
         if index.d == dim and index.ntotal == weighted_db.shape[0]:
             return index
+
     index = faiss.IndexFlatIP(dim)
     if weighted_db.shape[0] > 0:
         index.add(weighted_db)
     faiss.write_index(index, FAISS_INDEX_PATH)
+
     return index
 
 
@@ -222,96 +228,48 @@ def get_weighted_db(embeddings, dino_dim, clip_dim):
     return weighted
 
 
-st.set_page_config(page_title="상품 등록")
-
 st.markdown(
     """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;600;700&display=swap');
-
-html, body, [class*="css"]  {
-  font-family: 'Noto Sans KR', sans-serif;
-}
-
-.stApp {
-  background: #f7f8fb;
-}
-
-.page-title {
-  font-size: 30px;
-  font-weight: 700;
-  color: #111827;
-  margin-bottom: 8px;
-}
-
-.page-subtitle {
-  color: #6b7280;
-  margin-bottom: 20px;
-}
-
-.card {
-  background: #ffffff;
-  border-radius: 18px;
-  padding: 18px 20px;
-  border: 1px solid #eef0f4;
-  box-shadow: 0 10px 22px rgba(15, 23, 42, 0.08);
-}
-
-.card-title {
-  font-size: 18px;
-  font-weight: 700;
-  margin-bottom: 10px;
-  color: #111827;
-}
-
-.badge {
-  display: inline-block;
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: #fff4e6;
-  color: #c2410c;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  border-radius: 999px;
-  background: #fff1e7;
-  color: #b45309;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.soft-line {
-  height: 1px;
-  background: #f0f2f7;
-  margin: 12px 0;
-}
-</style>
-""",
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px;">
+      <div>
+        <h1 class="page-title">관리자 상품 등록</h1>
+        <p class="subtitle-text">상품명과 이미지(1~3장)를 업로드하면 임베딩 DB와 인덱스가 자동 갱신됩니다.</p>
+      </div>
+      <span class="pill-badge" style="background:#FFF1E7; color:#EA580C;">Admin</span>
+    </div>
+    """,
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="page-title">상품 등록</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="page-subtitle">상품명을 입력하고 이미지를 등록하면 인식 DB에 반영됩니다.</div>',
-    unsafe_allow_html=True,
-)
+if st.button("홈으로 돌아가기", key="add_back_home"):
+    st.switch_page("app.py")
+
+loading_placeholder = st.empty()
+with loading_placeholder.container():
+    st.markdown(
+        """
+        <div class="soft-card" style="max-width:620px; margin:0 auto 14px auto; text-align:center;">
+          <div style="font-size:56px; color:#FF8A65; margin-bottom:4px;">◌</div>
+          <div class="card-title" style="font-size:24px; margin-bottom:4px;">상품 등록 모델 로딩 중...</div>
+          <div class="card-subtitle">잠시만 기다려 주세요</div>
+          <div style="height:10px; border-radius:999px; background:linear-gradient(135deg,#FFB74D,#FF8A65); margin-top:16px;"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 model_bundle = load_models()
+loading_placeholder.empty()
 
-with st.sidebar:
-    st.markdown("### 모델 상태")
+status_col1, status_col2 = st.columns(2, gap="large")
+with status_col1:
     if model_bundle["lora_loaded"]:
-        st.success("DINO LoRA 로드 완료")
+        st.success("모델 상태: DINO LoRA 로드 완료")
     else:
-        st.warning("DINO LoRA 로드 실패 (베이스 모델 사용)")
+        warning_message = "모델 상태: DINO 베이스 모델 사용"
         if model_bundle["lora_error"]:
-            st.caption(model_bundle["lora_error"])
+            warning_message += f" · LoRA 로드 실패({model_bundle['lora_error']})"
+        st.warning(warning_message)
 
 embeddings_mtime = os.path.getmtime(EMBEDDINGS_PATH) if os.path.exists(EMBEDDINGS_PATH) else 0
 labels_mtime = os.path.getmtime(LABELS_PATH) if os.path.exists(LABELS_PATH) else 0
@@ -328,44 +286,19 @@ except Exception as exc:
     st.stop()
 
 unique_labels, counts = np.unique(labels, return_counts=True) if len(labels) else ([], [])
+with status_col2:
+    st.info(f"DB 상태: {len(unique_labels)}개 상품 · {len(labels)}개 이미지")
+
 existing_df = pd.DataFrame({"상품명": unique_labels, "등록 이미지 수": counts})
-
-col_left, col_right = st.columns([1, 1.4], gap="large")
-
-with col_left:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="card-title">상품 등록</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="pill">권장: 동일 상품 2~3장 업로드</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown('<div class="soft-line"></div>', unsafe_allow_html=True)
-
-    with st.form("add_product_form"):
-        new_name = st.text_input("상품명")
-        new_images = st.file_uploader(
-            "상품 이미지 업로드 (1~3장)",
-            accept_multiple_files=True,
-            type=["jpg", "png", "jpeg"],
-        )
-        submitted = st.form_submit_button("상품 등록")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with col_right:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="card-title">등록된 상품</div>', unsafe_allow_html=True)
-    st.markdown(
-        f'<span class="badge">총 {len(unique_labels)}개 상품 · {len(labels)}개 이미지</span>',
-        unsafe_allow_html=True,
-    )
-    st.markdown('<div class="soft-line"></div>', unsafe_allow_html=True)
-    st.dataframe(existing_df, use_container_width=True, height=420)
-    st.markdown('</div>', unsafe_allow_html=True)
 
 
 def add_product(name, images):
     if not name or not images:
         st.warning("상품명과 이미지를 입력해주세요.")
+        return
+
+    if len(images) < 1 or len(images) > 3:
+        st.warning("이미지는 1~3장만 업로드해주세요.")
         return
 
     new_raw = []
@@ -385,6 +318,7 @@ def add_product(name, images):
         updated_embeddings = new_raw
     else:
         updated_embeddings = np.vstack([raw_embeddings, new_raw])
+
     if labels.shape[0] == 0:
         updated_labels = new_labels
     else:
@@ -429,5 +363,45 @@ def add_product(name, images):
     st.rerun()
 
 
-if 'submitted' in locals() and submitted:
+col_left, col_right = st.columns([1, 1.45], gap="large")
+
+with col_left:
+    st.markdown(
+        """
+        <div class="soft-card card-hover">
+          <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px;">
+            <div class="icon-square" style="background:linear-gradient(135deg,#FFB74D,#FF8A65);">📦</div>
+            <h3 class="card-title">상품 등록</h3>
+          </div>
+          <p class="card-subtitle" style="margin-bottom:12px;">권장: 동일 상품 2~3장 업로드</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.form("add_product_form"):
+        new_name = st.text_input("상품명", placeholder="예: 사과")
+        new_images = st.file_uploader(
+            "상품 이미지 업로드 (1~3장)",
+            accept_multiple_files=True,
+            type=["jpg", "png", "jpeg"],
+        )
+        submitted = st.form_submit_button("상품 등록", type="primary")
+
+with col_right:
+    st.markdown(
+        f"""
+        <div class="soft-card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <h3 class="card-title">등록된 상품</h3>
+            <span class="pill-badge" style="background:#FFF1E7; color:#EA580C;">총 {len(unique_labels)}개</span>
+          </div>
+          <p class="card-subtitle" style="margin-bottom:10px;">현재까지 등록된 총 이미지 수: {len(labels)}개</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.dataframe(existing_df, use_container_width=True, height=460)
+
+if submitted:
     add_product(new_name, new_images)
