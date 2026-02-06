@@ -1,6 +1,0 @@
-sku,name,category,price,image_path
-10001,Bottle,Household,100.0,data\product_images\10001_8ab399e2-771c-4a46-b980-a6324cf92d4b.jpg
-10002,Bag,travelling,2000.0,data\product_images\10002_562b4ef1-c36d-40d9-90b4-0c2c04f952f0.jpg
-10003,Book,Stationary,50.0,data\product_images\10003_504f821f-fd5d-4e03-a894-c1e2acd5bc62.jpg
-10004,Chings Noodles,Food,150.0,data\product_images\10004_041e61e8-7107-4be2-b621-95dfc8e10c53.jpg
-10005,Mouse,Electronic,700.0,data\product_images\10005_48a217bf-6031-48b3-b553-a9b460f40673.jpg

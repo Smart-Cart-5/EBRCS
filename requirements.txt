@@ -1,7 +1,12 @@
 streamlit
+streamlit-drawable-canvas
 numpy
 pandas
 opencv-python-headless
 transformers
+torch
 Pillow
+peft
+safetensors
+faiss-cpu
 pyarrow

@@ -1,23 +1,23 @@
 import streamlit as st
 
 st.set_page_config(
-    page_title="Zero-Shot Retail Checkout System",
+    page_title="임베딩 기반 리테일 체크아웃 시스템",
     page_icon="🛒",
 )
 
-st.title("Welcome to the Zero-Shot Retail Checkout System")
+st.title("임베딩 기반 리테일 체크아웃 시스템")
 
-st.sidebar.success("Select a page above.")
+st.sidebar.success("좌측 메뉴에서 페이지를 선택하세요.")
 
 st.markdown(
     """
-    This application provides a complete system for a zero-shot retail checkout experience. 
+    이 애플리케이션은 임베딩 기반 리테일 체크아웃 시스템을 제공합니다.
     
-    **👈 Select a page from the sidebar** to get started.
+    **👈 좌측 사이드바에서 페이지를 선택**해서 시작하세요.
     
-    ### Pages:
-    - **Add Product**: Onboard new products into the system by providing details and uploading images.
-    - **Checkout**: Use your webcam to scan and identify products for billing.
-    - **Validate Bill**: Review the items in your cart and see the final bill.
+    ### 페이지:
+    - **Add Product**: 상품명과 이미지를 업로드해 인식 DB에 등록합니다.
+    - **Checkout**: 웹캠으로 상품을 인식해 수량을 집계합니다.
+    - **Validate Bill**: 인식된 상품 목록을 확인하고 수정합니다.
     """
 )

@@ -15,31 +15,23 @@ def display_bill():
 
     if not items:
         st.warning("Your cart is empty. Please scan items in the Checkout page.")
-        st.dataframe(pd.DataFrame(columns=["Product", "Quantity", "Price", "Total"]))
-        st.metric("Total Amount", "₹.0.00")
+        st.dataframe(pd.DataFrame(columns=["Product", "Quantity"]))
         return
 
     # Building table
     bill_data = []
-    total_amount = 0.0
-    for sku, item in items.items():
-        total_price = item["quantity"] * item["price"]
+    for name, quantity in items.items():
         bill_data.append({
-            "SKU": sku,
-            "Product": item["name"],
-            "Quantity": item["quantity"],
-            "Price": f"₹{item['price']:.2f}",
-            "Total": f"₹{total_price:.2f}"
+            "Product": name,
+            "Quantity": quantity,
         })
-        total_amount += total_price
 
     st.dataframe(pd.DataFrame(bill_data), use_container_width=True)
-    st.metric("Total Amount", f"₹{total_amount:.2f}")
 
     st.subheader("Edit Your Bill")
 
     sku_list = list(items.keys())
-    label_list = [f"{items[sku]['name']} ({sku})" for sku in sku_list]
+    label_list = [f"{name}" for name in sku_list]
 
     selected_label = st.selectbox(
         "Select item to remove from bill",
@@ -53,8 +45,8 @@ def display_bill():
         if st.button("Remove 1 Quantity", key="validate_remove_one"):
             idx = label_list.index(selected_label)
             sel_sku = sku_list[idx]
-            if items[sel_sku]["quantity"] > 1:
-                items[sel_sku]["quantity"] -= 1
+            if items[sel_sku] > 1:
+                items[sel_sku] -= 1
             else:
                 del items[sel_sku]
             st.session_state.billing_items = items
