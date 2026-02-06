@@ -362,9 +362,86 @@ main .block-container {{
   box-shadow: 0 4px 12px rgba(255, 138, 101, 0.32);
 }}
 
+.loading-card {{
+  text-align: center;
+}}
+
+.loading-spinner {{
+  width: 58px;
+  height: 58px;
+  margin: 0 auto 12px auto;
+  border-radius: 999px;
+  border: 6px solid #FFE4D4;
+  border-top-color: {PRIMARY_GRADIENT[1]};
+  border-right-color: {PRIMARY_GRADIENT[0]};
+  animation: spin 1s linear infinite;
+}}
+
+.loading-progress {{
+  width: 100%;
+  height: 12px;
+  border-radius: 999px;
+  background: #FFE8DA;
+  position: relative;
+  overflow: hidden;
+  margin-top: 14px;
+}}
+
+.loading-progress::before {{
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -40%;
+  width: 40%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(135deg, {PRIMARY_GRADIENT[0]}, {PRIMARY_GRADIENT[1]});
+  animation: loading-slide 1.1s ease-in-out infinite;
+}}
+
+.loading-caption {{
+  margin-top: 10px;
+  color: {TEXT_SECONDARY};
+  font-size: 14px;
+}}
+
+.loading-dots {{
+  display: inline-flex;
+  margin-left: 4px;
+}}
+
+.loading-dots span {{
+  opacity: 0.25;
+  animation: dot-blink 1.2s infinite;
+}}
+
+.loading-dots span:nth-child(2) {{
+  animation-delay: 0.2s;
+}}
+
+.loading-dots span:nth-child(3) {{
+  animation-delay: 0.4s;
+}}
+
 @keyframes pulse {{
   0%, 100% {{ opacity: 1; }}
   50% {{ opacity: 0.45; }}
+}}
+
+@keyframes spin {{
+  0% {{ transform: rotate(0deg); }}
+  100% {{ transform: rotate(360deg); }}
+}}
+
+@keyframes loading-slide {{
+  0% {{ left: -40%; }}
+  50% {{ left: 30%; }}
+  100% {{ left: 100%; }}
+}}
+
+@keyframes dot-blink {{
+  0%, 100% {{ opacity: 0.25; }}
+  50% {{ opacity: 1; }}
 }}
 </style>
 """

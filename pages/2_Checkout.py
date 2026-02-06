@@ -706,11 +706,15 @@ loading_placeholder = st.empty()
 with loading_placeholder.container():
     st.markdown(
         """
-        <div class="soft-card" style="max-width:620px; margin:0 auto 14px auto; text-align:center;">
-          <div style="font-size:56px; color:#FF8A65; margin-bottom:4px;">◌</div>
-          <div class="card-title" style="font-size:36px; margin-bottom:4px;">임베딩 모델 로딩 중...</div>
-          <div class="card-subtitle">잠시만 기다려 주세요</div>
-          <div style="height:10px; border-radius:999px; background:linear-gradient(135deg,#FFB74D,#FF8A65); margin-top:16px;"></div>
+        <div class="soft-card loading-card" style="max-width:620px; margin:0 auto 14px auto;">
+          <div class="loading-spinner"></div>
+          <div class="card-title" style="font-size:36px; margin-bottom:4px;">임베딩 모델 로딩 중</div>
+          <div class="card-subtitle">
+            잠시만 기다려 주세요
+            <span class="loading-dots"><span>.</span><span>.</span><span>.</span></span>
+          </div>
+          <div class="loading-progress"></div>
+          <div class="loading-caption">모델 다운로드/초기화 시간에 따라 로딩 시간이 달라질 수 있습니다.</div>
         </div>
         """,
         unsafe_allow_html=True,
