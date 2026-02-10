@@ -10,15 +10,19 @@ import faiss
 import numpy as np
 import streamlit as st
 import streamlit.elements.image as st_image
-import torch
-from peft import PeftModel
 from PIL import Image
 from streamlit.elements.lib import image_utils
 from streamlit.elements.lib.layout_utils import LayoutConfig
 from streamlit_drawable_canvas import st_canvas
-from torch.nn import functional as F
-from transformers import AutoImageProcessor, AutoModel, CLIPModel, CLIPProcessor
 
+from checkout_core.counting import ensure_last_seen_at_state
+from checkout_core.frame_processor import create_bg_subtractor, process_checkout_frame
+from checkout_core.inference import (
+    build_or_load_index as core_build_or_load_index,
+    load_db as core_load_db,
+    load_models as core_load_models,
+)
+from checkout_core.video_input import persist_uploaded_video
 from ui_theme import apply_theme
 
 DATA_DIR = "data"
@@ -29,27 +33,25 @@ ADAPTER_DIR = DATA_DIR
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-DINO_MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
-DINO_PROCESSOR_ID = "facebook/dinov2-large"
-CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
-
-DINO_WEIGHT = 0.7
-CLIP_WEIGHT = 0.3
-
 MIN_AREA = 2500
 DETECT_EVERY_N_FRAMES = 5
-MATCH_THRESHOLD = 0.7
-COUNT_COOLDOWN_FRAMES = 20
+MATCH_THRESHOLD = 0.62
+COUNT_COOLDOWN_SECONDS = 1.0
 ROI_CLEAR_FRAMES = 8
 STREAM_TARGET_WIDTH = 960
 ROI_DISPLAY_MAX_WIDTH = 920
 ROI_DISPLAY_MAX_HEIGHT = 560
+VIDEO_FILE_TYPES = ["mp4", "mov", "avi", "mkv"]
 
 video_placeholder = None
 status_placeholder = None
 billing_placeholder = None
 
 apply_theme(page_title="체크아웃", page_icon="🛒", current_nav="🛒 체크아웃")
+
+st.session_state.navigation_mode = "desktop"
+st.session_state.home_page_path = "pages/0_Desktop_Home.py"
+st.session_state.checkout_page_path = "pages/2_Checkout.py"
 
 # Compatibility patch for streamlit>=1.54 where image_to_url moved.
 if not hasattr(st_image, "image_to_url"):
@@ -191,201 +193,25 @@ def _extract_polygon_points(obj):
     return abs_points
 
 
-def get_hf_token():
-    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-    if token:
-        return token
-
-    try:
-        if hasattr(st, "secrets"):
-            return st.secrets.get("HF_TOKEN") or st.secrets.get("HUGGINGFACE_HUB_TOKEN")
-    except Exception:
-        return None
-
-    return None
-
-
-def safe_cls_from_output(output):
-    if output is None:
-        return None
-
-    if isinstance(output, dict):
-        if output.get("last_hidden_state") is not None:
-            return output["last_hidden_state"][:, 0]
-        if output.get("hidden_states") is not None:
-            return output["hidden_states"][-1][:, 0]
-
-    last_hidden = getattr(output, "last_hidden_state", None)
-    if last_hidden is not None:
-        return last_hidden[:, 0]
-
-    hidden_states = getattr(output, "hidden_states", None)
-    if hidden_states is not None:
-        return hidden_states[-1][:, 0]
-
-    if isinstance(output, (tuple, list)) and len(output) > 0:
-        first = output[0]
-        if torch.is_tensor(first) and first.dim() >= 3:
-            return first[:, 0]
-
-    return None
-
-
 @st.cache_resource(show_spinner=False)
 def load_models():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    token = get_hf_token()
-
-    dino_processor = AutoImageProcessor.from_pretrained(
-        DINO_PROCESSOR_ID,
-        use_fast=True,
-        token=token,
-    )
-    dino_model = AutoModel.from_pretrained(
-        DINO_MODEL_NAME,
-        trust_remote_code=True,
-        token=token,
-    )
-
-    lora_loaded = False
-    lora_error = None
-    adapter_path = os.path.join(ADAPTER_DIR, "adapter_model.safetensors")
-    if os.path.exists(adapter_path):
-        try:
-            dino_model = PeftModel.from_pretrained(dino_model, ADAPTER_DIR)
-            lora_loaded = True
-        except Exception as exc:
-            lora_error = str(exc)
-
-    dino_model.to(device).eval()
-
-    clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME, token=token)
-    clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME, token=token)
-    clip_model.to(device).eval()
-
-    dino_dim = getattr(dino_model.config, "hidden_size", None)
-    clip_dim = getattr(clip_model.config, "projection_dim", None)
-
-    if dino_dim is None or clip_dim is None:
-        raise RuntimeError("Model embedding dimensions are missing.")
-
-    return {
-        "device": device,
-        "dino_processor": dino_processor,
-        "dino_model": dino_model,
-        "clip_processor": clip_processor,
-        "clip_model": clip_model,
-        "dino_dim": int(dino_dim),
-        "clip_dim": int(clip_dim),
-        "lora_loaded": lora_loaded,
-        "lora_error": lora_error,
-    }
-
-
-def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    return matrix / np.maximum(norms, 1e-12)
+    return core_load_models(ADAPTER_DIR)
 
 
 @st.cache_data(show_spinner=False)
 def load_db(dino_dim, clip_dim, embeddings_mtime, labels_mtime):
-    if not os.path.exists(EMBEDDINGS_PATH):
-        raise FileNotFoundError("embeddings.npy not found.")
-    if not os.path.exists(LABELS_PATH):
-        raise FileNotFoundError("labels.npy not found.")
-
-    embeddings = np.load(EMBEDDINGS_PATH).astype(np.float32)
-    labels = np.load(LABELS_PATH)
-
-    expected_dim = dino_dim + clip_dim
-    if embeddings.shape[1] != expected_dim:
-        raise ValueError(
-            f"embeddings.npy must be {expected_dim} dims (DINO {dino_dim} + CLIP {clip_dim})."
-        )
-    if embeddings.shape[0] != len(labels):
-        raise ValueError("embeddings.npy and labels.npy rows do not match.")
-
-    dino = embeddings[:, :dino_dim]
-    clip = embeddings[:, dino_dim:dino_dim + clip_dim]
-
-    dino = _normalize_rows(dino)
-    clip = _normalize_rows(clip)
-
-    weighted = np.concatenate(
-        [dino * DINO_WEIGHT, clip * CLIP_WEIGHT], axis=1
-    ).astype(np.float32)
-    weighted = _normalize_rows(weighted)
-
-    return weighted, labels
+    return core_load_db(
+        dino_dim,
+        clip_dim,
+        EMBEDDINGS_PATH,
+        LABELS_PATH,
+        embeddings_mtime,
+        labels_mtime,
+    )
 
 
 def build_or_load_index(weighted_db: np.ndarray) -> faiss.IndexFlatIP:
-    dim = weighted_db.shape[1]
-    if os.path.exists(FAISS_INDEX_PATH):
-        index = faiss.read_index(FAISS_INDEX_PATH)
-        if index.d == dim and index.ntotal == weighted_db.shape[0]:
-            return index
-
-    index = faiss.IndexFlatIP(dim)
-    if weighted_db.shape[0] > 0:
-        index.add(weighted_db)
-    faiss.write_index(index, FAISS_INDEX_PATH)
-
-    return index
-
-
-def extract_dino_embedding(image_bgr, model, processor, device):
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(image_rgb)
-    inputs = processor(images=pil_image, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        output = model(**inputs)
-
-    cls_tensor = safe_cls_from_output(output)
-    if cls_tensor is None:
-        raise RuntimeError("Could not extract CLS token from DINO output.")
-    cls_tensor = F.normalize(cls_tensor, p=2, dim=-1)
-
-    return cls_tensor[0].detach().cpu().numpy().astype(np.float32)
-
-
-def extract_clip_embedding(image_bgr, model, processor, device):
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(image_rgb)
-    inputs = processor(images=pil_image, return_tensors="pt")
-    pixel_values = inputs["pixel_values"].to(device)
-
-    with torch.no_grad():
-        vision_outputs = model.vision_model(pixel_values=pixel_values)
-        pooled = vision_outputs.pooler_output
-        projected = model.visual_projection(pooled)
-
-    projected = F.normalize(projected, p=2, dim=-1)
-    return projected[0].detach().cpu().numpy().astype(np.float32)
-
-
-def build_query_embedding(image_bgr, bundle):
-    dino = extract_dino_embedding(
-        image_bgr,
-        bundle["dino_model"],
-        bundle["dino_processor"],
-        bundle["device"],
-    )
-    clip = extract_clip_embedding(
-        image_bgr,
-        bundle["clip_model"],
-        bundle["clip_processor"],
-        bundle["device"],
-    )
-
-    combined = np.concatenate([dino * DINO_WEIGHT, clip * CLIP_WEIGHT], axis=0).astype(np.float32)
-    norm = np.linalg.norm(combined)
-    if norm > 0:
-        combined = combined / norm
-
-    return combined
+    return core_build_or_load_index(weighted_db, FAISS_INDEX_PATH)
 
 
 def update_status_ui() -> None:
@@ -510,8 +336,7 @@ def init_app_state(bundle) -> None:
         st.session_state.billing_items = {}
     if "item_scores" not in st.session_state:
         st.session_state.item_scores = {}
-    if "last_seen" not in st.session_state:
-        st.session_state.last_seen = {}
+    ensure_last_seen_at_state(st.session_state)
     if "last_label" not in st.session_state:
         st.session_state.last_label = "-"
     if "last_score" not in st.session_state:
@@ -545,21 +370,24 @@ def init_app_state(bundle) -> None:
         st.session_state.index_mtime = db_mtime
 
 
-def run_checkout_pipeline(model_bundle) -> None:
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        st.error("카메라를 열 수 없습니다.")
-        return
-
-    bg_subtractor = cv2.createBackgroundSubtractorKNN(
-        history=300, dist2Threshold=500, detectShadows=False
-    )
-
+def run_checkout_capture_loop(
+    model_bundle,
+    cap,
+    *,
+    use_roi: bool,
+    detect_every_n_frames: int,
+    cooldown_seconds: float,
+    playback_fps: float | None = None,
+    stop_when_roi_setup: bool = False,
+) -> None:
+    bg_subtractor = create_bg_subtractor()
     frame_count = 0
+    frame_interval = 1.0 / playback_fps if playback_fps and playback_fps > 0 else None
 
     try:
         while True:
-            if st.session_state.get("roi_setup"):
+            loop_started = time.perf_counter()
+            if stop_when_roi_setup and st.session_state.get("roi_setup"):
                 break
 
             ret, frame = cap.read()
@@ -568,7 +396,6 @@ def run_checkout_pipeline(model_bundle) -> None:
 
             frame = resize_to_stream_size(frame)
             frame_count += 1
-            display_frame = frame.copy()
 
             now = time.perf_counter()
             delta = now - st.session_state.last_frame_time
@@ -576,117 +403,82 @@ def run_checkout_pipeline(model_bundle) -> None:
                 st.session_state.last_fps = 1.0 / delta
             st.session_state.last_frame_time = now
 
-            fg_mask = bg_subtractor.apply(frame)
-            fg_mask = cv2.erode(fg_mask, None, iterations=2)
-            fg_mask = cv2.dilate(fg_mask, None, iterations=4)
-            _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-
-            roi_poly = get_roi_polygon(frame.shape)
-            if roi_poly is not None:
-                roi_mask = np.zeros_like(fg_mask)
-                cv2.fillPoly(roi_mask, [roi_poly], 255)
-                fg_mask = cv2.bitwise_and(fg_mask, roi_mask)
-
-            contours, _ = cv2.findContours(
-                fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            roi_poly = get_roi_polygon(frame.shape) if use_roi else None
+            display_frame = process_checkout_frame(
+                frame=frame,
+                frame_count=frame_count,
+                bg_subtractor=bg_subtractor,
+                model_bundle=model_bundle,
+                faiss_index=st.session_state.faiss_index,
+                labels=st.session_state.labels,
+                state=st.session_state,
+                min_area=MIN_AREA,
+                detect_every_n_frames=detect_every_n_frames,
+                match_threshold=MATCH_THRESHOLD,
+                cooldown_seconds=cooldown_seconds,
+                roi_poly=roi_poly,
+                roi_clear_frames=ROI_CLEAR_FRAMES,
+                roi_entry_mode=use_roi,
             )
-            candidates = [cnt for cnt in contours if cv2.contourArea(cnt) > MIN_AREA]
-
-            if candidates and st.session_state.faiss_index is not None and st.session_state.faiss_index.ntotal > 0:
-                st.session_state.last_status = "탐지됨"
-                main_cnt = max(candidates, key=cv2.contourArea)
-                x, y, w, h = cv2.boundingRect(main_cnt)
-
-                pad = 10
-                x = max(0, x - pad)
-                y = max(0, y - pad)
-                x2 = min(frame.shape[1], x + w + 2 * pad)
-                y2 = min(frame.shape[0], y + h + 2 * pad)
-
-                w = x2 - x
-                h = y2 - y
-
-                if w > 20 and h > 20:
-                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-                    entry_event = False
-                    if roi_poly is not None:
-                        cx = x + (w / 2)
-                        cy = y + (h / 2)
-                        inside = cv2.pointPolygonTest(roi_poly, (cx, cy), False) >= 0
-                        if inside:
-                            st.session_state.roi_empty_frames = 0
-                            entry_event = not st.session_state.roi_occupied
-                            st.session_state.roi_occupied = True
-                        else:
-                            st.session_state.roi_empty_frames += 1
-
-                    if roi_poly is not None and st.session_state.roi_empty_frames >= ROI_CLEAR_FRAMES:
-                        st.session_state.roi_occupied = False
-
-                    crop = frame[y:y + h, x:x + w]
-
-                    if roi_poly is not None:
-                        allow_inference = entry_event
-                        st.session_state.last_status = "ROI 진입" if entry_event else "ROI 내부"
-                    else:
-                        allow_inference = frame_count % DETECT_EVERY_N_FRAMES == 0
-
-                    if allow_inference:
-                        emb = build_query_embedding(crop, model_bundle)
-                        query = np.expand_dims(emb, axis=0)
-
-                        D, I = st.session_state.faiss_index.search(query, 1)
-                        best_idx = int(I[0][0])
-                        best_score = float(D[0][0])
-
-                        if best_score > MATCH_THRESHOLD and best_idx < len(st.session_state.labels):
-                            name = str(st.session_state.labels[best_idx])
-                            label = f"{name} ({best_score:.3f})"
-
-                            st.session_state.last_label = name
-                            st.session_state.last_score = best_score
-                            st.session_state.last_status = "매칭됨"
-                            st.session_state.item_scores[name] = best_score
-
-                            cv2.putText(
-                                display_frame,
-                                label,
-                                (x, max(20, y - 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.7,
-                                (255, 255, 255),
-                                2,
-                            )
-
-                            last_seen = st.session_state.last_seen.get(name, -COUNT_COOLDOWN_FRAMES)
-                            if frame_count - last_seen >= COUNT_COOLDOWN_FRAMES:
-                                st.session_state.billing_items[name] = (
-                                    st.session_state.billing_items.get(name, 0) + 1
-                                )
-                                st.session_state.last_seen[name] = frame_count
-                        else:
-                            st.session_state.last_label = "미매칭"
-                            st.session_state.last_score = best_score
-                            st.session_state.last_status = "매칭 실패"
-            else:
-                if st.session_state.roi_occupied:
-                    st.session_state.roi_empty_frames += 1
-                    if st.session_state.roi_empty_frames >= ROI_CLEAR_FRAMES:
-                        st.session_state.roi_occupied = False
-                st.session_state.last_label = "-"
-                st.session_state.last_score = 0.0
-                st.session_state.last_status = "미탐지"
-
-            if roi_poly is not None:
-                cv2.polylines(display_frame, [roi_poly], True, (0, 181, 255), 2)
 
             if video_placeholder is not None:
                 video_placeholder.image(display_frame, channels="BGR", use_container_width=True)
             update_status_ui()
             update_billing_ui()
+
+            if frame_interval is not None:
+                elapsed = time.perf_counter() - loop_started
+                if elapsed < frame_interval:
+                    time.sleep(frame_interval - elapsed)
     finally:
         cap.release()
+
+
+def run_checkout_pipeline(model_bundle) -> None:
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        st.error("카메라를 열 수 없습니다.")
+        return
+
+    run_checkout_capture_loop(
+        model_bundle,
+        cap,
+        use_roi=True,
+        detect_every_n_frames=DETECT_EVERY_N_FRAMES,
+        cooldown_seconds=COUNT_COOLDOWN_SECONDS,
+        stop_when_roi_setup=True,
+    )
+
+
+def run_uploaded_video_pipeline(model_bundle, uploaded_video) -> None:
+    temp_video_path = persist_uploaded_video(uploaded_video, prefix="desktop_checkout_")
+    cap = cv2.VideoCapture(temp_video_path)
+    if not cap.isOpened():
+        os.remove(temp_video_path)
+        st.error("업로드한 영상을 열 수 없습니다.")
+        return
+
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        if fps <= 0 or fps > 240:
+            fps = 15.0
+
+        st.session_state.stream_size = None
+        st.session_state.last_status = "영상 추론 중"
+
+        run_checkout_capture_loop(
+            model_bundle,
+            cap,
+            use_roi=False,
+            detect_every_n_frames=DETECT_EVERY_N_FRAMES,
+            cooldown_seconds=COUNT_COOLDOWN_SECONDS,
+            playback_fps=fps,
+            stop_when_roi_setup=False,
+        )
+        st.success("업로드 영상 추론이 완료되었습니다.")
+    finally:
+        if os.path.exists(temp_video_path):
+            os.remove(temp_video_path)
 
 
 st.markdown(
@@ -750,7 +542,17 @@ except Exception as exc:
     st.info("홈에서 관리자 기능(Add Product)으로 먼저 상품 임베딩을 등록하세요.")
     st.stop()
 
-if st.session_state.get("roi_setup"):
+source_mode = st.radio(
+    "입력 소스",
+    options=["라이브 카메라", "업로드 영상"],
+    horizontal=True,
+    key="desktop_checkout_source_mode",
+)
+is_live_source = source_mode == "라이브 카메라"
+if not is_live_source and st.session_state.get("roi_setup"):
+    exit_roi_setup()
+
+if is_live_source and st.session_state.get("roi_setup"):
     col_camera, col_panel = st.columns([2, 1], gap="large")
 
     with col_camera:
@@ -835,54 +637,88 @@ if st.session_state.get("roi_setup"):
             st.switch_page("pages/3_Validate_Bill.py")
 else:
     col_camera, col_panel = st.columns([2, 1], gap="large")
+    uploaded_video = None
+    start_video_inference = False
 
     with col_camera:
         st.markdown('<div class="camera-shell">', unsafe_allow_html=True)
         st.markdown(
-            '<div class="live-badge"><span class="live-dot"></span>Live</div>',
+            (
+                '<div class="live-badge"><span class="live-dot"></span>Live</div>'
+                if is_live_source
+                else '<div class="live-badge"><span class="live-dot"></span>Video</div>'
+            ),
             unsafe_allow_html=True,
         )
         video_placeholder = st.empty()
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
-        st.markdown(
-            """
-            <div class="soft-card">
-              <div class="roi-row">
-                <div style="display:flex; align-items:center; gap:12px;">
-                  <div class="icon-square" style="background:linear-gradient(135deg,#FFB74D,#FF8A65);">🎯</div>
-                  <div>
-                    <div class="card-title">ROI 영역 설정</div>
-                    <div class="card-subtitle">인식 영역을 지정하여 정확도를 향상할 수 있습니다.</div>
+        if is_live_source:
+            st.markdown(
+                """
+                <div class="soft-card">
+                  <div class="roi-row">
+                    <div style="display:flex; align-items:center; gap:12px;">
+                      <div class="icon-square" style="background:linear-gradient(135deg,#FFB74D,#FF8A65);">🎯</div>
+                      <div>
+                        <div class="card-title">ROI 영역 설정</div>
+                        <div class="card-subtitle">인식 영역을 지정하여 정확도를 향상할 수 있습니다.</div>
+                      </div>
+                    </div>
                   </div>
                 </div>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+                """,
+                unsafe_allow_html=True,
+            )
 
-        roi_btn_col1, roi_btn_col2, roi_btn_col3 = st.columns([2, 1, 1], gap="small")
-        with roi_btn_col1:
-            if st.button("ROI 설정", key="open_roi_setup", type="primary", use_container_width=True):
-                st.session_state.stream_size = None
-                capture_roi_frame()
-                reset_roi_canvas(clear_saved=False)
-                st.session_state.roi_setup = True
-                st.session_state.roi_mode = True
-                st.rerun()
-        with roi_btn_col2:
-            if st.button("ROI 다시 그리기", key="roi_redraw", use_container_width=True):
-                reset_roi_canvas(clear_saved=False)
-                st.session_state.roi_setup = True
-                st.session_state.roi_mode = True
-                st.rerun()
-        with roi_btn_col3:
-            if st.button("ROI 해제", key="roi_clear", use_container_width=True):
-                reset_roi_canvas(clear_saved=True)
-                st.session_state.roi_status = {"level": "info", "text": "ROI가 해제되었습니다."}
-                st.rerun()
+            roi_btn_col1, roi_btn_col2, roi_btn_col3 = st.columns([2, 1, 1], gap="small")
+            with roi_btn_col1:
+                if st.button("ROI 설정", key="open_roi_setup", type="primary", use_container_width=True):
+                    st.session_state.stream_size = None
+                    capture_roi_frame()
+                    reset_roi_canvas(clear_saved=False)
+                    st.session_state.roi_setup = True
+                    st.session_state.roi_mode = True
+                    st.rerun()
+            with roi_btn_col2:
+                if st.button("ROI 다시 그리기", key="roi_redraw", use_container_width=True):
+                    reset_roi_canvas(clear_saved=False)
+                    st.session_state.roi_setup = True
+                    st.session_state.roi_mode = True
+                    st.rerun()
+            with roi_btn_col3:
+                if st.button("ROI 해제", key="roi_clear", use_container_width=True):
+                    reset_roi_canvas(clear_saved=True)
+                    st.session_state.roi_status = {"level": "info", "text": "ROI가 해제되었습니다."}
+                    st.rerun()
+        else:
+            st.markdown(
+                """
+                <div class="soft-card">
+                  <div style="display:flex; align-items:center; gap:12px;">
+                    <div class="icon-square" style="background:linear-gradient(135deg,#3B82F6,#2563EB);">🎬</div>
+                    <div>
+                      <div class="card-title">영상 업로드 추론</div>
+                      <div class="card-subtitle">업로드한 영상을 재생 속도에 맞춰 프레임 단위로 추론합니다.</div>
+                    </div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            uploaded_video = st.file_uploader(
+                "추론할 영상 업로드",
+                type=VIDEO_FILE_TYPES,
+                key="desktop_checkout_uploaded_video",
+            )
+            start_video_inference = st.button(
+                "업로드 영상 추론 시작",
+                type="primary",
+                use_container_width=True,
+                key="desktop_run_uploaded_video",
+                disabled=uploaded_video is None,
+            )
 
     with col_panel:
         status_placeholder = st.empty()
@@ -890,4 +726,10 @@ else:
         if st.button("체크아웃 완료", type="primary", use_container_width=True, key="checkout_done_panel"):
             st.switch_page("pages/3_Validate_Bill.py")
 
-    run_checkout_pipeline(model_bundle)
+    if is_live_source:
+        run_checkout_pipeline(model_bundle)
+    elif start_video_inference and uploaded_video is not None:
+        run_uploaded_video_pipeline(model_bundle, uploaded_video)
+    else:
+        update_status_ui()
+        update_billing_ui()

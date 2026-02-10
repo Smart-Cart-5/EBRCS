@@ -1,0 +1,35 @@
+"""Backend configuration via environment variables."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+# Project root (parent of backend/)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Data directory
+DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data")))
+
+# File paths
+EMBEDDINGS_PATH = str(DATA_DIR / "embeddings.npy")
+LABELS_PATH = str(DATA_DIR / "labels.npy")
+FAISS_INDEX_PATH = str(DATA_DIR / "faiss_index.bin")
+ADAPTER_DIR = str(DATA_DIR)
+
+# Server
+CORS_ORIGINS: list[str] = os.getenv(
+    "CORS_ORIGINS", "http://localhost:5173,http://localhost:3000"
+).split(",")
+
+# Session
+MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "50"))
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
+
+# Inference constants (mirrors checkout_core / pages/2_Checkout.py)
+MIN_AREA = 2500
+DETECT_EVERY_N_FRAMES = 5
+MATCH_THRESHOLD = 0.62
+COUNT_COOLDOWN_SECONDS = 1.0
+ROI_CLEAR_FRAMES = 8
+STREAM_TARGET_WIDTH = 960

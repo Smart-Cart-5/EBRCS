@@ -9,9 +9,9 @@ BORDER = "rgba(0, 0, 0, 0.10)"
 GREEN_ACCENT = "#10B981"
 BLUE_ACCENT = "#3B82F6"
 
-NAV_ITEMS = ["🏠 홈", "🛒 체크아웃", "✅ 영수증 확인"]
-NAV_TO_PAGE = {
-    "🏠 홈": "app.py",
+DEFAULT_NAV_ITEMS = ["🏠 홈", "🛒 체크아웃", "✅ 영수증 확인"]
+DEFAULT_NAV_TO_PAGE = {
+    "🏠 홈": "pages/0_Desktop_Home.py",
     "🛒 체크아웃": "pages/2_Checkout.py",
     "✅ 영수증 확인": "pages/3_Validate_Bill.py",
 }
@@ -447,10 +447,18 @@ main .block-container {{
 """
 
 
-def render_sidebar(current_nav: str) -> None:
-    if current_nav not in NAV_ITEMS:
-        current_nav = "🏠 홈"
-    current_index = NAV_ITEMS.index(current_nav)
+def render_sidebar(
+    current_nav: str,
+    nav_items: list[str] | None = None,
+    nav_to_page: dict[str, str] | None = None,
+    nav_key_prefix: str = "default",
+) -> None:
+    items = nav_items or DEFAULT_NAV_ITEMS
+    pages = nav_to_page or DEFAULT_NAV_TO_PAGE
+
+    if current_nav not in items:
+        current_nav = items[0]
+    current_index = items.index(current_nav)
 
     with st.sidebar:
         st.markdown(
@@ -470,20 +478,32 @@ def render_sidebar(current_nav: str) -> None:
 
         choice = st.radio(
             "메뉴",
-            NAV_ITEMS,
+            items,
             index=current_index,
             label_visibility="collapsed",
-            key=f"sidebar_nav_{current_nav}",
+            key=f"sidebar_nav_{nav_key_prefix}_{current_nav}",
         )
 
         st.markdown('<div class="sidebar-footer">© 2026 Smart Checkout</div>', unsafe_allow_html=True)
 
     if choice != current_nav:
-        st.switch_page(NAV_TO_PAGE[choice])
+        st.switch_page(pages[choice])
 
 
-def apply_theme(page_title: str, page_icon: str, current_nav: str) -> None:
+def apply_theme(
+    page_title: str,
+    page_icon: str,
+    current_nav: str,
+    nav_items: list[str] | None = None,
+    nav_to_page: dict[str, str] | None = None,
+    nav_key_prefix: str = "default",
+) -> None:
     st.set_page_config(page_title=page_title, page_icon=page_icon, layout="wide")
     init_session_defaults()
     st.markdown(_theme_css(), unsafe_allow_html=True)
-    render_sidebar(current_nav)
+    render_sidebar(
+        current_nav,
+        nav_items=nav_items,
+        nav_to_page=nav_to_page,
+        nav_key_prefix=nav_key_prefix,
+    )

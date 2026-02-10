@@ -1,0 +1,137 @@
+// API base URL: use env var in production, proxy in development
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "";
+const BASE = `${API_BASE}/api`;
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, init);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+// --- Sessions ---
+
+export interface SessionResponse {
+  session_id: string;
+}
+
+export function createSession(): Promise<SessionResponse> {
+  return request("/sessions", { method: "POST" });
+}
+
+export function deleteSession(id: string): Promise<void> {
+  return request(`/sessions/${id}`, { method: "DELETE" });
+}
+
+// --- ROI ---
+
+export interface ROIResponse {
+  points: number[][] | null;
+  num_vertices: number;
+}
+
+export function setROI(
+  sessionId: string,
+  points: number[][],
+): Promise<ROIResponse> {
+  return request(`/sessions/${sessionId}/roi`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ points }),
+  });
+}
+
+export function clearROI(sessionId: string): Promise<void> {
+  return request(`/sessions/${sessionId}/roi`, { method: "DELETE" });
+}
+
+// --- Billing ---
+
+export interface BillingState {
+  billing_items: Record<string, number>;
+  item_scores: Record<string, number>;
+  total_count: number;
+}
+
+export function getBilling(sessionId: string): Promise<BillingState> {
+  return request(`/sessions/${sessionId}/billing`);
+}
+
+export function updateBilling(
+  sessionId: string,
+  billing_items: Record<string, number>,
+): Promise<BillingState> {
+  return request(`/sessions/${sessionId}/billing`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ billing_items }),
+  });
+}
+
+export function confirmBilling(sessionId: string) {
+  return request<{ status: string; confirmed_items: Record<string, number> }>(
+    `/sessions/${sessionId}/billing/confirm`,
+    { method: "POST" },
+  );
+}
+
+// --- Products ---
+
+export interface Product {
+  name: string;
+  embedding_count: number;
+}
+
+export function listProducts(): Promise<{
+  products: Product[];
+  total_embeddings: number;
+}> {
+  return request("/products");
+}
+
+export function addProduct(name: string, images: File[]) {
+  const form = new FormData();
+  form.append("name", name);
+  images.forEach((f) => form.append("images", f));
+  return request<{ status: string; product_name: string }>("/products", {
+    method: "POST",
+    body: form,
+  });
+}
+
+// --- Video Upload ---
+
+export function uploadVideo(
+  sessionId: string,
+  file: File,
+): Promise<{ task_id: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  return request(`/sessions/${sessionId}/video-upload`, {
+    method: "POST",
+    body: form,
+  });
+}
+
+// --- Health ---
+
+export function getHealth(): Promise<Record<string, unknown>> {
+  return request("/health");
+}
+
+// --- WebSocket URL helper ---
+
+export function wsCheckoutUrl(sessionId: string): string {
+  // Use backend URL for WebSocket in production
+  const backendUrl = import.meta.env.VITE_API_BASE_URL || location.origin;
+  const wsBase = backendUrl.replace(/^http/, "ws");
+  return `${wsBase}/api/ws/checkout/${sessionId}`;
+}
+
+// --- SSE helper ---
+
+export function videoStatusUrl(sessionId: string, taskId: string): string {
+  return `${BASE}/sessions/${sessionId}/video-status?task_id=${taskId}`;
+}

@@ -1,0 +1,3 @@
+from pages_mobile.checkout_mobile_page import render_mobile_checkout
+
+render_mobile_checkout()

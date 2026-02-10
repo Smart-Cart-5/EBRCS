@@ -1,0 +1,22 @@
+# Git LFS (Large File Storage) 설정
+# Hugging Face Spaces에서 대용량 파일 관리
+
+# 임베딩 파일 (NPY)
+*.npy filter=lfs diff=lfs merge=lfs -text
+
+# FAISS 인덱스
+*.bin filter=lfs diff=lfs merge=lfs -text
+
+# 모델 파일 (있는 경우)
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+
+# 이미지 파일 (데모용)
+*.png filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text
+*.jpeg filter=lfs diff=lfs merge=lfs -text
+
+# 영상 파일
+*.mp4 filter=lfs diff=lfs merge=lfs -text
+*.avi filter=lfs diff=lfs merge=lfs -text

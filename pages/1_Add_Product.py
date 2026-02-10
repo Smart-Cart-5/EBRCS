@@ -31,6 +31,10 @@ CLIP_WEIGHT = 0.3
 
 apply_theme(page_title="상품 등록", page_icon="🧩", current_nav="🏠 홈")
 
+st.session_state.navigation_mode = "desktop"
+st.session_state.home_page_path = "pages/0_Desktop_Home.py"
+st.session_state.checkout_page_path = "pages/2_Checkout.py"
+
 
 def get_hf_token():
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
@@ -242,7 +246,7 @@ st.markdown(
 )
 
 if st.button("홈으로 돌아가기", key="add_back_home"):
-    st.switch_page("app.py")
+    st.switch_page(st.session_state.get("home_page_path", "pages/0_Desktop_Home.py"))
 
 loading_placeholder = st.empty()
 with loading_placeholder.container():

@@ -2,9 +2,27 @@ import html
 
 import streamlit as st
 
+from mobile_nav import MOBILE_NAV_ITEMS, MOBILE_NAV_TO_PAGE
 from ui_theme import apply_theme
 
-apply_theme(page_title="영수증 확인", page_icon="✅", current_nav="✅ 영수증 확인")
+navigation_mode = st.session_state.get("navigation_mode", "desktop")
+
+if navigation_mode == "mobile":
+    apply_theme(
+        page_title="영수증 확인",
+        page_icon="✅",
+        current_nav="✅ 영수증 확인",
+        nav_items=MOBILE_NAV_ITEMS,
+        nav_to_page=MOBILE_NAV_TO_PAGE,
+        nav_key_prefix="mobile",
+    )
+else:
+    apply_theme(page_title="영수증 확인", page_icon="✅", current_nav="✅ 영수증 확인")
+
+default_checkout_page = "pages/4_Checkout_Mobile.py" if navigation_mode == "mobile" else "pages/2_Checkout.py"
+default_home_page = "mobile_app.py" if navigation_mode == "mobile" else "pages/0_Desktop_Home.py"
+checkout_page_path = st.session_state.get("checkout_page_path", default_checkout_page)
+home_page_path = st.session_state.get("home_page_path", default_home_page)
 
 if "billing_items" not in st.session_state:
     st.session_state.billing_items = {}
@@ -88,7 +106,7 @@ if not items:
         unsafe_allow_html=True,
     )
     if st.button("체크아웃으로 이동", type="primary", key="empty_to_checkout"):
-        st.switch_page("pages/2_Checkout.py")
+        st.switch_page(checkout_page_path)
 else:
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     name_list = list(items.keys())
@@ -160,7 +178,7 @@ st.markdown(
 action_col1, action_col2 = st.columns(2, gap="large")
 with action_col1:
     if st.button("취소", key="receipt_cancel", use_container_width=True):
-        st.switch_page("app.py")
+        st.switch_page(home_page_path)
 with action_col2:
     if st.button("영수증 확정", key="receipt_confirm", type="primary", use_container_width=True):
         st.success("영수증이 확정되었습니다!")

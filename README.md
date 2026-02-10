@@ -5,6 +5,8 @@ DINOv3 + CLIP 임베딩과 FAISS 검색을 결합해, 웹캠으로 들어오는 
 ## 주요 기능
 - `Add Product`: 상품명 + 이미지(1~3장)로 임베딩 DB 등록
 - `Checkout`: 웹캠 기반 실시간 인식, ROI(관심영역) 설정, 수량 집계
+- `Mobile Checkout (Iriun)`: iPhone Iriun Webcam 입력, ROI 없이 실시간 인식
+- `Video Upload Inference`: 업로드 영상을 재생 속도에 맞춰 프레임 단위 추론
 - `Validate Bill`: 인식된 장바구니 항목 검수/수정
 
 ## 아키텍처 요약
@@ -17,10 +19,22 @@ DINOv3 + CLIP 임베딩과 FAISS 검색을 결합해, 웹캠으로 들어오는 
 ```text
 Embedding-Based-Retail-Checkout-System/
 ├─ app.py
+├─ mobile_app.py
+├─ mobile_nav.py
 ├─ pages/
+│  ├─ 0_Desktop_Home.py
 │  ├─ 1_Add_Product.py
 │  ├─ 2_Checkout.py
-│  └─ 3_Validate_Bill.py
+│  ├─ 3_Validate_Bill.py
+│  └─ 4_Checkout_Mobile.py
+├─ pages_mobile/
+│  ├─ 2_Checkout_Mobile.py
+│  └─ checkout_mobile_page.py
+├─ checkout_core/
+│  ├─ counting.py
+│  ├─ inference.py
+│  ├─ frame_processor.py
+│  └─ video_input.py
 ├─ data/
 │  ├─ adapter_config.json
 │  ├─ adapter_model.safetensors   # git ignore
@@ -29,6 +43,7 @@ Embedding-Based-Retail-Checkout-System/
 │  └─ faiss_index.bin             # git ignore
 ├─ requirements.txt
 ├─ run.sh
+├─ run_mobile.sh
 ├─ .env.example
 └─ .gitignore
 ```
@@ -83,11 +98,34 @@ HUGGINGFACE_HUB_TOKEN=your_hf_token
 streamlit run app.py
 ```
 
+Iriun 모바일 파이프라인 실행:
+```bash
+./run_mobile.sh
+```
+또는
+```bash
+streamlit run mobile_app.py
+```
+
 ## 실행 후 사용 순서 (중요)
 1. `Add Product` 페이지에서 상품을 먼저 1개 이상 등록합니다.
 2. `Checkout` 페이지에서 실시간 인식을 시작합니다.
 3. 필요 시 사이드바에서 ROI를 설정해 특정 영역 진입 이벤트만 카운트합니다.
 4. `Validate Bill` 페이지에서 수량 수정/결제 확정을 진행합니다.
+
+## Iriun 모바일 체크아웃 사용 순서 (macOS + iPhone)
+1. macOS에 `Iriun Webcam Desktop` 앱을 설치하고 실행합니다.
+2. iPhone App Store에서 `Iriun Webcam` 앱을 설치하고 실행합니다.
+3. Mac과 iPhone을 같은 네트워크(Wi-Fi 또는 USB 테더링)로 연결합니다.
+4. `streamlit run mobile_app.py` 또는 `./run_mobile.sh`로 모바일 앱을 실행합니다.
+5. `모바일 체크아웃` 페이지에서 카메라 목록을 새로고침하고 Iriun 인덱스를 선택합니다.
+6. 필요 시 `중복 카운트 방지 쿨다운` 슬라이더를 올려 중복 인식을 줄입니다.
+
+## 업로드 영상 추론 사용 순서
+1. `Checkout` 또는 `Mobile Checkout` 페이지에서 `입력 소스`를 `업로드 영상`으로 선택합니다.
+2. `mp4/mov/avi/mkv` 영상을 업로드합니다.
+3. `업로드 영상 추론 시작` 버튼을 눌러 재생 속도 기반 추론을 실행합니다.
+4. 추론 완료 후 장바구니가 누적되며 `Validate Bill`에서 검수할 수 있습니다.
 
 ## 데이터/모델 파일 정책 (.gitignore 반영)
 GitHub에 올리지 않도록 설정된 파일:
@@ -120,6 +158,11 @@ git rm --cached faiss_index.bin
 
 - `카메라를 열 수 없습니다.`
   - 다른 앱에서 카메라를 점유 중인지 확인하고, OS 카메라 권한을 허용하세요.
+
+- `Iriun 카메라가 목록에 보이지 않습니다.`
+  - macOS Iriun Desktop + iPhone Iriun 앱이 모두 실행 중인지 확인하세요.
+  - `mobile_app.py`의 모바일 체크아웃 페이지에서 카메라 목록을 새로고침하세요.
+  - 같은 네트워크인지 확인하고, 필요하면 앱/기기를 재시작해 인덱스를 다시 탐색하세요.
 
 - `DINO LoRA 로드 실패 (베이스 모델 사용)`
   - `data/adapter_model.safetensors`가 없거나 불일치한 경우입니다.
