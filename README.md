@@ -21,6 +21,8 @@ DINOv3 + CLIP 하이브리드 임베딩을 활용한 상품 자동 인식 및 �
   - [웹앱 실행](#2-웹앱-실행)
 - [데이터 준비](#-데이터-준비)
 - [배포](#-배포)
+  - [AWS EC2 배포](#-aws-ec2-배포)
+  - [HTTPS 설정](#-https-설정-외부-카메라-접근-필수)
 - [기술 스택](#-기술-스택)
 
 ---
@@ -580,6 +582,7 @@ kill -9 $(lsof -ti:8000)
 - **보안 그룹**:
   - SSH (22) - 내 IP만
   - HTTP (80) - 0.0.0.0/0
+  - HTTPS (443) - 0.0.0.0/0
 
 #### 2️⃣ 자동 설치 스크립트 실행
 
@@ -641,6 +644,77 @@ tail -f ~/ebrcs_streaming/app/logs/backend.log
 # Frontend 로그
 tail -f ~/ebrcs_streaming/app/logs/frontend.log
 ```
+
+---
+
+### 🔒 HTTPS 설정 (외부 카메라 접근 필수)
+
+**중요**: 브라우저의 보안 정책상 외부에서 카메라를 사용하려면 **반드시 HTTPS**가 필요합니다.
+
+#### 왜 HTTPS가 필요한가?
+
+`getUserMedia()` (카메라 API)는 다음 환경에서만 작동:
+- ✅ `localhost` / `127.0.0.1`
+- ✅ **HTTPS 연결**
+
+HTTP로 외부 접속 시 카메라를 사용할 수 없습니다!
+
+#### 자동 HTTPS 설정 (5분 완료)
+
+```bash
+cd ~/ebrcs_streaming
+sudo ./setup_https.sh
+```
+
+이 스크립트가 자동으로:
+1. ✅ Nginx 설치 및 설정
+2. ✅ 자체 서명 SSL 인증서 생성
+3. ✅ HTTP → HTTPS 리다이렉트 설정
+4. ✅ WebSocket over HTTPS 지원
+
+#### 접속 방법
+
+```
+https://YOUR_EC2_IP
+```
+
+**브라우저 보안 경고 처리**:
+1. **Chrome/Edge**: "고급" → "안전하지 않음(계속 진행)" 클릭
+2. **Firefox**: "고급..." → "위험을 감수하고 계속" 클릭
+3. **Safari**: "세부사항 보기" → "웹 사이트 방문" 클릭
+
+이후 카메라가 정상 작동합니다! 🎉
+
+#### Let's Encrypt 정식 인증서 (프로덕션 권장)
+
+도메인이 있는 경우 무료 정식 SSL 인증서 사용 가능:
+
+```bash
+# 1. 도메인을 EC2 IP에 연결 (Route 53, Cloudflare 등)
+
+# 2. Certbot 설치
+sudo snap install --classic certbot
+
+# 3. 자동 인증서 설정
+sudo certbot --nginx -d your-domain.com
+
+# 4. 자동 갱신 확인
+sudo certbot renew --dry-run
+```
+
+**장점**:
+- ✅ 브라우저 경고 없음
+- ✅ 무료
+- ✅ 자동 갱신
+
+#### 추가 정보
+
+자세한 설정 방법은 [HTTPS_SETUP.md](HTTPS_SETUP.md) 참고
+
+**AWS 보안 그룹 필수 포트**:
+- 포트 **80** (HTTP) - HTTPS 리다이렉트
+- 포트 **443** (HTTPS) - 메인 접속
+- 포트 22 (SSH) - 서버 관리
 
 ---
 
