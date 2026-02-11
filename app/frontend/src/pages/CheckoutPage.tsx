@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import toast, { Toaster } from "react-hot-toast";
 import { useSessionStore, type WsMessage } from "../stores/sessionStore";
-import { wsCheckoutUrl, uploadVideo, videoStatusUrl } from "../api/client";
+import { wsCheckoutUrl, uploadVideo, videoStatusUrl, setROI } from "../api/client";
 import BillingPanel from "../components/BillingPanel";
 import StatusMetrics from "../components/StatusMetrics";
 import ProductDrawer from "../components/ProductDrawer";
@@ -35,10 +35,21 @@ export default function CheckoutPage() {
   const animRef = useRef<number>(0);
   const prevBillingRef = useRef<Record<string, number>>({});
 
-  // Ensure session exists
+  // Ensure session exists and setup virtual ROI for entry-event mode
   useEffect(() => {
     if (!sessionId) {
       createSession();
+    } else {
+      // Setup full-screen virtual ROI to enable entry-event mode
+      // This prevents counting the same object multiple times
+      setROI(sessionId, [
+        [0, 0],    // Top-left
+        [1, 0],    // Top-right
+        [1, 1],    // Bottom-right
+        [0, 1],    // Bottom-left
+      ]).catch((err) => {
+        console.warn("Failed to set virtual ROI:", err);
+      });
     }
   }, [sessionId, createSession]);
 

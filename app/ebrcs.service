@@ -1,0 +1,21 @@
+[Unit]
+Description=EBRCS Smart Checkout Web App
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ebrcs_streaming/app
+ExecStart=/home/ubuntu/ebrcs_streaming/app/run_web_production.sh
+ExecStop=/home/ubuntu/ebrcs_streaming/app/stop_web.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# 환경 변수
+Environment="PATH=/home/ubuntu/ebrcs_streaming/app/backend/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/ebrcs_streaming/.env
+
+[Install]
+WantedBy=multi-user.target

@@ -23,8 +23,10 @@ __pycache__/
 *.log
 
 # Generated model/index artifacts
-faiss_index.bin
 data/embeddings.npy
 data/labels.npy
 data/faiss_index.bin
 data/adapter_model.safetensors
+
+# Allow adapter config (small, required)
+!data/adapter_config.json

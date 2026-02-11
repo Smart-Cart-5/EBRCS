@@ -1,0 +1,19 @@
+# Streamlit Demo Dependencies
+
+# Streamlit
+streamlit>=1.39.0
+streamlit-drawable-canvas
+
+# AI/ML (공통)
+numpy
+pandas
+opencv-python-headless
+transformers
+torch
+Pillow
+peft
+safetensors
+faiss-cpu
+
+# Data
+pyarrow
