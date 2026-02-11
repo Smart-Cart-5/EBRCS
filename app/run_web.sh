@@ -31,7 +31,7 @@ echo "Frontend: http://localhost:5173"
 echo ""
 
 # Start backend (PYTHONPATH includes project root for checkout_core, data)
-PYTHONPATH="$PROJECT_ROOT" uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload &
+PYTHONPATH="$PROJECT_ROOT" uvicorn app.backend.main:app --host 0.0.0.0 --port 8000 --reload &
 BACKEND_PID=$!
 
 # Start frontend dev server
