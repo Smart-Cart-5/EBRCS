@@ -12,13 +12,10 @@ echo "📦 시스템 업데이트 중..."
 sudo apt-get update 2>/dev/null || true
 sudo apt-get upgrade -y
 
-# 2. Python 3.11 설치
-echo "🐍 Python 3.11 설치 중..."
-sudo apt-get install -y software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt-get update 2>/dev/null || true
-sudo apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip
-sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+# 2. Python 설치 확인 (Ubuntu 24.04는 Python 3.12가 기본)
+echo "🐍 Python 확인 중..."
+sudo apt-get install -y python3 python3-venv python3-pip
+python3 --version
 
 # 3. 기존 Node.js 제거
 echo "📗 기존 Node.js 제거 중..."
@@ -57,7 +54,7 @@ cd ebrcs_streaming
 # 8. Backend 가상환경 설정
 echo "🔨 Backend 가상환경 설정 중..."
 cd app/backend
-python3.11 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
