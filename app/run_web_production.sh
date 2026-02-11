@@ -19,6 +19,10 @@ fi
 # 가상환경 활성화
 source "$APP_DIR/backend/.venv/bin/activate"
 
+# nvm 로드 (Node.js)
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
 # 환경 변수 확인
 if [ ! -f "$PROJECT_ROOT/.env" ]; then
     echo "❌ .env 파일이 없습니다."
