@@ -49,9 +49,9 @@ cd "$APP_DIR"
 
 # Backend 실행 (프로덕션 모드)
 echo "🚀 Backend 시작 중..."
-cd "$PROJECT_ROOT"
-export PYTHONPATH="$PROJECT_ROOT"
-nohup uvicorn app.backend.main:app \
+cd "$APP_DIR"
+export PYTHONPATH="$APP_DIR:$PROJECT_ROOT"
+nohup uvicorn backend.main:app \
     --host 0.0.0.0 \
     --port 8000 \
     --workers 2 \
