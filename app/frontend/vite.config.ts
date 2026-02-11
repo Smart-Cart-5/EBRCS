@@ -3,8 +3,8 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
-  // GitHub Pages base path (저장소 이름과 동일하게 설정)
-  base: process.env.NODE_ENV === 'production' ? '/EBRCS_streaming/' : '/',
+  // AWS 배포용: base를 '/'로 설정 (GitHub Pages는 별도 브랜치 사용)
+  base: '/',
 
   plugins: [react(), tailwindcss()],
   server: {
@@ -13,8 +13,12 @@ export default defineConfig({
       "/api": {
         target: "http://localhost:8000",
         changeOrigin: true,
-        ws: true,  // WebSocket 지원 추가!
+        ws: true,
       },
     },
+  },
+  preview: {
+    port: 5173,
+    host: '0.0.0.0',  // 외부 접속 허용
   },
 });

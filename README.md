@@ -566,6 +566,84 @@ kill -9 $(lsof -ti:8000)
 
 ---
 
+## 🌐 AWS EC2 배포
+
+### 🚀 완전 자동 배포 (권장)
+
+**단 3단계로 AWS EC2에 배포 완료!**
+
+#### 1️⃣ EC2 준비
+
+- **인스턴스 타입**: t3.large 이상 권장 (GPU 있으면 g4dn.xlarge)
+- **OS**: Ubuntu 22.04 LTS 또는 24.04 LTS
+- **스토리지**: 30GB 이상
+- **보안 그룹**:
+  - SSH (22) - 내 IP만
+  - HTTP (80) - 0.0.0.0/0
+
+#### 2️⃣ 자동 설치 스크립트 실행
+
+EC2에 SSH 접속 후:
+
+```bash
+wget https://raw.githubusercontent.com/Smart-Cart-5/EBRCS/main/setup_aws_ec2_complete.sh
+chmod +x setup_aws_ec2_complete.sh
+./setup_aws_ec2_complete.sh
+```
+
+**자동으로 설치되는 것**:
+- ✅ Python 3.11 + Node.js 20
+- ✅ Backend/Frontend 환경 설정
+- ✅ Nginx 리버스 프록시 (80 포트)
+- ✅ 모든 의존성 패키지
+
+#### 3️⃣ 데이터 업로드 & 실행
+
+**로컬에서 data 폴더 업로드**:
+```bash
+scp -i your-key.pem -r data/* ubuntu@YOUR_EC2_IP:~/ebrcs_streaming/data/
+```
+
+**EC2에서 웹앱 실행**:
+```bash
+cd ~/ebrcs_streaming/app
+./run_web_production.sh
+```
+
+**접속**:
+```
+http://YOUR_EC2_IP
+```
+
+#### 📊 프로덕션 모드 vs 개발 모드
+
+| 항목 | 개발 (`run_web.sh`) | 프로덕션 (`run_web_production.sh`) |
+|------|---------------------|-------------------------------------|
+| 접속 | localhost만 | 외부 접속 가능 |
+| Frontend | Vite dev (핫 리로드) | 빌드된 정적 파일 |
+| Backend | `--reload` | `--workers 2` |
+| 백그라운드 | ❌ | ✅ (nohup) |
+| 포트 | 5173, 8000 | 80 (Nginx) |
+
+#### 🛑 웹앱 종료
+
+```bash
+cd ~/ebrcs_streaming/app
+./stop_web.sh
+```
+
+#### 📊 로그 확인
+
+```bash
+# Backend 로그
+tail -f ~/ebrcs_streaming/app/logs/backend.log
+
+# Frontend 로그
+tail -f ~/ebrcs_streaming/app/logs/frontend.log
+```
+
+---
+
 ## 📝 License
 
 MIT License - 자유롭게 사용, 수정, 배포 가능
