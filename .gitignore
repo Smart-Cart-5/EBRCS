@@ -30,3 +30,7 @@ data/adapter_model.safetensors
 
 # Allow adapter config (small, required)
 !data/adapter_config.json
+
+# Data and logs
+app/data/
+app/logs/
