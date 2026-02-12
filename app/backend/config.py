@@ -33,3 +33,4 @@ MATCH_THRESHOLD = 0.62
 COUNT_COOLDOWN_SECONDS = 3.0  # 중복 방지: 동일 상품 3초 내 재카운트 방지
 ROI_CLEAR_FRAMES = 8
 STREAM_TARGET_WIDTH = 960  # Restored for better quality
+STREAM_SEND_IMAGES = os.getenv("STREAM_SEND_IMAGES", "false").lower() == "true"  # Send images in WebSocket responses (default: false, JSON only)

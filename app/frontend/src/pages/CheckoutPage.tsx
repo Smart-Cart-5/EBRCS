@@ -11,6 +11,8 @@ type Mode = "camera" | "upload";
 export default function CheckoutPage() {
   const [mode, setMode] = useState<Mode>("camera");
   const [connected, setConnected] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState("");
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
 
@@ -26,13 +28,16 @@ export default function CheckoutPage() {
     lastScore,
     lastStatus,
     annotatedFrame,
+    roiPolygon,
   } = useSessionStore();
 
   const wsRef = useRef<WebSocket | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement>(null); // For capturing frames to send to backend
+  const displayCanvasRef = useRef<HTMLCanvasElement>(null); // For rendering at 60 FPS
   const streamRef = useRef<MediaStream | null>(null);
-  const animRef = useRef<number>(0);
+  const captureAnimRef = useRef<number>(0); // For capture/send loop
+  const renderAnimRef = useRef<number>(0); // For render loop (60 FPS)
   const prevBillingRef = useRef<Record<string, number>>({});
 
   // Ensure session exists and setup virtual ROI for entry-event mode
@@ -87,7 +92,8 @@ export default function CheckoutPage() {
     return () => {
       wsRef.current?.close();
       streamRef.current?.getTracks().forEach((t) => t.stop());
-      cancelAnimationFrame(animRef.current);
+      cancelAnimationFrame(captureAnimRef.current);
+      cancelAnimationFrame(renderAnimRef.current);
     };
   }, []);
 
@@ -96,105 +102,255 @@ export default function CheckoutPage() {
     if (!sessionId) return;
 
     try {
-      // Open WebSocket
+      // Start loading state
+      setIsLoading(true);
+      setLoadingMessage("카메라 권한 요청 중...");
+
+      // Request camera and WebSocket in parallel for better UX
+      console.log("📷 Requesting camera access...");
+
+      // Start both operations in parallel
+      const cameraPromise = navigator.mediaDevices.getUserMedia({
+        video: { width: 960, height: 540, facingMode: "environment" },
+      });
+
       const ws = new WebSocket(wsCheckoutUrl(sessionId));
       wsRef.current = ws;
 
-      ws.onopen = () => {
-        console.log("✅ WebSocket connected");
-        setConnected(true);
-      };
+      const wsPromise = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error("WebSocket connection timeout"));
+        }, 10000); // Increased to 10 seconds
+
+        ws.onopen = () => {
+          clearTimeout(timeout);
+          console.log("✅ WebSocket connected");
+          resolve();
+        };
+        ws.onerror = (err) => {
+          clearTimeout(timeout);
+          console.error("❌ WebSocket error:", err);
+          reject(new Error("WebSocket connection failed"));
+        };
+      });
+
+      // Setup WebSocket message handlers
       ws.onclose = () => {
         console.log("❌ WebSocket closed");
         setConnected(false);
       };
-      ws.onerror = (err) => {
-        console.error("❌ WebSocket error:", err);
-        alert("WebSocket connection failed. Check if backend is running.");
-      };
       ws.onmessage = (e) => {
         const data: WsMessage = JSON.parse(e.data);
-        console.log("📥 Received frame from backend", {
+        console.log("📥 Received state from backend", {
           has_frame: !!data.frame,
+          has_roi: !!data.roi_polygon,
           total_count: data.total_count,
           last_label: data.last_label,
         });
         updateFromWsMessage(data);
       };
 
-      // Open camera
-      console.log("📷 Requesting camera access...");
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 960, height: 540, facingMode: "environment" },
-      });
+      // Wait for both camera and WebSocket to be ready
+      setLoadingMessage("카메라 및 서버 연결 중...");
+      const [stream] = await Promise.all([cameraPromise, wsPromise]);
+
       console.log("✅ Camera access granted");
       streamRef.current = stream;
 
-    const video = videoRef.current!;
-    video.srcObject = stream;
+      const video = videoRef.current!;
+      video.srcObject = stream;
 
-    // Wait for video to be ready
-    await new Promise<void>((resolve) => {
-      video.onloadedmetadata = () => {
-        console.log("📹 Video metadata loaded");
-        resolve();
-      };
-    });
+      // Wait for video to be ready
+      setLoadingMessage("카메라 준비 중...");
+      await new Promise<void>((resolve) => {
+        video.onloadedmetadata = () => {
+          console.log("📹 Video metadata loaded");
+          resolve();
+        };
+      });
 
-    await video.play();
-    console.log("▶️ Video playing");
+      await video.play();
+      console.log("▶️ Video playing");
 
-    const canvas = canvasRef.current!;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d")!;
-    console.log(`📐 Canvas size: ${canvas.width}x${canvas.height}`);
+      // Wait for both video dimensions AND canvas refs to be ready
+      // Critical for mobile browsers where DOM mounting can be slower
+      setLoadingMessage("화면 초기화 중...");
+      await new Promise<void>((resolve, reject) => {
+        let attempts = 0;
+        const maxAttempts = 100; // ~1.6 seconds max wait
 
-    let lastSend = 0;
-    let frameCount = 0;
-    const sendFrame = () => {
-      animRef.current = requestAnimationFrame(sendFrame);
-      const now = performance.now();
-      if (now - lastSend < 33) return; // 30 FPS max (reduced latency)
-      if (ws.readyState !== WebSocket.OPEN) {
-        if (frameCount === 0) {
-          console.log("⏳ Waiting for WebSocket to be ready...");
-        }
-        return;
+        const checkReady = () => {
+          attempts++;
+
+          // Check if canvas refs are available
+          if (!captureCanvasRef.current || !displayCanvasRef.current) {
+            console.log(`⏳ Waiting for canvas refs... (attempt ${attempts})`);
+            if (attempts < maxAttempts) {
+              requestAnimationFrame(checkReady);
+            } else {
+              reject(new Error("Canvas refs not available after timeout"));
+            }
+            return;
+          }
+
+          // Check if video dimensions are available
+          if (video.videoWidth > 0 && video.videoHeight > 0) {
+            console.log(`✅ Ready: video=${video.videoWidth}x${video.videoHeight}, canvases=mounted`);
+            resolve();
+          } else {
+            console.log(`⏳ Waiting for video dimensions... (attempt ${attempts})`);
+            if (attempts < maxAttempts) {
+              requestAnimationFrame(checkReady);
+            } else {
+              reject(new Error("Video dimensions not available after timeout"));
+            }
+          }
+        };
+
+        checkReady();
+      });
+
+      // Setup canvases - now guaranteed to exist
+      const captureCanvas = captureCanvasRef.current;
+      const displayCanvas = displayCanvasRef.current;
+
+      if (!captureCanvas || !displayCanvas) {
+        throw new Error("Canvas elements not found after ready check");
       }
 
-      ctx.drawImage(video, 0, 0);
-      canvas.toBlob(
-        (blob) => {
-          if (blob && ws.readyState === WebSocket.OPEN) {
-            ws.send(blob);
-            frameCount++;
-            if (frameCount === 1) {
-              console.log("📤 First frame sent to backend");
+      // Use actual video dimensions (guaranteed to be > 0 now)
+      const canvasWidth = video.videoWidth;
+      const canvasHeight = video.videoHeight;
+
+      console.log(`🎨 Setting canvas size: ${canvasWidth}x${canvasHeight}`);
+
+      captureCanvas.width = canvasWidth;
+      captureCanvas.height = canvasHeight;
+      displayCanvas.width = canvasWidth;
+      displayCanvas.height = canvasHeight;
+
+      const captureCtx = captureCanvas.getContext("2d");
+      const displayCtx = displayCanvas.getContext("2d");
+
+      if (!captureCtx || !displayCtx) {
+        throw new Error("Failed to get 2D context from canvas");
+      }
+
+      // 60 FPS rendering loop (local camera + overlay)
+      const renderFrame = () => {
+        renderAnimRef.current = requestAnimationFrame(renderFrame);
+
+        // Draw video to display canvas
+        displayCtx.drawImage(video, 0, 0, displayCanvas.width, displayCanvas.height);
+
+        // Draw ROI polygon overlay
+        if (roiPolygon && roiPolygon.length > 0) {
+          displayCtx.strokeStyle = 'rgb(0, 181, 255)'; // Orange color
+          displayCtx.lineWidth = 2;
+          displayCtx.beginPath();
+
+          roiPolygon.forEach((point, i) => {
+            const x = point[0] * displayCanvas.width;
+            const y = point[1] * displayCanvas.height;
+            if (i === 0) {
+              displayCtx.moveTo(x, y);
+            } else {
+              displayCtx.lineTo(x, y);
             }
-            lastSend = performance.now();
+          });
+
+          displayCtx.closePath();
+          displayCtx.stroke();
+        }
+
+        // Draw status text overlay
+        if (lastLabel) {
+          const text = `${lastLabel} (${lastScore.toFixed(3)})`;
+          displayCtx.font = 'bold 20px sans-serif';
+
+          // Text shadow for better visibility
+          displayCtx.strokeStyle = 'black';
+          displayCtx.lineWidth = 4;
+          displayCtx.strokeText(text, 10, 30);
+
+          displayCtx.fillStyle = 'white';
+          displayCtx.fillText(text, 10, 30);
+        }
+
+        // Draw status indicator
+        if (lastStatus) {
+          displayCtx.font = '14px sans-serif';
+          displayCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+          displayCtx.fillRect(10, displayCanvas.height - 30, 150, 20);
+          displayCtx.fillStyle = 'white';
+          displayCtx.fillText(lastStatus, 15, displayCanvas.height - 15);
+        }
+      };
+
+      // 10-15 FPS capture and send loop
+      let lastSend = 0;
+      let frameCount = 0;
+      const sendFrame = () => {
+        captureAnimRef.current = requestAnimationFrame(sendFrame);
+        const now = performance.now();
+
+        // Throttle to 10-15 FPS (66-100ms interval)
+        if (now - lastSend < 80) return; // ~12.5 FPS
+
+        if (ws.readyState !== WebSocket.OPEN) {
+          if (frameCount === 0) {
+            console.log("⏳ Waiting for WebSocket to be ready...");
           }
-        },
-        "image/jpeg",
-        0.7,
-      );
-    };
-    console.log("🎬 Starting frame capture loop");
-    sendFrame();
+          return;
+        }
+
+        captureCtx.drawImage(video, 0, 0);
+        captureCanvas.toBlob(
+          (blob) => {
+            if (blob && ws.readyState === WebSocket.OPEN) {
+              ws.send(blob);
+              frameCount++;
+              if (frameCount === 1) {
+                console.log("📤 First frame sent to backend");
+              }
+              lastSend = performance.now();
+            }
+          },
+          "image/jpeg",
+          0.7,
+        );
+      };
+
+      console.log("🎬 Starting 60 FPS render loop and 12.5 FPS capture loop");
+      renderFrame();
+      sendFrame();
+
+      // All ready - show camera feed
+      setLoadingMessage("완료!");
+      setTimeout(() => {
+        setConnected(true);
+        setIsLoading(false);
+        setLoadingMessage("");
+      }, 300); // Small delay for smooth transition
     } catch (error) {
       console.error("❌ Camera error:", error);
+      setIsLoading(false);
+      setLoadingMessage("");
       alert(`Failed to start camera: ${error instanceof Error ? error.message : String(error)}`);
       stopCamera();
     }
-  }, [sessionId, updateFromWsMessage]);
+  }, [sessionId, updateFromWsMessage, roiPolygon, lastLabel, lastScore, lastStatus]);
 
   const stopCamera = useCallback(() => {
     wsRef.current?.close();
     wsRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
-    cancelAnimationFrame(animRef.current);
+    cancelAnimationFrame(captureAnimRef.current);
+    cancelAnimationFrame(renderAnimRef.current);
     setConnected(false);
+    setIsLoading(false);
+    setLoadingMessage("");
   }, []);
 
   // --- Upload mode ---
@@ -242,16 +398,19 @@ export default function CheckoutPage() {
           <div className="bg-[#1e293b] rounded-none lg:rounded-2xl overflow-hidden relative h-[calc(100vh-64px)] lg:h-full flex items-center justify-center">
           {/* Hidden video + canvas for capture */}
           <video ref={videoRef} className="hidden" playsInline muted />
-          <canvas ref={canvasRef} className="hidden" />
+          <canvas ref={captureCanvasRef} className="hidden" />
+
+          {/* Display canvas - always in DOM, visibility controlled by CSS */}
+          <canvas
+            ref={displayCanvasRef}
+            className={`max-w-full max-h-full object-contain ${
+              mode === "camera" && connected ? "" : "hidden"
+            }`}
+          />
 
           {mode === "camera" ? (
-            connected && annotatedFrame ? (
+            connected ? (
               <>
-                <img
-                  src={`data:image/jpeg;base64,${annotatedFrame}`}
-                  alt="Camera feed"
-                  className="max-w-full max-h-full object-contain"
-                />
                 {/* Live Badge */}
                 <div className="absolute top-3 left-3 md:top-4 md:left-4 bg-[var(--color-success)] text-white px-2 py-1 md:px-3 md:py-1 rounded-full text-xs md:text-sm font-semibold flex items-center gap-1.5 md:gap-2">
                   <span className="w-1.5 h-1.5 md:w-2 md:h-2 bg-white rounded-full animate-pulse" />
@@ -267,14 +426,23 @@ export default function CheckoutPage() {
               </>
             ) : (
               <div className="text-center">
-                <span className="text-5xl md:text-6xl mb-3 md:mb-4 block">📷</span>
-                <p className="text-gray-400 mb-3 md:mb-4 text-sm md:text-base">카메라 시작 중...</p>
+                <span className="text-5xl md:text-6xl mb-3 md:mb-4 block">
+                  {isLoading ? "⏳" : "📷"}
+                </span>
+                <p className="text-gray-400 mb-3 md:mb-4 text-sm md:text-base">
+                  {isLoading ? loadingMessage : "카메라를 시작하려면 버튼을 클릭하세요"}
+                </p>
+                {isLoading && (
+                  <div className="mb-4">
+                    <div className="inline-block w-8 h-8 border-4 border-gray-600 border-t-[var(--color-success)] rounded-full animate-spin"></div>
+                  </div>
+                )}
                 <button
                   onClick={startCamera}
-                  disabled={connected}
-                  className="px-5 py-2.5 md:px-6 md:py-3 bg-[var(--color-success)] hover:bg-[var(--color-success-hover)] text-white rounded-lg md:rounded-xl text-sm md:text-base font-semibold disabled:opacity-50 transition-colors shadow-lg"
+                  disabled={isLoading}
+                  className="px-5 py-2.5 md:px-6 md:py-3 bg-[var(--color-success)] hover:bg-[var(--color-success-hover)] text-white rounded-lg md:rounded-xl text-sm md:text-base font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-lg"
                 >
-                  {connected ? "연결 중..." : "카메라 시작"}
+                  {isLoading ? "준비 중..." : "카메라 시작"}
                 </button>
               </div>
             )

@@ -53,6 +53,9 @@ def _process_frame_sync(
     frame = _resize_frame(frame, config.STREAM_TARGET_WIDTH)
     session.frame_count += 1
 
+    # Get ROI polygon coordinates (normalized 0-1)
+    roi_polygon_normalized = session.roi_polygon if hasattr(session, 'roi_polygon') else None
+
     # Fast path: skip heavy processing for non-inference frames
     should_infer = session.frame_count % max(1, config.DETECT_EVERY_N_FRAMES) == 0
 
@@ -70,6 +73,7 @@ def _process_frame_sync(
             "last_score": round(session.state["last_score"], 4),
             "last_status": "표시중",  # Non-inference frame
             "total_count": sum(session.state["billing_items"].values()),
+            "roi_polygon": roi_polygon_normalized,  # Normalized coordinates for frontend
         }
         return display_frame, state_snapshot
 
@@ -100,6 +104,7 @@ def _process_frame_sync(
         "last_score": round(session.state["last_score"], 4),
         "last_status": session.state["last_status"],
         "total_count": sum(session.state["billing_items"].values()),
+        "roi_polygon": roi_polygon_normalized,  # Normalized coordinates for frontend
     }
 
     return display_frame, state_snapshot
@@ -197,13 +202,17 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
                 # Run inference with reader lock
                 display_frame, state_snapshot = await _process_frame(session, frame)
 
-                # Encode annotated frame as JPEG
-                _, jpeg_buf = cv2.imencode(
-                    ".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
-                )
-                frame_b64 = base64.b64encode(jpeg_buf.tobytes()).decode("ascii")
+                # Conditionally encode and send image based on config
+                if config.STREAM_SEND_IMAGES:
+                    _, jpeg_buf = cv2.imencode(
+                        ".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
+                    )
+                    frame_b64 = base64.b64encode(jpeg_buf.tobytes()).decode("ascii")
+                    response = {"frame": frame_b64, **state_snapshot}
+                else:
+                    # JSON-only mode: no image, just state and ROI
+                    response = state_snapshot
 
-                response = {"frame": frame_b64, **state_snapshot}
                 await websocket.send_text(json.dumps(response))
 
                 # Log performance every 30 frames

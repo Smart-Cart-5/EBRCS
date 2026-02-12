@@ -9,7 +9,8 @@ interface SessionStore {
   lastLabel: string;
   lastScore: number;
   lastStatus: string;
-  annotatedFrame: string | null; // base64 JPEG
+  annotatedFrame: string | null; // base64 JPEG (optional in JSON-only mode)
+  roiPolygon: number[][] | null; // Normalized ROI polygon coordinates [[x1,y1], [x2,y2], ...]
 
   createSession: () => Promise<string>;
   updateFromWsMessage: (data: WsMessage) => void;
@@ -18,13 +19,14 @@ interface SessionStore {
 }
 
 export interface WsMessage {
-  frame: string;
+  frame?: string; // Optional: only sent when STREAM_SEND_IMAGES=true
   billing_items: Record<string, number>;
   item_scores: Record<string, number>;
   last_label: string;
   last_score: number;
   last_status: string;
   total_count: number;
+  roi_polygon?: number[][] | null; // Normalized ROI polygon coordinates
 }
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
@@ -36,6 +38,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   lastScore: 0,
   lastStatus: "",
   annotatedFrame: null,
+  roiPolygon: null,
 
   createSession: async () => {
     const { session_id } = await api.createSession();
@@ -45,13 +48,14 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
 
   updateFromWsMessage: (data: WsMessage) => {
     set({
-      annotatedFrame: data.frame,
+      annotatedFrame: data.frame ?? null,
       billingItems: data.billing_items,
       itemScores: data.item_scores,
       lastLabel: data.last_label,
       lastScore: data.last_score,
       lastStatus: data.last_status,
       totalCount: data.total_count,
+      roiPolygon: data.roi_polygon ?? null,
     });
   },
 
@@ -69,6 +73,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       lastScore: 0,
       lastStatus: "",
       annotatedFrame: null,
+      roiPolygon: null,
     });
   },
 }));

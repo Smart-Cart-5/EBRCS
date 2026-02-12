@@ -31,6 +31,9 @@ data/adapter_model.safetensors
 # Allow adapter config (small, required)
 !data/adapter_config.json
 
+# YOLO model files
+*.pt
+
 # Data and logs
 app/data/
 app/logs/
