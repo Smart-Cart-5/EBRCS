@@ -24,4 +24,19 @@ fi
 pkill -f "uvicorn backend.main:app" || true
 pkill -f "vite preview" || true
 
+sleep 2
+
+# 포트 기반 강제 종료
+PORT_PID=$(lsof -ti:8000 2>/dev/null || true)
+if [ -n "$PORT_PID" ]; then
+    echo "  ✓ 포트 8000 점유 프로세스 강제 종료 (PID: $PORT_PID)"
+    kill -9 $PORT_PID || true
+fi
+
+PORT_PID=$(lsof -ti:5173 2>/dev/null || true)
+if [ -n "$PORT_PID" ]; then
+    echo "  ✓ 포트 5173 점유 프로세스 강제 종료 (PID: $PORT_PID)"
+    kill -9 $PORT_PID || true
+fi
+
 echo "✅ 종료 완료"

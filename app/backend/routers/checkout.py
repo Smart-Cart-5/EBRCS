@@ -53,6 +53,27 @@ def _process_frame_sync(
     frame = _resize_frame(frame, config.STREAM_TARGET_WIDTH)
     session.frame_count += 1
 
+    # Fast path: skip heavy processing for non-inference frames
+    should_infer = session.frame_count % max(1, config.DETECT_EVERY_N_FRAMES) == 0
+
+    if not should_infer:
+        # Return frame quickly without heavy processing
+        display_frame = frame.copy()
+        roi_poly = session.get_roi_polygon(frame.shape)
+        if roi_poly is not None:
+            cv2.polylines(display_frame, [roi_poly], True, (0, 181, 255), 2)
+
+        state_snapshot = {
+            "billing_items": dict(session.state["billing_items"]),
+            "item_scores": {k: round(v, 4) for k, v in session.state["item_scores"].items()},
+            "last_label": session.state["last_label"],
+            "last_score": round(session.state["last_score"], 4),
+            "last_status": "표시중",  # Non-inference frame
+            "total_count": sum(session.state["billing_items"].values()),
+        }
+        return display_frame, state_snapshot
+
+    # Full processing path for inference frames
     roi_poly = session.get_roi_polygon(frame.shape)
 
     display_frame = process_checkout_frame(
@@ -126,7 +147,8 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
     await websocket.accept()
     logger.info("WebSocket connected: session=%s", session_id)
 
-    # Latest-frame-wins queue for back-pressure
+    # Latest-frame-only queue for minimum latency
+    # Small queue + drop old frames = always process most recent frame
     frame_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=2)
 
     async def receive_loop():
@@ -145,9 +167,24 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
 
     async def process_loop():
         loop = asyncio.get_event_loop()
+        frame_times = []
         try:
             while True:
-                data = await frame_queue.get()
+                start_time = time.time()
+
+                # Always get the latest frame, discard old ones for minimum latency
+                data = None
+                dropped_frames = 0
+                while True:
+                    try:
+                        data = frame_queue.get_nowait()
+                        if not frame_queue.empty():
+                            dropped_frames += 1
+                    except asyncio.QueueEmpty:
+                        if data is None:
+                            data = await frame_queue.get()  # Wait for first frame
+                        break
+
                 if data == b"":
                     break  # Disconnected
 
@@ -168,6 +205,18 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
 
                 response = {"frame": frame_b64, **state_snapshot}
                 await websocket.send_text(json.dumps(response))
+
+                # Log performance every 30 frames
+                frame_time = (time.time() - start_time) * 1000
+                frame_times.append(frame_time)
+                if len(frame_times) >= 30:
+                    avg_time = sum(frame_times) / len(frame_times)
+                    fps = 1000 / avg_time if avg_time > 0 else 0
+                    logger.info(
+                        "Checkout performance: avg=%.1fms, fps=%.1f, dropped=%d",
+                        avg_time, fps, dropped_frames
+                    )
+                    frame_times = []
         except WebSocketDisconnect:
             pass
         except Exception:

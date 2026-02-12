@@ -155,7 +155,7 @@ export default function CheckoutPage() {
     const sendFrame = () => {
       animRef.current = requestAnimationFrame(sendFrame);
       const now = performance.now();
-      if (now - lastSend < 200) return; // 5 FPS max
+      if (now - lastSend < 33) return; // 30 FPS max (reduced latency)
       if (ws.readyState !== WebSocket.OPEN) {
         if (frameCount === 0) {
           console.log("⏳ Waiting for WebSocket to be ready...");

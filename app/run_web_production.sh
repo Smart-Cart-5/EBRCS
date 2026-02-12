@@ -37,9 +37,49 @@ mkdir -p "$APP_DIR/logs"
 
 # 기존 프로세스 종료
 echo "🔄 기존 프로세스 종료 중..."
+
+# PID 파일 기반 종료
+if [ -f "$APP_DIR/logs/backend.pid" ]; then
+    BACKEND_PID=$(cat "$APP_DIR/logs/backend.pid")
+    kill $BACKEND_PID 2>/dev/null || true
+    echo "  - Backend PID $BACKEND_PID 종료 시도"
+fi
+
+if [ -f "$APP_DIR/logs/frontend.pid" ]; then
+    FRONTEND_PID=$(cat "$APP_DIR/logs/frontend.pid")
+    kill $FRONTEND_PID 2>/dev/null || true
+    echo "  - Frontend PID $FRONTEND_PID 종료 시도"
+fi
+
+# pkill로 남은 프로세스 종료
 pkill -f "uvicorn backend.main:app" || true
-pkill -f "vite" || true
+pkill -f "vite preview" || true
 sleep 2
+
+# 포트 8000을 사용 중인 프로세스 강제 종료
+PORT_PID=$(lsof -ti:8000 || true)
+if [ -n "$PORT_PID" ]; then
+    echo "  - 포트 8000 점유 프로세스 (PID: $PORT_PID) 강제 종료"
+    kill -9 $PORT_PID || true
+    sleep 1
+fi
+
+# 포트 5173을 사용 중인 프로세스 강제 종료
+PORT_PID=$(lsof -ti:5173 || true)
+if [ -n "$PORT_PID" ]; then
+    echo "  - 포트 5173 점유 프로세스 (PID: $PORT_PID) 강제 종료"
+    kill -9 $PORT_PID || true
+    sleep 1
+fi
+
+# 최종 확인
+if lsof -i:8000 >/dev/null 2>&1; then
+    echo "❌ 포트 8000을 해제할 수 없습니다. 수동으로 확인하세요:"
+    echo "   lsof -i:8000"
+    exit 1
+fi
+
+echo "  ✓ 기존 프로세스 종료 완료"
 
 # Frontend 빌드
 echo "🔨 Frontend 빌드 중..."
