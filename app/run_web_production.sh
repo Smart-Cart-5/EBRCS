@@ -94,7 +94,7 @@ export PYTHONPATH="$APP_DIR:$PROJECT_ROOT"
 nohup uvicorn backend.main:app \
     --host 0.0.0.0 \
     --port 8000 \
-    --workers 2 \
+    --workers 1 \
     > "$APP_DIR/logs/backend.log" 2>&1 &
 
 BACKEND_PID=$!

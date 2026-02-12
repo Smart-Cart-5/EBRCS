@@ -11,6 +11,11 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+# Configure logging for backend and checkout_core
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logging.getLogger("backend").setLevel(logging.INFO)
+logging.getLogger("checkout_core").setLevel(logging.INFO)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -34,11 +39,12 @@ async def lifespan(app: FastAPI):
         load_models,
     )
 
-    logger.info("Loading AI models (DINOv3 + CLIP) ...")
+    logger.info("Loading AI models from %s ...", config.ADAPTER_DIR)
     bundle = load_models(adapter_dir=config.ADAPTER_DIR)
     logger.info(
-        "Models loaded on %s (LoRA: %s)",
+        "Models loaded on %s (mode: %s, weights: %s)",
         bundle["device"],
+        bundle.get("mode", "unknown"),
         bundle.get("lora_loaded", False),
     )
 

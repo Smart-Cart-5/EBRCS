@@ -8,8 +8,8 @@ from pathlib import Path
 # Project root (parent of backend/)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Data directory
-DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data")))
+# Data directory (data2 = UltimateFusion model, data = original ensemble model)
+DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT.parent / "data2")))
 
 # File paths
 EMBEDDINGS_PATH = str(DATA_DIR / "embeddings.npy")

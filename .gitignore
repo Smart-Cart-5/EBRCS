@@ -34,6 +34,7 @@ data/adapter_model.safetensors
 # YOLO model files
 *.pt
 
-# Data and logs
+# Data directories (large model/embedding files)
+data2/
 app/data/
 app/logs/
