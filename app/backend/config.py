@@ -17,6 +17,12 @@ LABELS_PATH = str(DATA_DIR / "labels.npy")
 FAISS_INDEX_PATH = str(DATA_DIR / "faiss_index.bin")
 ADAPTER_DIR = str(DATA_DIR)
 
+# YOLO model (optional: if not found, falls back to background subtraction)
+_DEFAULT_YOLO_PATH = str(PROJECT_ROOT.parent / "smartcart_hand_yolo11_best_arg_best.pt")
+YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", _DEFAULT_YOLO_PATH)
+YOLO_CONF_THRESHOLD = float(os.getenv("YOLO_CONF_THRESHOLD", "0.5"))
+USE_YOLO = os.getenv("USE_YOLO", "true").lower() == "true"
+
 # Server
 CORS_ORIGINS: list[str] = os.getenv(
     "CORS_ORIGINS", "http://localhost:5173,http://localhost:3000"

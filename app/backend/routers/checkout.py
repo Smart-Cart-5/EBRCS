@@ -42,11 +42,15 @@ def _process_frame_sync(
     model_bundle: dict,
     faiss_index: Any,
     labels: np.ndarray,
+    yolo_detector: Any = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Run one frame through the checkout pipeline (sync, for thread pool execution).
 
     IMPORTANT: This function expects FAISS index snapshot to be passed in,
     ensuring consistency during the entire frame processing.
+
+    Args:
+        yolo_detector: Optional YOLO detector for object detection.
     """
     from checkout_core.frame_processor import process_checkout_frame
 
@@ -74,6 +78,7 @@ def _process_frame_sync(
             "last_status": "표시중",  # Non-inference frame
             "total_count": sum(session.state["billing_items"].values()),
             "roi_polygon": roi_polygon_normalized,  # Normalized coordinates for frontend
+            "detection_boxes": session.state.get("detection_boxes", []),  # YOLO detections
         }
         return display_frame, state_snapshot
 
@@ -95,6 +100,7 @@ def _process_frame_sync(
         roi_poly=roi_poly,
         roi_clear_frames=config.ROI_CLEAR_FRAMES,
         roi_entry_mode=roi_poly is not None,
+        yolo_detector=yolo_detector,
     )
 
     state_snapshot = {
@@ -105,6 +111,7 @@ def _process_frame_sync(
         "last_status": session.state["last_status"],
         "total_count": sum(session.state["billing_items"].values()),
         "roi_polygon": roi_polygon_normalized,  # Normalized coordinates for frontend
+        "detection_boxes": session.state.get("detection_boxes", []),  # YOLO detections
     }
 
     return display_frame, state_snapshot
@@ -124,10 +131,11 @@ async def _process_frame(session: CheckoutSession, frame: np.ndarray) -> tuple[n
         model_bundle = app_state.model_bundle
         faiss_index = app_state.faiss_index
         labels = app_state.labels
+        yolo_detector = app_state.yolo_detector
 
         # Run CPU/GPU-intensive work in thread pool
         return await loop.run_in_executor(
-            None, _process_frame_sync, session, frame, model_bundle, faiss_index, labels
+            None, _process_frame_sync, session, frame, model_bundle, faiss_index, labels, yolo_detector
         )
 
 

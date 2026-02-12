@@ -1,6 +1,14 @@
 import { create } from "zustand";
 import * as api from "../api/client";
 
+export interface DetectionBox {
+  box: number[]; // [x1, y1, x2, y2] normalized coordinates (0-1)
+  class: "product" | "hand";
+  confidence: number;
+  label?: string; // Product label (if matched via CLIP+DINO)
+  score?: number; // Matching score (if matched via CLIP+DINO)
+}
+
 interface SessionStore {
   sessionId: string | null;
   billingItems: Record<string, number>;
@@ -11,6 +19,7 @@ interface SessionStore {
   lastStatus: string;
   annotatedFrame: string | null; // base64 JPEG (optional in JSON-only mode)
   roiPolygon: number[][] | null; // Normalized ROI polygon coordinates [[x1,y1], [x2,y2], ...]
+  detectionBoxes: DetectionBox[]; // YOLO detection results
 
   createSession: () => Promise<string>;
   updateFromWsMessage: (data: WsMessage) => void;
@@ -27,6 +36,7 @@ export interface WsMessage {
   last_status: string;
   total_count: number;
   roi_polygon?: number[][] | null; // Normalized ROI polygon coordinates
+  detection_boxes?: DetectionBox[]; // YOLO detection results
 }
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
@@ -39,6 +49,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   lastStatus: "",
   annotatedFrame: null,
   roiPolygon: null,
+  detectionBoxes: [],
 
   createSession: async () => {
     const { session_id } = await api.createSession();
@@ -56,6 +67,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       lastStatus: data.last_status,
       totalCount: data.total_count,
       roiPolygon: data.roi_polygon ?? null,
+      detectionBoxes: data.detection_boxes ?? [],
     });
   },
 
@@ -74,6 +86,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       lastStatus: "",
       annotatedFrame: null,
       roiPolygon: null,
+      detectionBoxes: [],
     });
   },
 }));

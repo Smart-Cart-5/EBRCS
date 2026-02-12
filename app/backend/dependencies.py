@@ -29,6 +29,7 @@ class AppState:
     weighted_db: np.ndarray | None = None
     labels: np.ndarray | None = None
     faiss_index: faiss.IndexFlatIP | None = None
+    yolo_detector: Any | None = None  # Optional YOLO detector for object detection
 
     # RWLock: allows multiple readers OR single writer
     index_rwlock: RWLock = field(default_factory=RWLock)

@@ -29,6 +29,7 @@ export default function CheckoutPage() {
     lastStatus,
     annotatedFrame,
     roiPolygon,
+    detectionBoxes,
   } = useSessionStore();
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -237,19 +238,58 @@ export default function CheckoutPage() {
       }
 
       // 60 FPS rendering loop (local camera + overlay)
+      // Read state from zustand store directly each frame to avoid stale closures
       const renderFrame = () => {
         renderAnimRef.current = requestAnimationFrame(renderFrame);
 
         // Draw video to display canvas
         displayCtx.drawImage(video, 0, 0, displayCanvas.width, displayCanvas.height);
 
+        // Read latest state from store (not from closure)
+        const state = useSessionStore.getState();
+        const boxes = state.detectionBoxes;
+        const roi = state.roiPolygon;
+        const label = state.lastLabel;
+        const score = state.lastScore;
+        const status = state.lastStatus;
+
+        // Draw YOLO detection bounding boxes
+        if (boxes && boxes.length > 0) {
+          boxes.forEach(detection => {
+            const [x1, y1, x2, y2] = detection.box;
+            const x = x1 * displayCanvas.width;
+            const y = y1 * displayCanvas.height;
+            const w = (x2 - x1) * displayCanvas.width;
+            const h = (y2 - y1) * displayCanvas.height;
+
+            // Color: product = green, hand = red
+            displayCtx.strokeStyle = detection.class === 'product' ? 'rgb(0, 255, 0)' : 'rgb(255, 0, 0)';
+            displayCtx.lineWidth = 2;
+            displayCtx.strokeRect(x, y, w, h);
+
+            // Draw label if matched
+            if (detection.label && detection.score) {
+              const text = `${detection.label} (${detection.score.toFixed(3)})`;
+              displayCtx.font = 'bold 16px sans-serif';
+
+              // Text shadow
+              displayCtx.strokeStyle = 'black';
+              displayCtx.lineWidth = 3;
+              displayCtx.strokeText(text, x, Math.max(20, y - 5));
+
+              displayCtx.fillStyle = 'white';
+              displayCtx.fillText(text, x, Math.max(20, y - 5));
+            }
+          });
+        }
+
         // Draw ROI polygon overlay
-        if (roiPolygon && roiPolygon.length > 0) {
-          displayCtx.strokeStyle = 'rgb(0, 181, 255)'; // Orange color
+        if (roi && roi.length > 0) {
+          displayCtx.strokeStyle = 'rgb(0, 181, 255)';
           displayCtx.lineWidth = 2;
           displayCtx.beginPath();
 
-          roiPolygon.forEach((point, i) => {
+          roi.forEach((point, i) => {
             const x = point[0] * displayCanvas.width;
             const y = point[1] * displayCanvas.height;
             if (i === 0) {
@@ -263,9 +303,9 @@ export default function CheckoutPage() {
           displayCtx.stroke();
         }
 
-        // Draw status text overlay
-        if (lastLabel) {
-          const text = `${lastLabel} (${lastScore.toFixed(3)})`;
+        // Draw status text overlay (top-left)
+        if (label) {
+          const text = `${label} (${score.toFixed(3)})`;
           displayCtx.font = 'bold 20px sans-serif';
 
           // Text shadow for better visibility
@@ -277,13 +317,13 @@ export default function CheckoutPage() {
           displayCtx.fillText(text, 10, 30);
         }
 
-        // Draw status indicator
-        if (lastStatus) {
+        // Draw status indicator (bottom-left)
+        if (status) {
           displayCtx.font = '14px sans-serif';
           displayCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
           displayCtx.fillRect(10, displayCanvas.height - 30, 150, 20);
           displayCtx.fillStyle = 'white';
-          displayCtx.fillText(lastStatus, 15, displayCanvas.height - 15);
+          displayCtx.fillText(status, 15, displayCanvas.height - 15);
         }
       };
 
@@ -339,7 +379,7 @@ export default function CheckoutPage() {
       alert(`Failed to start camera: ${error instanceof Error ? error.message : String(error)}`);
       stopCamera();
     }
-  }, [sessionId, updateFromWsMessage, roiPolygon, lastLabel, lastScore, lastStatus]);
+  }, [sessionId, updateFromWsMessage]);
 
   const stopCamera = useCallback(() => {
     wsRef.current?.close();

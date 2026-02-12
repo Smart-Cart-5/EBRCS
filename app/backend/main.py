@@ -58,11 +58,34 @@ async def lifespan(app: FastAPI):
     faiss_index = build_or_load_index(weighted_db, config.FAISS_INDEX_PATH)
     logger.info("FAISS index ready: %d vectors", faiss_index.ntotal)
 
+    # Load YOLO detector (optional)
+    yolo_detector = None
+    if config.USE_YOLO:
+        if os.path.exists(config.YOLO_MODEL_PATH):
+            try:
+                from checkout_core.yolo_detector import YOLODetector
+
+                device_str = str(bundle["device"])
+                yolo_detector = YOLODetector(
+                    model_path=config.YOLO_MODEL_PATH,
+                    conf_threshold=config.YOLO_CONF_THRESHOLD,
+                    device=device_str,
+                )
+                logger.info("YOLO detector loaded: %s", config.YOLO_MODEL_PATH)
+            except Exception as e:
+                logger.warning("Failed to load YOLO detector: %s (falling back to background subtraction)", e)
+        else:
+            logger.warning(
+                "YOLO model not found at %s (falling back to background subtraction)",
+                config.YOLO_MODEL_PATH
+            )
+
     # Populate shared state
     app_state.model_bundle = bundle
     app_state.weighted_db = weighted_db
     app_state.labels = labels
     app_state.faiss_index = faiss_index
+    app_state.yolo_detector = yolo_detector
     app_state.session_manager._ttl = config.SESSION_TTL_SECONDS
     app_state.session_manager._max_sessions = config.MAX_SESSIONS
 
@@ -99,6 +122,7 @@ def create_app() -> FastAPI:
             "lora_loaded": app_state.model_bundle.get("lora_loaded", False),
             "index_vectors": app_state.faiss_index.ntotal if app_state.faiss_index else 0,
             "active_sessions": app_state.session_manager.active_count,
+            "yolo_loaded": app_state.yolo_detector is not None,
         }
 
     # Serve frontend static files in production (Docker)

@@ -18,6 +18,7 @@ Pillow
 peft
 safetensors
 faiss-cpu
+ultralytics
 
 # Data
 pyarrow
