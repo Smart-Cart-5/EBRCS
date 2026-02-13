@@ -19,8 +19,9 @@ from fastapi.staticfiles import StaticFiles
 import backend.st_shim  # noqa: F401
 
 from backend import config
+from backend.database import Base, engine
 from backend.dependencies import app_state
-from backend.routers import billing, checkout, products, sessions
+from backend.routers import auth, billing, checkout, products, purchases, sessions
 
 logger = logging.getLogger("backend")
 
@@ -28,6 +29,11 @@ logger = logging.getLogger("backend")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load models and FAISS index once at startup."""
+    # Initialize database tables
+    logger.info("Initializing database tables...")
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables ready")
+
     from checkout_core.inference import (
         build_or_load_index,
         load_db,
@@ -86,9 +92,11 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    app.include_router(auth.router, prefix="/api")
     app.include_router(sessions.router, prefix="/api")
     app.include_router(billing.router, prefix="/api")
     app.include_router(products.router, prefix="/api")
+    app.include_router(purchases.router, prefix="/api")
     app.include_router(checkout.router, prefix="/api")
 
     @app.get("/api/health")

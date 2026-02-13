@@ -45,6 +45,13 @@ DINOv3 + CLIP 하이브리드 임베딩을 활용한 상품 자동 인식 및 �
 - **Streamlit 데모**: 빠른 프로토타입 테스트 및 데모
 - **웹앱**: 프로덕션 레벨 FastAPI + React SPA
 
+### 🔐 사용자 인증 & 관리 (Phase 2)
+- **JWT 기반 인증**: 회원가입, 로그인, 자동 로그인 (7일)
+- **역할 기반 접근 제어 (RBAC)**: User / Admin 분리
+- **Admin 대시보드**: 실시간 통계, 인기 상품 TOP 5, 최근 구매 내역
+- **구매 내역 관리**: 사용자별 구매 기록 저장 및 조회
+- **모바일 최적화**: 반응형 UI, 프로필 드롭다운 메뉴
+
 ---
 
 ## 🏗️ 시스템 아키텍처
@@ -94,11 +101,37 @@ EBRCS_streaming/
 │   ├── backend/
 │   │   ├── .venv/        # Backend 가상환경
 │   │   ├── main.py       # FastAPI 앱
+│   │   ├── config.py     # 설정 상수
+│   │   ├── database.py   # SQLAlchemy 데이터베이스 설정
+│   │   ├── models.py     # 데이터베이스 모델 (User, PurchaseHistory)
+│   │   ├── st_shim.py    # Streamlit 호환 레이어
 │   │   ├── routers/      # API 라우터
+│   │   │   ├── auth.py       # 인증 (회원가입, 로그인)
+│   │   │   ├── sessions.py   # 세션 관리
+│   │   │   ├── checkout.py   # 실시간 체크아웃
+│   │   │   ├── billing.py    # 장바구니 관리
+│   │   │   ├── products.py   # 상품 관리
+│   │   │   └── purchases.py  # 구매 내역
 │   │   ├── services/     # 비즈니스 로직
+│   │   │   └── session_manager.py  # CheckoutSession 관리
 │   │   └── requirements.txt
 │   ├── frontend/
 │   │   ├── src/
+│   │   │   ├── pages/         # 페이지 컴포넌트
+│   │   │   │   ├── HomePage.tsx         # 홈 / 대시보드
+│   │   │   │   ├── CheckoutPage.tsx     # 실시간 체크아웃
+│   │   │   │   ├── ValidatePage.tsx     # 영수증 확인
+│   │   │   │   ├── ProductsPage.tsx     # 상품 관리 (관리자)
+│   │   │   │   ├── MyPage.tsx           # 마이페이지
+│   │   │   │   ├── AdminPurchasesPage.tsx  # 구매 내역 (관리자)
+│   │   │   │   ├── LoginPage.tsx        # 로그인
+│   │   │   │   └── SignupPage.tsx       # 회원가입
+│   │   │   ├── stores/        # Zustand 상태 관리
+│   │   │   │   ├── authStore.ts     # 인증 상태
+│   │   │   │   └── sessionStore.ts  # 세션 상태
+│   │   │   ├── api/           # API 클라이언트
+│   │   │   │   └── client.ts
+│   │   │   └── App.tsx
 │   │   ├── package.json
 │   │   └── vite.config.ts
 │   ├── run_web.sh        # 개발 모드
@@ -128,6 +161,44 @@ EBRCS_streaming/
 ```
 
 자세한 구조는 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) 참고
+
+---
+
+## 🔌 API 엔드포인트
+
+### 인증 (Authentication)
+- `POST /api/auth/signup` - 회원가입 (username, password, name)
+- `POST /api/auth/login` - 로그인 (JWT 토큰 발급, 7일 유효)
+- `GET /api/auth/me` - 현재 사용자 정보 조회
+
+### 세션 (Sessions)
+- `POST /api/sessions` - 체크아웃 세션 생성
+- `GET /api/sessions/{id}` - 세션 정보 조회
+- `WebSocket /api/ws/checkout/{id}` - 실시간 카메라 스트리밍 (바이너리 JPEG → JSON 응답)
+- `POST /api/sessions/{id}/video-upload` - 동영상 업로드
+- `GET /api/sessions/{id}/video-status?task_id=` - 동영상 처리 진행률 (SSE)
+
+### 결제 (Billing)
+- `GET /api/sessions/{id}/billing` - 장바구니 조회
+- `PUT /api/sessions/{id}/billing` - 장바구니 수정
+- `POST /api/sessions/{id}/billing/confirm` - 구매 확정
+
+### 상품 (Products)
+- `POST /api/products` - 상품 등록 (이미지 업로드, 관리자 전용)
+- `GET /api/products` - 상품 목록 조회
+- `DELETE /api/products/{id}` - 상품 삭제 (관리자 전용)
+
+### 구매 내역 (Purchases)
+- `GET /api/purchases/my` - 내 구매 내역
+- `GET /api/purchases/all` - 전체 구매 내역 (관리자 전용)
+- `POST /api/purchases` - 구매 기록 생성
+- `GET /api/purchases/dashboard` - 대시보드 통계 (관리자 전용)
+
+### 인증 방식
+모든 보호된 엔드포인트는 JWT Bearer 토큰 필요:
+```bash
+Authorization: Bearer <your_jwt_token>
+```
 
 ---
 
@@ -220,6 +291,79 @@ cd app
 
 - **Frontend**: http://localhost:5173
 - **Backend API**: http://localhost:8000/docs
+
+### 3️⃣ 관리자 계정 생성
+
+웹앱을 처음 실행하면 일반 사용자 계정만 생성됩니다. 관리자 계정을 만들려면:
+
+#### 방법 1: 일반 계정을 관리자로 변경 (권장)
+
+**🪟 Windows**
+
+```cmd
+REM 1. 웹 UI에서 일반 계정 생성 (예: admin / password123)
+
+REM 2. 데이터베이스에서 역할 변경
+cd app
+backend\.venv\Scripts\activate
+python -c "from backend.database import SessionLocal; from backend import models; db = SessionLocal(); user = db.query(models.User).filter(models.User.username == 'admin').first(); user.role = 'admin' if user else None; db.commit() if user else None; print(f'✅ {user.username} 계정이 관리자로 변경되었습니다.') if user else print('❌ 사용자를 찾을 수 없습니다.'); db.close()"
+```
+
+**🍎 macOS / 🐧 Linux**
+
+```bash
+# 1. 웹 UI에서 일반 계정 생성 (예: admin / password123)
+
+# 2. 데이터베이스에서 역할 변경
+cd app
+source backend/.venv/bin/activate
+python -c "
+from backend.database import SessionLocal
+from backend import models
+
+db = SessionLocal()
+user = db.query(models.User).filter(models.User.username == 'admin').first()
+if user:
+    user.role = 'admin'
+    db.commit()
+    print(f'✅ {user.username} 계정이 관리자로 변경되었습니다.')
+else:
+    print('❌ 사용자를 찾을 수 없습니다.')
+db.close()
+"
+```
+
+#### 방법 2: SQLite 도구 사용
+
+**🪟 Windows**
+
+```cmd
+REM 1. 웹 UI에서 일반 계정 생성 (예: admin / password123)
+
+REM 2. SQLite CLI로 직접 수정 (sqlite3.exe 설치 필요)
+sqlite3 data\ebrcs.db "UPDATE users SET role = 'admin' WHERE username = 'admin';"
+
+REM 또는 대화형 모드
+sqlite3 data\ebrcs.db
+UPDATE users SET role = 'admin' WHERE username = 'admin';
+.quit
+```
+
+**🍎 macOS / 🐧 Linux**
+
+```bash
+# 1. 웹 UI에서 일반 계정 생성 (예: admin / password123)
+
+# 2. SQLite CLI로 직접 수정
+sqlite3 data/ebrcs.db "UPDATE users SET role = 'admin' WHERE username = 'admin';"
+
+# 또는 대화형 모드
+sqlite3 data/ebrcs.db
+UPDATE users SET role = 'admin' WHERE username = 'admin';
+.quit
+```
+
+관리자로 로그인하면 대시보드, 상품 관리, 전체 구매 내역 조회 가능합니다.
 
 ---
 
@@ -397,6 +541,11 @@ docker-compose -f docker-compose.yml up
 - **WebSocket** - 실시간 카메라 스트리밍
 - **SSE (Server-Sent Events)** - 비디오 처리 진행률
 - **aiorwlock** - 비동기 Reader-Writer Lock
+- **SQLAlchemy** - ORM (데이터베이스 추상화)
+- **SQLite** - 개발용 데이터베이스
+- **python-jose** - JWT 토큰 생성/검증
+- **bcrypt** - 비밀번호 해싱
+- **Pydantic** - 요청/응답 데이터 검증
 
 ### Frontend
 - **React 18** + TypeScript
@@ -426,15 +575,24 @@ docker-compose -f docker-compose.yml up
 
 ## 🔐 환경 변수
 
-`.env` 파일 설정:
+`.env` 파일 설정 (`.env.example` 참고):
 
 ```bash
 # HuggingFace 토큰 (모델 다운로드용)
 HF_TOKEN=your_huggingface_token_here
 HUGGINGFACE_HUB_TOKEN=your_huggingface_token_here
 
+# JWT 인증용 비밀 키 (Phase 2)
+# 랜덤 문자열 생성 권장
+SECRET_KEY=your_random_secret_key_here
+
 # 선택 사항
 # KMP_DUPLICATE_LIB_OK=TRUE  # macOS OpenMP 이슈 해결
+```
+
+**SECRET_KEY 생성 방법**:
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
 ---

@@ -1,10 +1,12 @@
 import { useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useSessionStore } from "../stores/sessionStore";
-import { updateBilling, confirmBilling } from "../api/client";
+import { useAuthStore } from "../stores/authStore";
+import { updateBilling, confirmBilling, createPurchase } from "../api/client";
 
 export default function ValidatePage() {
   const navigate = useNavigate();
+  const { token } = useAuthStore();
   const {
     sessionId,
     billingItems,
@@ -36,11 +38,32 @@ export default function ValidatePage() {
   );
 
   const handleConfirm = useCallback(async () => {
-    if (!sessionId) return;
-    await confirmBilling(sessionId);
-    resetSession();
-    navigate("/");
-  }, [sessionId, resetSession, navigate]);
+    if (!sessionId || !token) return;
+
+    try {
+      // Create purchase record
+      const items = Object.entries(billingItems).map(([name, count]) => ({
+        name,
+        count,
+      }));
+
+      await createPurchase(token, {
+        session_id: sessionId,
+        items,
+      });
+
+      // Confirm billing
+      await confirmBilling(sessionId);
+
+      // Reset and navigate
+      resetSession();
+      alert("구매가 완료되었습니다! 마이페이지에서 구매 내역을 확인할 수 있습니다.");
+      navigate("/mypage");
+    } catch (error) {
+      console.error("Purchase confirmation failed:", error);
+      alert("구매 확정 중 오류가 발생했습니다.");
+    }
+  }, [sessionId, token, billingItems, resetSession, navigate]);
 
   return (
     <div className="h-full flex flex-col bg-[var(--color-bg)]">

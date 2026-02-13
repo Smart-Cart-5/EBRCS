@@ -37,3 +37,16 @@ data/adapter_model.safetensors
 # Data and logs
 app/data/
 app/logs/
+
+# Node.js (Frontend)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+app/frontend/dist/
+app/frontend/.vite/
+
+# Database
+data/ebrcs.db
+data/ebrcs.db-journal
+*.db
+*.db-journal

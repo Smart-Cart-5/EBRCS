@@ -135,3 +135,119 @@ export function wsCheckoutUrl(sessionId: string): string {
 export function videoStatusUrl(sessionId: string, taskId: string): string {
   return `${BASE}/sessions/${sessionId}/video-status?task_id=${taskId}`;
 }
+
+// --- Authentication ---
+
+export interface User {
+  id: number;
+  username: string;
+  name: string | null;
+  role: string;
+  is_active: boolean;
+}
+
+export interface SignupData {
+  username: string;
+  password: string;
+  name: string;
+  role?: string;
+}
+
+export interface LoginResponse {
+  access_token: string;
+  token_type: string;
+  user: User;
+}
+
+export function signup(data: SignupData): Promise<User> {
+  return request("/auth/signup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export function login(username: string, password: string): Promise<LoginResponse> {
+  const formData = new FormData();
+  formData.append("username", username);
+  formData.append("password", password);
+  return request("/auth/login", {
+    method: "POST",
+    body: formData,
+  });
+}
+
+export function getMe(token: string): Promise<User> {
+  return request("/auth/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Purchase History ---
+
+export interface PurchaseItem {
+  name: string;
+  count: number;
+}
+
+export interface Purchase {
+  id: number;
+  user_id: number;
+  username: string;
+  items: PurchaseItem[];
+  total_amount: number;
+  timestamp: string;
+  notes: string | null;
+}
+
+export interface PurchaseCreate {
+  session_id: string;
+  items: PurchaseItem[];
+  notes?: string;
+}
+
+export function getMyPurchases(token: string): Promise<Purchase[]> {
+  return request("/purchases/my", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getAllPurchases(token: string): Promise<Purchase[]> {
+  return request("/purchases/all", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function createPurchase(
+  token: string,
+  data: PurchaseCreate
+): Promise<Purchase> {
+  return request("/purchases", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(data),
+  });
+}
+
+export interface PopularProduct {
+  name: string;
+  total_count: number;
+}
+
+export interface DashboardStats {
+  total_purchases: number;
+  total_customers: number;
+  today_purchases: number;
+  total_products_sold: number;
+  popular_products: PopularProduct[];
+  recent_purchases: Purchase[];
+}
+
+export function getDashboardStats(token: string): Promise<DashboardStats> {
+  return request("/purchases/dashboard", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
