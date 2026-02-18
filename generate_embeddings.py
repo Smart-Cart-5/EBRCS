@@ -26,10 +26,18 @@ from tqdm import tqdm
 
 # Streamlit shim 먼저 import
 import sys
-sys.path.insert(0, str(Path(__file__).parent))
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
 import backend.st_shim  # noqa: F401
 
 from checkout_core.inference import load_models, extract_dino_embedding, extract_clip_embedding
+
+
+def _resolve_project_path(path_str: str) -> Path:
+    path = Path(path_str)
+    if path.is_absolute():
+        return path
+    return (PROJECT_ROOT / path).resolve()
 
 
 def generate_embeddings_db(
@@ -42,11 +50,11 @@ def generate_embeddings_db(
         images_dir: 상품 이미지 폴더 (하위 폴더 = 상품 이름)
         output_dir: 출력 디렉토리 (embeddings.npy, labels.npy)
     """
-    images_path = Path(images_dir)
+    images_path = _resolve_project_path(images_dir)
     if not images_path.exists():
-        raise FileNotFoundError(f"{images_dir} 폴더가 없습니다.")
+        raise FileNotFoundError(f"{images_path} 폴더가 없습니다.")
 
-    output_path = Path(output_dir)
+    output_path = _resolve_project_path(output_dir)
     output_path.mkdir(exist_ok=True)
 
     # 1. 모델 로딩
@@ -60,7 +68,7 @@ def generate_embeddings_db(
     clip_dim = bundle["clip_dim"]
 
     # 2. 이미지 수집
-    print(f"\n📂 {images_dir}/ 스캔 중...")
+    print(f"\n📂 {images_path} 스캔 중...")
     image_files = []
     labels = []
 

@@ -1,7 +1,10 @@
 @echo off
 REM Streamlit 실행 스크립트 (Windows)
 
-if exist .env (
+if exist ..\.env (
+    echo Loading environment from ..\.env...
+    for /f "delims=" %%a in ('type ..\.env ^| findstr /v "^#"') do set %%a
+) else if exist .env (
     echo Loading environment from .env...
     for /f "delims=" %%a in ('type .env ^| findstr /v "^#"') do set %%a
 )

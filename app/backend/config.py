@@ -5,8 +5,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# Project root (parent of backend/)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Resolve project root robustly for both:
+# - local layout: <repo>/app/backend/config.py -> <repo>
+# - docker layout: /app/backend/config.py -> /app
+_BACKEND_DIR = Path(__file__).resolve().parent
+_APP_DIR = _BACKEND_DIR.parent
+_REPO_CANDIDATE = _APP_DIR.parent
+PROJECT_ROOT = _REPO_CANDIDATE if (_REPO_CANDIDATE / "checkout_core").is_dir() else _APP_DIR
 
 # Data directory
 DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data")))

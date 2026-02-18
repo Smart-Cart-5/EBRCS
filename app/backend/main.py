@@ -11,6 +11,7 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -48,18 +49,31 @@ async def lifespan(app: FastAPI):
         bundle.get("lora_loaded", False),
     )
 
-    emb_mtime = os.path.getmtime(config.EMBEDDINGS_PATH)
-    lbl_mtime = os.path.getmtime(config.LABELS_PATH)
+    os.makedirs(config.DATA_DIR, exist_ok=True)
+    has_embeddings = os.path.exists(config.EMBEDDINGS_PATH)
+    has_labels = os.path.exists(config.LABELS_PATH)
 
-    weighted_db, labels = load_db(
-        bundle["dino_dim"],
-        bundle["clip_dim"],
-        config.EMBEDDINGS_PATH,
-        config.LABELS_PATH,
-        emb_mtime,
-        lbl_mtime,
-    )
-    logger.info("Embedding DB loaded: %d entries", len(labels))
+    if has_embeddings and has_labels:
+        emb_mtime = os.path.getmtime(config.EMBEDDINGS_PATH)
+        lbl_mtime = os.path.getmtime(config.LABELS_PATH)
+        weighted_db, labels = load_db(
+            bundle["dino_dim"],
+            bundle["clip_dim"],
+            config.EMBEDDINGS_PATH,
+            config.LABELS_PATH,
+            emb_mtime,
+            lbl_mtime,
+        )
+        logger.info("Embedding DB loaded: %d entries", len(labels))
+    else:
+        dim = bundle["dino_dim"] + bundle["clip_dim"]
+        weighted_db = np.empty((0, dim), dtype=np.float32)
+        labels = np.array([], dtype=object)
+        logger.warning(
+            "Embedding DB files missing (embeddings=%s, labels=%s). Starting with empty DB.",
+            has_embeddings,
+            has_labels,
+        )
 
     faiss_index = build_or_load_index(weighted_db, config.FAISS_INDEX_PATH)
     logger.info("FAISS index ready: %d vectors", faiss_index.ntotal)

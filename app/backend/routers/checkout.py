@@ -54,7 +54,7 @@ def _process_frame_sync(
     session.frame_count += 1
 
     # Get ROI polygon coordinates (normalized 0-1)
-    roi_polygon_normalized = session.roi_polygon if hasattr(session, 'roi_polygon') else None
+    roi_polygon_normalized = session.roi_poly_norm
 
     # Fast path: skip heavy processing for non-inference frames
     should_infer = session.frame_count % max(1, config.DETECT_EVERY_N_FRAMES) == 0

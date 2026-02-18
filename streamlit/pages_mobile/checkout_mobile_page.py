@@ -27,7 +27,8 @@ from checkout_core.video_input import persist_uploaded_video
 from mobile_nav import MOBILE_NAV_ITEMS, MOBILE_NAV_TO_PAGE
 from ui_theme import apply_theme
 
-DATA_DIR = "data"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 EMBEDDINGS_PATH = os.path.join(DATA_DIR, "embeddings.npy")
 LABELS_PATH = os.path.join(DATA_DIR, "labels.npy")
 FAISS_INDEX_PATH = os.path.join(DATA_DIR, "faiss_index.bin")
