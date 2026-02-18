@@ -53,5 +53,8 @@ EVENT_MODE = os.getenv("EVENT_MODE", "false").lower() == "true"
 T_GRASP_MIN_FRAMES = int(os.getenv("T_GRASP_MIN_FRAMES", "4"))
 T_PLACE_STABLE_FRAMES = int(os.getenv("T_PLACE_STABLE_FRAMES", "12"))
 SNAPSHOT_MAX_FRAMES = int(os.getenv("SNAPSHOT_MAX_FRAMES", "8"))
+WARP_MODE = os.getenv("WARP_MODE", "false").lower() == "true"
+WARP_WIDTH = int(os.getenv("WARP_WIDTH", "640"))
+WARP_HEIGHT = int(os.getenv("WARP_HEIGHT", "480"))
 ENABLE_PROFILING = os.getenv("ENABLE_PROFILING", "false").lower() == "true"
 PROFILE_EVERY_N_FRAMES = int(os.getenv("PROFILE_EVERY_N_FRAMES", "30"))

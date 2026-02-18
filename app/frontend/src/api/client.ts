@@ -47,6 +47,41 @@ export function clearROI(sessionId: string): Promise<void> {
   return request(`/sessions/${sessionId}/roi`, { method: "DELETE" });
 }
 
+export interface WarpResponse {
+  enabled: boolean;
+  points: number[][] | null;
+  size: number[];
+}
+
+export function setWarp(
+  sessionId: string,
+  points: number[][],
+  enabled?: boolean,
+  width?: number,
+  height?: number,
+): Promise<WarpResponse> {
+  return request(`/sessions/${sessionId}/warp`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ points, enabled, width, height }),
+  });
+}
+
+export function setWarpEnabled(
+  sessionId: string,
+  enabled: boolean,
+): Promise<WarpResponse> {
+  return request(`/sessions/${sessionId}/warp/enabled`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export function clearWarp(sessionId: string): Promise<WarpResponse> {
+  return request(`/sessions/${sessionId}/warp`, { method: "DELETE" });
+}
+
 // --- Billing ---
 
 export interface BillingState {

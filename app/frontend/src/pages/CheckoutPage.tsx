@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
 import toast, { Toaster } from "react-hot-toast";
 import { useSessionStore, type WsMessage } from "../stores/sessionStore";
-import { wsCheckoutUrl, uploadVideo, videoStatusUrl, setROI } from "../api/client";
+import { wsCheckoutUrl, uploadVideo, videoStatusUrl, setROI, setWarp, clearWarp, setWarpEnabled } from "../api/client";
 import BillingPanel from "../components/BillingPanel";
 import StatusMetrics from "../components/StatusMetrics";
 import ProductDrawer from "../components/ProductDrawer";
@@ -15,6 +15,8 @@ export default function CheckoutPage() {
   const [loadingMessage, setLoadingMessage] = useState("");
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [setupMode, setSetupMode] = useState(false);
+  const [calibrationPoints, setCalibrationPoints] = useState<number[][]>([]);
 
   const {
     sessionId,
@@ -30,6 +32,8 @@ export default function CheckoutPage() {
     annotatedFrame,
     roiPolygon,
     detectionBoxes,
+    warpEnabled,
+    warpPoints,
   } = useSessionStore();
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -40,6 +44,8 @@ export default function CheckoutPage() {
   const captureAnimRef = useRef<number>(0); // For capture/send loop
   const renderAnimRef = useRef<number>(0); // For render loop (60 FPS)
   const prevBillingRef = useRef<Record<string, number>>({});
+  const setupModeRef = useRef(false);
+  const calibrationPointsRef = useRef<number[][]>([]);
 
   // Ensure session exists and setup virtual ROI for entry-event mode
   useEffect(() => {
@@ -98,7 +104,48 @@ export default function CheckoutPage() {
     };
   }, []);
 
+  useEffect(() => {
+    setupModeRef.current = setupMode;
+  }, [setupMode]);
+
+  useEffect(() => {
+    calibrationPointsRef.current = calibrationPoints;
+  }, [calibrationPoints]);
+
   // --- Camera mode ---
+  const handleCanvasClick = useCallback((e: MouseEvent<HTMLCanvasElement>) => {
+    if (!setupModeRef.current) return;
+    const canvas = displayCanvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const xPx = ((e.clientX - rect.left) / Math.max(1, rect.width)) * canvas.width;
+    const yPx = ((e.clientY - rect.top) / Math.max(1, rect.height)) * canvas.height;
+    const x = Math.max(0, Math.min(1, xPx / Math.max(1, canvas.width)));
+    const y = Math.max(0, Math.min(1, yPx / Math.max(1, canvas.height)));
+    setCalibrationPoints((prev) => {
+      if (prev.length >= 4) return prev;
+      return [...prev, [x, y]];
+    });
+  }, []);
+
+  const applyWarpCalibration = useCallback(async () => {
+    if (!sessionId || calibrationPoints.length !== 4) return;
+    await setWarp(sessionId, calibrationPoints, true);
+    setSetupMode(false);
+  }, [sessionId, calibrationPoints]);
+
+  const resetWarpCalibration = useCallback(async () => {
+    setCalibrationPoints([]);
+    setSetupMode(false);
+    if (!sessionId) return;
+    await clearWarp(sessionId);
+  }, [sessionId]);
+
+  const toggleWarp = useCallback(async () => {
+    if (!sessionId) return;
+    await setWarpEnabled(sessionId, !warpEnabled);
+  }, [sessionId, warpEnabled]);
+
   const startCamera = useCallback(async () => {
     if (!sessionId) return;
 
@@ -252,6 +299,8 @@ export default function CheckoutPage() {
         const label = state.lastLabel;
         const score = state.lastScore;
         const status = state.lastStatus;
+        const activeWarpPoints = state.warpPoints;
+        const activeWarpEnabled = state.warpEnabled;
 
         // Draw YOLO detection bounding boxes
         if (boxes && boxes.length > 0) {
@@ -281,6 +330,51 @@ export default function CheckoutPage() {
               displayCtx.fillText(text, x, Math.max(20, y - 5));
             }
           });
+        }
+
+        // Draw active warp polygon from backend state
+        if (activeWarpPoints && activeWarpPoints.length === 4) {
+          displayCtx.strokeStyle = activeWarpEnabled ? "rgb(59, 130, 246)" : "rgb(107, 114, 128)";
+          displayCtx.lineWidth = 2;
+          displayCtx.beginPath();
+          activeWarpPoints.forEach((point, i) => {
+            const x = point[0] * displayCanvas.width;
+            const y = point[1] * displayCanvas.height;
+            if (i === 0) displayCtx.moveTo(x, y);
+            else displayCtx.lineTo(x, y);
+          });
+          displayCtx.closePath();
+          displayCtx.stroke();
+        }
+
+        // Draw calibration points while setup mode is active
+        if (setupModeRef.current) {
+          const pts = calibrationPointsRef.current;
+          if (pts.length > 0) {
+            displayCtx.strokeStyle = "rgb(250, 204, 21)";
+            displayCtx.fillStyle = "rgb(250, 204, 21)";
+            displayCtx.lineWidth = 2;
+            displayCtx.beginPath();
+            pts.forEach((point, i) => {
+              const x = point[0] * displayCanvas.width;
+              const y = point[1] * displayCanvas.height;
+              if (i === 0) displayCtx.moveTo(x, y);
+              else displayCtx.lineTo(x, y);
+              displayCtx.beginPath();
+              displayCtx.arc(x, y, 6, 0, Math.PI * 2);
+              displayCtx.fill();
+            });
+            if (pts.length >= 2) {
+              displayCtx.beginPath();
+              pts.forEach((point, i) => {
+                const x = point[0] * displayCanvas.width;
+                const y = point[1] * displayCanvas.height;
+                if (i === 0) displayCtx.moveTo(x, y);
+                else displayCtx.lineTo(x, y);
+              });
+              displayCtx.stroke();
+            }
+          }
         }
 
         // Draw ROI polygon overlay
@@ -446,7 +540,45 @@ export default function CheckoutPage() {
             className={`max-w-full max-h-full object-contain ${
               mode === "camera" && connected ? "" : "hidden"
             }`}
+            onClick={handleCanvasClick}
           />
+
+          {/* Setup Bar */}
+          <div className="absolute top-3 left-3 right-3 md:top-4 md:left-4 md:right-4 z-20 bg-black/55 backdrop-blur-sm rounded-xl p-2 flex flex-wrap items-center gap-2 text-xs md:text-sm text-white">
+            <button
+              onClick={() => {
+                setSetupMode(true);
+                setCalibrationPoints([]);
+              }}
+              className="px-3 py-1.5 rounded-lg bg-yellow-500 hover:bg-yellow-400 text-black font-semibold"
+            >
+              ROI 캘리브(4점)
+            </button>
+            <button
+              onClick={applyWarpCalibration}
+              disabled={!sessionId || calibrationPoints.length !== 4}
+              className="px-3 py-1.5 rounded-lg bg-blue-500 hover:bg-blue-400 disabled:opacity-50 disabled:cursor-not-allowed font-semibold"
+            >
+              적용
+            </button>
+            <button
+              onClick={resetWarpCalibration}
+              disabled={!sessionId}
+              className="px-3 py-1.5 rounded-lg bg-slate-600 hover:bg-slate-500 disabled:opacity-50 disabled:cursor-not-allowed font-semibold"
+            >
+              리셋
+            </button>
+            <button
+              onClick={toggleWarp}
+              disabled={!sessionId}
+              className={`px-3 py-1.5 rounded-lg font-semibold disabled:opacity-50 disabled:cursor-not-allowed ${
+                warpEnabled ? "bg-emerald-500 hover:bg-emerald-400" : "bg-gray-600 hover:bg-gray-500"
+              }`}
+            >
+              Warp {warpEnabled ? "ON" : "OFF"}
+            </button>
+            <span className="text-white/90">Points: {calibrationPoints.length}/4 (Saved: {warpPoints?.length ?? 0})</span>
+          </div>
 
           {mode === "camera" ? (
             connected ? (

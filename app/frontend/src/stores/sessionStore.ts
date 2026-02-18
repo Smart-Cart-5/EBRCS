@@ -20,6 +20,8 @@ interface SessionStore {
   annotatedFrame: string | null; // base64 JPEG (optional in JSON-only mode)
   roiPolygon: number[][] | null; // Normalized ROI polygon coordinates [[x1,y1], [x2,y2], ...]
   detectionBoxes: DetectionBox[]; // YOLO detection results
+  warpEnabled: boolean;
+  warpPoints: number[][] | null;
 
   createSession: () => Promise<string>;
   updateFromWsMessage: (data: WsMessage) => void;
@@ -37,6 +39,8 @@ export interface WsMessage {
   total_count: number;
   roi_polygon?: number[][] | null; // Normalized ROI polygon coordinates
   detection_boxes?: DetectionBox[]; // YOLO detection results
+  warp_enabled?: boolean;
+  warp_points?: number[][] | null;
 }
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
@@ -50,6 +54,8 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   annotatedFrame: null,
   roiPolygon: null,
   detectionBoxes: [],
+  warpEnabled: false,
+  warpPoints: null,
 
   createSession: async () => {
     const { session_id } = await api.createSession();
@@ -68,6 +74,8 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       totalCount: data.total_count,
       roiPolygon: data.roi_polygon ?? null,
       detectionBoxes: data.detection_boxes ?? [],
+      warpEnabled: data.warp_enabled ?? false,
+      warpPoints: data.warp_points ?? null,
     });
   },
 
@@ -87,6 +95,8 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       annotatedFrame: null,
       roiPolygon: null,
       detectionBoxes: [],
+      warpEnabled: false,
+      warpPoints: null,
     });
   },
 }));

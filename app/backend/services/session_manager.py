@@ -49,6 +49,9 @@ class CheckoutSession:
 
     # Normalized ROI polygon [[x, y], ...] in [0, 1] range, or None
     roi_poly_norm: list[list[float]] | None = None
+    warp_enabled: bool = False
+    warp_points_norm: list[list[float]] | None = None
+    warp_size: tuple[int, int] = (640, 480)
 
     # Video upload task tracking
     video_task_id: str | None = None

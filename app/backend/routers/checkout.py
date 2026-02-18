@@ -19,6 +19,7 @@ from fastapi.responses import StreamingResponse
 
 from backend import config
 from backend.dependencies import app_state
+from backend.roi_warp import warp_frame
 from backend.services.session_manager import CheckoutSession
 from backend.utils.profiler import FrameProfiler, ProfileCollector
 
@@ -56,6 +57,13 @@ def _process_frame_sync(
     """
     from checkout_core.frame_processor import process_checkout_frame
 
+    warp_active = bool(getattr(session, "warp_enabled", False) and getattr(session, "warp_points_norm", None))
+    if warp_active:
+        try:
+            frame = warp_frame(frame, session.warp_points_norm, session.warp_size)
+        except Exception:
+            logger.exception("Failed to apply warp; fallback to original frame")
+
     if ws_profiler is not None:
         with ws_profiler.measure("resize"):
             frame = _resize_frame(frame, config.STREAM_TARGET_WIDTH)
@@ -89,6 +97,8 @@ def _process_frame_sync(
             "confidence": round(float(session.state.get("confidence", 0.0)), 4),
             "best_pair": session.state.get("best_pair"),
             "event_state": session.state.get("event_state"),
+            "warp_enabled": bool(getattr(session, "warp_enabled", False)),
+            "warp_points": getattr(session, "warp_points_norm", None),
         }
         return display_frame, state_snapshot
 
@@ -131,6 +141,8 @@ def _process_frame_sync(
         "confidence": round(float(session.state.get("confidence", 0.0)), 4),
         "best_pair": session.state.get("best_pair"),
         "event_state": session.state.get("event_state"),
+        "warp_enabled": bool(getattr(session, "warp_enabled", False)),
+        "warp_points": getattr(session, "warp_points_norm", None),
     }
 
     return display_frame, state_snapshot
