@@ -187,6 +187,24 @@ def _classify_snapshots_with_votes(
     return None, best_avg_score, topk_candidates, confidence
 
 
+def _select_remove_label(state: MutableMapping[str, Any]) -> str | None:
+    billing_items = state.get("billing_items", {})
+    if not billing_items:
+        return None
+
+    sequence = state.get("in_cart_sequence", [])
+    while sequence:
+        candidate = sequence[-1]
+        if int(billing_items.get(candidate, 0)) > 0:
+            return candidate
+        sequence.pop()
+
+    ranked = sorted(billing_items.items(), key=lambda x: x[1], reverse=True)
+    if not ranked:
+        return None
+    return str(ranked[0][0])
+
+
 def create_bg_subtractor():
     return cv2.createBackgroundSubtractorKNN(
         history=300,
@@ -278,6 +296,9 @@ def process_checkout_frame(
                 event_engine = AddEventEngine(
                     t_grasp_min_frames=getattr(backend_config, "T_GRASP_MIN_FRAMES", 4),
                     t_place_stable_frames=getattr(backend_config, "T_PLACE_STABLE_FRAMES", 12),
+                    t_remove_confirm_frames=getattr(backend_config, "T_REMOVE_CONFIRM_FRAMES", 45),
+                    roi_hysteresis_inset_ratio=getattr(backend_config, "ROI_HYSTERESIS_INSET_RATIO", 0.05),
+                    roi_hysteresis_outset_ratio=getattr(backend_config, "ROI_HYSTERESIS_OUTSET_RATIO", 0.05),
                 )
                 state["_event_engine"] = event_engine
 
@@ -321,11 +342,30 @@ def process_checkout_frame(
                     state.setdefault("item_scores", {})[name] = best_score
                     billing_items = state.setdefault("billing_items", {})
                     billing_items[name] = int(billing_items.get(name, 0)) + 1
+                    state.setdefault("in_cart_sequence", []).append(name)
                 else:
                     state["last_label"] = "미매칭"
                     state["last_score"] = best_score
                     state["last_status"] = "ADD 미확정"
                 snapshot_buffer.clear()
+
+            if event_update.remove_confirmed:
+                remove_label = _select_remove_label(state)
+                billing_items = state.setdefault("billing_items", {})
+                if remove_label and int(billing_items.get(remove_label, 0)) > 0:
+                    billing_items[remove_label] = int(billing_items.get(remove_label, 0)) - 1
+                    if billing_items[remove_label] <= 0:
+                        billing_items.pop(remove_label, None)
+                    sequence = state.setdefault("in_cart_sequence", [])
+                    for i in range(len(sequence) - 1, -1, -1):
+                        if sequence[i] == remove_label:
+                            sequence.pop(i)
+                            break
+                    state["last_label"] = remove_label
+                    state["last_score"] = 0.0
+                    state["last_status"] = "REMOVE 확정"
+                else:
+                    state["last_status"] = "REMOVE 미확정"
 
             # In EVENT_MODE, defer embedding/FAISS to event confirmation only.
             if roi_poly is not None:

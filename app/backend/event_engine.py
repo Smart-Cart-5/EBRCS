@@ -14,6 +14,7 @@ class EventUpdate:
     state: str
     status: str
     add_confirmed: bool = False
+    remove_confirmed: bool = False
     track_box: list[float] | None = None
 
 
@@ -22,14 +23,28 @@ class AddEventEngine:
     GRASP = "GRASP"
     PLACE_CHECK = "PLACE_CHECK"
     IN_CART = "IN_CART"
+    PICK_CHECK = "PICK_CHECK"
+    REMOVE_CHECK = "REMOVE_CHECK"
 
-    def __init__(self, t_grasp_min_frames: int = 4, t_place_stable_frames: int = 12):
+    def __init__(
+        self,
+        t_grasp_min_frames: int = 4,
+        t_place_stable_frames: int = 12,
+        t_remove_confirm_frames: int = 45,
+        roi_hysteresis_inset_ratio: float = 0.05,
+        roi_hysteresis_outset_ratio: float = 0.05,
+    ):
         self.t_grasp_min_frames = max(1, int(t_grasp_min_frames))
         self.t_place_stable_frames = max(1, int(t_place_stable_frames))
+        self.t_remove_confirm_frames = max(1, int(t_remove_confirm_frames))
+        self.roi_hysteresis_inset_ratio = max(0.0, float(roi_hysteresis_inset_ratio))
+        self.roi_hysteresis_outset_ratio = max(0.0, float(roi_hysteresis_outset_ratio))
         self.state = self.IDLE
         self.grasp_frames = 0
         self.place_stable_frames = 0
         self.place_missing_frames = 0
+        self.pick_frames = 0
+        self.remove_confirm_frames = 0
         self.last_box: list[float] | None = None
 
     @staticmethod
@@ -65,14 +80,40 @@ class AddEventEngine:
                 best_dist = dist
         return best
 
-    @staticmethod
-    def _inside_roi(box: list[float], roi_poly: np.ndarray | None, frame_shape: tuple[int, ...]) -> bool:
+    def _inside_roi(
+        self,
+        box: list[float],
+        roi_poly: np.ndarray | None,
+        frame_shape: tuple[int, ...],
+        *,
+        mode: str = "normal",
+    ) -> bool:
         if roi_poly is None:
             return True
         h, w = frame_shape[:2]
+        poly = roi_poly.astype(np.float32)
+        if mode in {"in", "out"} and len(poly) >= 3:
+            center = np.mean(poly, axis=0)
+            if mode == "in":
+                ratio = max(0.0, 1.0 - self.roi_hysteresis_inset_ratio)
+            else:
+                ratio = 1.0 + self.roi_hysteresis_outset_ratio
+            poly = (poly - center) * ratio + center
         cx = ((box[0] + box[2]) * 0.5) * w
         cy = ((box[1] + box[3]) * 0.5) * h
-        return cv2.pointPolygonTest(roi_poly, (cx, cy), False) >= 0
+        return cv2.pointPolygonTest(poly, (cx, cy), False) >= 0
+
+    def _visible_in_roi(
+        self,
+        products: list[dict[str, Any]],
+        roi_poly: np.ndarray | None,
+        frame_shape: tuple[int, ...],
+    ) -> bool:
+        for product in products:
+            box = product.get("box")
+            if box and self._inside_roi(box, roi_poly, frame_shape, mode="in"):
+                return True
+        return False
 
     def update(
         self,
@@ -118,7 +159,7 @@ class AddEventEngine:
 
             self.last_box = track_box
             hand_separated = paired_box is None
-            in_roi = self._inside_roi(track_box, roi_poly, frame_shape)
+            in_roi = self._inside_roi(track_box, roi_poly, frame_shape, mode="in")
             if hand_separated and in_roi:
                 self.place_stable_frames += 1
             else:
@@ -127,13 +168,56 @@ class AddEventEngine:
             if self.place_stable_frames >= self.t_place_stable_frames:
                 self.state = self.IN_CART
                 self.grasp_frames = 0
+                self.pick_frames = 0
                 return EventUpdate(self.state, "ADD 확정", add_confirmed=True, track_box=track_box)
 
             return EventUpdate(self.state, "PLACE_CHECK", track_box=track_box)
 
-        # IN_CART: start a new cycle when hand grabs again.
-        if paired_box is not None:
-            self.state = self.GRASP
-            self.grasp_frames = 1
-            return EventUpdate(self.state, "GRASP", track_box=self.last_box)
-        return EventUpdate(self.state, "IN_CART", track_box=self.last_box)
+        if self.state == self.IN_CART:
+            if paired_box is not None and self._inside_roi(paired_box, roi_poly, frame_shape, mode="in"):
+                self.pick_frames += 1
+                self.last_box = paired_box
+                if self.pick_frames >= self.t_grasp_min_frames:
+                    self.state = self.PICK_CHECK
+                    self.remove_confirm_frames = 0
+                    return EventUpdate(self.state, "PICK_CHECK", track_box=self.last_box)
+            else:
+                self.pick_frames = 0
+            return EventUpdate(self.state, "IN_CART", track_box=self.last_box)
+
+        if self.state == self.PICK_CHECK:
+            if paired_box is not None:
+                self.last_box = paired_box
+                outside_out = not self._inside_roi(paired_box, roi_poly, frame_shape, mode="out")
+                if outside_out:
+                    self.state = self.REMOVE_CHECK
+                    self.remove_confirm_frames = 1
+                    return EventUpdate(self.state, "REMOVE_CHECK", track_box=self.last_box)
+                return EventUpdate(self.state, "PICK_CHECK", track_box=self.last_box)
+
+            # Hand-product pair lost after pick; begin remove confirmation.
+            self.state = self.REMOVE_CHECK
+            self.remove_confirm_frames = 1
+            return EventUpdate(self.state, "REMOVE_CHECK", track_box=self.last_box)
+
+        # REMOVE_CHECK
+        if paired_box is not None and self._inside_roi(paired_box, roi_poly, frame_shape, mode="in"):
+            self.state = self.IN_CART
+            self.pick_frames = 0
+            self.remove_confirm_frames = 0
+            return EventUpdate(self.state, "REMOVE 취소", track_box=paired_box)
+
+        if self._visible_in_roi(products, roi_poly, frame_shape):
+            self.state = self.IN_CART
+            self.pick_frames = 0
+            self.remove_confirm_frames = 0
+            return EventUpdate(self.state, "REMOVE 취소", track_box=self.last_box)
+
+        self.remove_confirm_frames += 1
+        if self.remove_confirm_frames >= self.t_remove_confirm_frames:
+            self.state = self.IN_CART
+            self.pick_frames = 0
+            self.remove_confirm_frames = 0
+            return EventUpdate(self.state, "REMOVE 확정", remove_confirmed=True, track_box=self.last_box)
+
+        return EventUpdate(self.state, "REMOVE_CHECK", track_box=self.last_box)

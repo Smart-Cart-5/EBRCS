@@ -53,6 +53,9 @@ EVENT_MODE = os.getenv("EVENT_MODE", "false").lower() == "true"
 T_GRASP_MIN_FRAMES = int(os.getenv("T_GRASP_MIN_FRAMES", "4"))
 T_PLACE_STABLE_FRAMES = int(os.getenv("T_PLACE_STABLE_FRAMES", "12"))
 SNAPSHOT_MAX_FRAMES = int(os.getenv("SNAPSHOT_MAX_FRAMES", "8"))
+T_REMOVE_CONFIRM_FRAMES = int(os.getenv("T_REMOVE_CONFIRM_FRAMES", "45"))
+ROI_HYSTERESIS_INSET_RATIO = float(os.getenv("ROI_HYSTERESIS_INSET_RATIO", "0.05"))
+ROI_HYSTERESIS_OUTSET_RATIO = float(os.getenv("ROI_HYSTERESIS_OUTSET_RATIO", "0.05"))
 WARP_MODE = os.getenv("WARP_MODE", "false").lower() == "true"
 WARP_WIDTH = int(os.getenv("WARP_WIDTH", "640"))
 WARP_HEIGHT = int(os.getenv("WARP_HEIGHT", "480"))

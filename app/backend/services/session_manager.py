@@ -34,6 +34,7 @@ class CheckoutSession:
         "confidence": 0.0,
         "best_pair": None,
         "event_state": "IDLE",
+        "in_cart_sequence": [],
         "last_label": "-",
         "last_score": 0.0,
         "last_status": "대기",
@@ -79,6 +80,7 @@ class CheckoutSession:
         self.state["confidence"] = 0.0
         self.state["best_pair"] = None
         self.state["event_state"] = "IDLE"
+        self.state["in_cart_sequence"] = []
         self.state["last_label"] = "-"
         self.state["last_score"] = 0.0
         self.state["last_status"] = "대기"
