@@ -63,6 +63,8 @@ def process_checkout_frame(
     roi_poly: np.ndarray | None = None,
     roi_clear_frames: int = 8,
     roi_entry_mode: bool = False,
+    min_product_bbox_area: int = 2500,
+    max_products_per_frame: int = 3,
     yolo_detector=None,
 ) -> np.ndarray:
     """Process a single frame and update checkout state in-place.
@@ -89,12 +91,27 @@ def process_checkout_frame(
             detections = yolo_detector.detect(frame)
         state["detection_boxes"] = detections  # Store all detections (product + hand)
 
-        # Filter only product detections for embedding
+        # Filter only product detections and keep largest K for stable throughput.
+        frame_h, frame_w = frame.shape[:2]
         product_detections = [d for d in detections if d["class"] == "product"]
+        if product_detections:
+            product_detections = sorted(
+                product_detections,
+                key=lambda d: max(0.0, (d["box"][2] - d["box"][0]) * frame_w)
+                * max(0.0, (d["box"][3] - d["box"][1]) * frame_h),
+                reverse=True,
+            )[: max(1, int(max_products_per_frame))]
 
         # Process each detected product
         for detection in product_detections:
             box = detection["box"]
+
+            bbox_w_px = max(0.0, (box[2] - box[0]) * frame_w)
+            bbox_h_px = max(0.0, (box[3] - box[1]) * frame_h)
+            bbox_area_px = bbox_w_px * bbox_h_px
+            if bbox_area_px < max(1, int(min_product_bbox_area)):
+                continue
+
             crop = yolo_detector.extract_crop(frame, box)
 
             if crop is None:

@@ -34,7 +34,9 @@ SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
 
 # Inference constants (mirrors checkout_core / pages/2_Checkout.py)
 MIN_AREA = 2500
-DETECT_EVERY_N_FRAMES = 3  # Smooth display: inference every 3 frames, display all frames
+DETECT_EVERY_N_FRAMES = int(os.getenv("DETECT_EVERY_N_FRAMES", "6"))
+MIN_PRODUCT_BBOX_AREA = int(os.getenv("MIN_PRODUCT_BBOX_AREA", str(MIN_AREA)))
+MAX_PRODUCTS_PER_FRAME = int(os.getenv("MAX_PRODUCTS_PER_FRAME", "3"))
 MATCH_THRESHOLD = 0.62
 COUNT_COOLDOWN_SECONDS = 3.0  # 중복 방지: 동일 상품 3초 내 재카운트 방지
 ROI_CLEAR_FRAMES = 8

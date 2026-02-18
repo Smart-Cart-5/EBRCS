@@ -106,6 +106,8 @@ def _process_frame_sync(
         roi_poly=roi_poly,
         roi_clear_frames=config.ROI_CLEAR_FRAMES,
         roi_entry_mode=roi_poly is not None,
+        min_product_bbox_area=config.MIN_PRODUCT_BBOX_AREA,
+        max_products_per_frame=config.MAX_PRODUCTS_PER_FRAME,
         yolo_detector=yolo_detector,
     )
 
