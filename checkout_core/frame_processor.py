@@ -39,6 +39,101 @@ def _get_frame_profiler():
     return _FRAME_PROFILER.start_frame()
 
 
+def _reset_candidate_votes(state: MutableMapping[str, Any]) -> None:
+    state["candidate_votes"] = {}
+    state["candidate_history"] = []
+    state["topk_candidates"] = []
+    state["confidence"] = 0.0
+
+
+def _update_candidate_votes(
+    state: MutableMapping[str, Any],
+    current_scores: dict[str, float],
+    vote_window_size: int,
+) -> tuple[list[dict[str, float]], dict[str, float]]:
+    history = state.setdefault("candidate_history", [])
+    history.append(current_scores)
+    max_len = max(1, int(vote_window_size))
+    if len(history) > max_len:
+        del history[:-max_len]
+
+    aggregated: dict[str, float] = {}
+    for sample in history:
+        for label, score in sample.items():
+            aggregated[label] = aggregated.get(label, 0.0) + float(score)
+
+    state["candidate_votes"] = aggregated
+    return history, aggregated
+
+
+def _build_topk_response(aggregated: dict[str, float], top_k: int) -> list[dict[str, float]]:
+    ranked = sorted(aggregated.items(), key=lambda x: x[1], reverse=True)[: max(1, int(top_k))]
+    return [{"label": label, "score": float(score)} for label, score in ranked]
+
+
+def _compute_confidence(topk_candidates: list[dict[str, float]]) -> float:
+    if not topk_candidates:
+        return 0.0
+    top1 = float(topk_candidates[0]["score"])
+    top2 = float(topk_candidates[1]["score"]) if len(topk_candidates) > 1 else 0.0
+    if top2 <= 1e-6:
+        return top1
+    return top1 / top2
+
+
+def _match_with_voting(
+    *,
+    crop: np.ndarray,
+    model_bundle,
+    faiss_index,
+    labels,
+    state: MutableMapping[str, Any],
+    match_threshold: float,
+    faiss_top_k: int,
+    vote_window_size: int,
+    vote_min_samples: int,
+    frame_profiler,
+) -> tuple[str | None, float, list[dict[str, float]], float]:
+    if frame_profiler is not None:
+        with frame_profiler.measure("embed"):
+            emb = build_query_embedding(crop, model_bundle)
+    else:
+        emb = build_query_embedding(crop, model_bundle)
+
+    query = np.expand_dims(emb, axis=0)
+    search_k = max(1, min(int(faiss_top_k), int(faiss_index.ntotal)))
+    if frame_profiler is not None:
+        with frame_profiler.measure("faiss"):
+            distances, indices = faiss_index.search(query, search_k)
+    else:
+        distances, indices = faiss_index.search(query, search_k)
+
+    current_scores: dict[str, float] = {}
+    for idx, score in zip(indices[0], distances[0]):
+        label_idx = int(idx)
+        if label_idx < 0 or label_idx >= len(labels):
+            continue
+        name = str(labels[label_idx])
+        current_scores[name] = max(current_scores.get(name, -1e9), float(score))
+
+    history, aggregated = _update_candidate_votes(state, current_scores, vote_window_size)
+    topk_candidates = _build_topk_response(aggregated, faiss_top_k)
+    confidence = _compute_confidence(topk_candidates)
+    state["topk_candidates"] = topk_candidates
+    state["confidence"] = confidence
+
+    if not topk_candidates:
+        return None, 0.0, topk_candidates, confidence
+
+    best_label = str(topk_candidates[0]["label"])
+    best_agg_score = float(topk_candidates[0]["score"])
+    avg_score = best_agg_score / max(1, len(history))
+    enough_samples = len(history) >= max(1, int(vote_min_samples))
+    if enough_samples and avg_score >= match_threshold:
+        return best_label, avg_score, topk_candidates, confidence
+    return None, avg_score, topk_candidates, confidence
+
+
 def create_bg_subtractor():
     return cv2.createBackgroundSubtractorKNN(
         history=300,
@@ -65,6 +160,9 @@ def process_checkout_frame(
     roi_entry_mode: bool = False,
     min_product_bbox_area: int = 2500,
     max_products_per_frame: int = 3,
+    faiss_top_k: int = 3,
+    vote_window_size: int = 5,
+    vote_min_samples: int = 3,
     yolo_detector=None,
 ) -> np.ndarray:
     """Process a single frame and update checkout state in-place.
@@ -101,6 +199,8 @@ def process_checkout_frame(
                 * max(0.0, (d["box"][3] - d["box"][1]) * frame_h),
                 reverse=True,
             )[: max(1, int(max_products_per_frame))]
+        else:
+            _reset_candidate_votes(state)
 
         # Process each detected product
         for detection in product_detections:
@@ -153,23 +253,22 @@ def process_checkout_frame(
 
             # Run embedding + FAISS matching
             if allow_inference and faiss_index is not None and faiss_index.ntotal > 0:
-                if frame_profiler is not None:
-                    with frame_profiler.measure("embed"):
-                        emb = build_query_embedding(crop, model_bundle)
-                else:
-                    emb = build_query_embedding(crop, model_bundle)
-                query = np.expand_dims(emb, axis=0)
+                name, best_score, topk_candidates, confidence = _match_with_voting(
+                    crop=crop,
+                    model_bundle=model_bundle,
+                    faiss_index=faiss_index,
+                    labels=labels,
+                    state=state,
+                    match_threshold=match_threshold,
+                    faiss_top_k=faiss_top_k,
+                    vote_window_size=vote_window_size,
+                    vote_min_samples=vote_min_samples,
+                    frame_profiler=frame_profiler,
+                )
+                detection["topk_candidates"] = topk_candidates
+                detection["confidence"] = confidence
 
-                if frame_profiler is not None:
-                    with frame_profiler.measure("faiss"):
-                        distances, indices = faiss_index.search(query, 1)
-                else:
-                    distances, indices = faiss_index.search(query, 1)
-                best_idx = int(indices[0][0])
-                best_score = float(distances[0][0])
-
-                if best_score > match_threshold and best_idx < len(labels):
-                    name = str(labels[best_idx])
+                if name is not None:
 
                     # Store match result in detection
                     detection["label"] = name
@@ -266,23 +365,19 @@ def process_checkout_frame(
                     allow_inference = frame_count % max(1, detect_every_n_frames) == 0
 
                 if allow_inference:
-                    if frame_profiler is not None:
-                        with frame_profiler.measure("embed"):
-                            emb = build_query_embedding(crop, model_bundle)
-                    else:
-                        emb = build_query_embedding(crop, model_bundle)
-                    query = np.expand_dims(emb, axis=0)
-
-                    if frame_profiler is not None:
-                        with frame_profiler.measure("faiss"):
-                            distances, indices = faiss_index.search(query, 1)
-                    else:
-                        distances, indices = faiss_index.search(query, 1)
-                    best_idx = int(indices[0][0])
-                    best_score = float(distances[0][0])
-
-                    if best_score > match_threshold and best_idx < len(labels):
-                        name = str(labels[best_idx])
+                    name, best_score, topk_candidates, _ = _match_with_voting(
+                        crop=crop,
+                        model_bundle=model_bundle,
+                        faiss_index=faiss_index,
+                        labels=labels,
+                        state=state,
+                        match_threshold=match_threshold,
+                        faiss_top_k=faiss_top_k,
+                        vote_window_size=vote_window_size,
+                        vote_min_samples=vote_min_samples,
+                        frame_profiler=frame_profiler,
+                    )
+                    if name is not None:
                         label = f"{name} ({best_score:.3f})"
 
                         state["last_label"] = name
@@ -313,7 +408,9 @@ def process_checkout_frame(
                         state["last_label"] = "미매칭"
                         state["last_score"] = best_score
                         state["last_status"] = "매칭 실패"
+                        state["topk_candidates"] = topk_candidates
         else:
+            _reset_candidate_votes(state)
             if roi_poly is not None and bool(state.get("roi_occupied", False)):
                 state["roi_empty_frames"] = int(state.get("roi_empty_frames", 0)) + 1
                 if int(state.get("roi_empty_frames", 0)) >= roi_clear_frames:

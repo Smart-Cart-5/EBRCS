@@ -28,6 +28,10 @@ class CheckoutSession:
         "billing_items": {},
         "item_scores": {},
         "last_seen_at": {},
+        "candidate_votes": {},
+        "candidate_history": [],
+        "topk_candidates": [],
+        "confidence": 0.0,
         "last_label": "-",
         "last_score": 0.0,
         "last_status": "대기",
@@ -64,6 +68,10 @@ class CheckoutSession:
         self.state["billing_items"] = {}
         self.state["item_scores"] = {}
         self.state["last_seen_at"] = {}
+        self.state["candidate_votes"] = {}
+        self.state["candidate_history"] = []
+        self.state["topk_candidates"] = []
+        self.state["confidence"] = 0.0
         self.state["last_label"] = "-"
         self.state["last_score"] = 0.0
         self.state["last_status"] = "대기"

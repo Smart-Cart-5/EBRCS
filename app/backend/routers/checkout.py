@@ -85,6 +85,8 @@ def _process_frame_sync(
             "total_count": sum(session.state["billing_items"].values()),
             "roi_polygon": roi_polygon_normalized,  # Normalized coordinates for frontend
             "detection_boxes": session.state.get("detection_boxes", []),  # YOLO detections
+            "topk_candidates": session.state.get("topk_candidates", []),
+            "confidence": round(float(session.state.get("confidence", 0.0)), 4),
         }
         return display_frame, state_snapshot
 
@@ -108,6 +110,9 @@ def _process_frame_sync(
         roi_entry_mode=roi_poly is not None,
         min_product_bbox_area=config.MIN_PRODUCT_BBOX_AREA,
         max_products_per_frame=config.MAX_PRODUCTS_PER_FRAME,
+        faiss_top_k=config.FAISS_TOP_K,
+        vote_window_size=config.VOTE_WINDOW_SIZE,
+        vote_min_samples=config.VOTE_MIN_SAMPLES,
         yolo_detector=yolo_detector,
     )
 
@@ -120,6 +125,8 @@ def _process_frame_sync(
         "total_count": sum(session.state["billing_items"].values()),
         "roi_polygon": roi_polygon_normalized,  # Normalized coordinates for frontend
         "detection_boxes": session.state.get("detection_boxes", []),  # YOLO detections
+        "topk_candidates": session.state.get("topk_candidates", []),
+        "confidence": round(float(session.state.get("confidence", 0.0)), 4),
     }
 
     return display_frame, state_snapshot
