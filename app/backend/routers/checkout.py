@@ -20,6 +20,7 @@ from fastapi.responses import StreamingResponse
 from backend import config
 from backend.dependencies import app_state
 from backend.services.session_manager import CheckoutSession
+from backend.utils.profiler import FrameProfiler, ProfileCollector
 
 logger = logging.getLogger("backend.checkout")
 
@@ -43,6 +44,7 @@ def _process_frame_sync(
     faiss_index: Any,
     labels: np.ndarray,
     yolo_detector: Any = None,
+    ws_profiler: FrameProfiler | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Run one frame through the checkout pipeline (sync, for thread pool execution).
 
@@ -54,7 +56,11 @@ def _process_frame_sync(
     """
     from checkout_core.frame_processor import process_checkout_frame
 
-    frame = _resize_frame(frame, config.STREAM_TARGET_WIDTH)
+    if ws_profiler is not None:
+        with ws_profiler.measure("resize"):
+            frame = _resize_frame(frame, config.STREAM_TARGET_WIDTH)
+    else:
+        frame = _resize_frame(frame, config.STREAM_TARGET_WIDTH)
     session.frame_count += 1
 
     # Get ROI polygon coordinates (normalized 0-1)
@@ -117,7 +123,11 @@ def _process_frame_sync(
     return display_frame, state_snapshot
 
 
-async def _process_frame(session: CheckoutSession, frame: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+async def _process_frame(
+    session: CheckoutSession,
+    frame: np.ndarray,
+    ws_profiler: FrameProfiler | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
     """Async wrapper: acquires reader lock and delegates to sync processing.
 
     Uses RWLock reader lock to allow multiple concurrent inference requests
@@ -135,7 +145,15 @@ async def _process_frame(session: CheckoutSession, frame: np.ndarray) -> tuple[n
 
         # Run CPU/GPU-intensive work in thread pool
         return await loop.run_in_executor(
-            None, _process_frame_sync, session, frame, model_bundle, faiss_index, labels, yolo_detector
+            None,
+            _process_frame_sync,
+            session,
+            frame,
+            model_bundle,
+            faiss_index,
+            labels,
+            yolo_detector,
+            ws_profiler,
         )
 
 
@@ -179,11 +197,17 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
             await frame_queue.put(b"")  # Sentinel to stop processing
 
     async def process_loop():
-        loop = asyncio.get_event_loop()
         frame_times = []
+        ws_profiler_collector = ProfileCollector(
+            kind="ws",
+            enable=config.ENABLE_PROFILING,
+            every_n_frames=config.PROFILE_EVERY_N_FRAMES,
+            logger=logger,
+        )
         try:
             while True:
                 start_time = time.time()
+                ws_frame_profiler = ws_profiler_collector.start_frame()
 
                 # Always get the latest frame, discard old ones for minimum latency
                 data = None
@@ -203,12 +227,18 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
 
                 # Decode JPEG
                 np_arr = np.frombuffer(data, np.uint8)
-                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                with ws_frame_profiler.measure("imdecode"):
+                    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 if frame is None:
+                    ws_frame_profiler.finish()
                     continue
 
                 # Run inference with reader lock
-                display_frame, state_snapshot = await _process_frame(session, frame)
+                display_frame, state_snapshot = await _process_frame(
+                    session,
+                    frame,
+                    ws_profiler=ws_frame_profiler,
+                )
 
                 # Conditionally encode and send image based on config
                 if config.STREAM_SEND_IMAGES:
@@ -226,6 +256,7 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
                 # Log performance every 30 frames
                 frame_time = (time.time() - start_time) * 1000
                 frame_times.append(frame_time)
+                ws_frame_profiler.finish()
                 if len(frame_times) >= 30:
                     avg_time = sum(frame_times) / len(frame_times)
                     fps = 1000 / avg_time if avg_time > 0 else 0

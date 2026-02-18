@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import MutableMapping
+import logging
+import time
 from typing import Any
 
 import cv2
@@ -8,6 +10,33 @@ import numpy as np
 
 from checkout_core.counting import should_count_product
 from checkout_core.inference import build_query_embedding
+
+try:
+    from backend import config as backend_config
+    from backend.utils.profiler import ProfileCollector
+except Exception:  # pragma: no cover - optional in non-backend contexts
+    backend_config = None
+    ProfileCollector = None
+
+
+logger = logging.getLogger("checkout_core.frame_processor")
+_FRAME_PROFILER = None
+
+
+def _get_frame_profiler():
+    global _FRAME_PROFILER
+    if backend_config is None or ProfileCollector is None:
+        return None
+    if not getattr(backend_config, "ENABLE_PROFILING", False):
+        return None
+    if _FRAME_PROFILER is None:
+        _FRAME_PROFILER = ProfileCollector(
+            kind="frame",
+            enable=backend_config.ENABLE_PROFILING,
+            every_n_frames=getattr(backend_config, "PROFILE_EVERY_N_FRAMES", 30),
+            logger=logger,
+        )
+    return _FRAME_PROFILER.start_frame()
 
 
 def create_bg_subtractor():
@@ -42,6 +71,8 @@ def process_checkout_frame(
         yolo_detector: Optional YOLODetector instance. If provided, uses YOLO for detection
                       instead of background subtraction.
     """
+    frame_profiler = _get_frame_profiler()
+    total_start = time.perf_counter() if frame_profiler is not None else 0.0
     display_frame = frame.copy()
 
     # Initialize detection_boxes in state if not present
@@ -51,7 +82,11 @@ def process_checkout_frame(
     # Choose detection method: YOLO or background subtraction
     if yolo_detector is not None:
         # YOLO-based detection
-        detections = yolo_detector.detect(frame)
+        if frame_profiler is not None:
+            with frame_profiler.measure("detect"):
+                detections = yolo_detector.detect(frame)
+        else:
+            detections = yolo_detector.detect(frame)
         state["detection_boxes"] = detections  # Store all detections (product + hand)
 
         # Filter only product detections for embedding
@@ -101,10 +136,18 @@ def process_checkout_frame(
 
             # Run embedding + FAISS matching
             if allow_inference and faiss_index is not None and faiss_index.ntotal > 0:
-                emb = build_query_embedding(crop, model_bundle)
+                if frame_profiler is not None:
+                    with frame_profiler.measure("embed"):
+                        emb = build_query_embedding(crop, model_bundle)
+                else:
+                    emb = build_query_embedding(crop, model_bundle)
                 query = np.expand_dims(emb, axis=0)
 
-                distances, indices = faiss_index.search(query, 1)
+                if frame_profiler is not None:
+                    with frame_profiler.measure("faiss"):
+                        distances, indices = faiss_index.search(query, 1)
+                else:
+                    distances, indices = faiss_index.search(query, 1)
                 best_idx = int(indices[0][0])
                 best_score = float(distances[0][0])
 
@@ -139,10 +182,17 @@ def process_checkout_frame(
         # Fallback: Background subtraction (original logic)
         state["detection_boxes"] = []  # No YOLO detections
 
-        fg_mask = bg_subtractor.apply(frame)
-        fg_mask = cv2.erode(fg_mask, None, iterations=2)
-        fg_mask = cv2.dilate(fg_mask, None, iterations=4)
-        _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+        if frame_profiler is not None:
+            with frame_profiler.measure("detect"):
+                fg_mask = bg_subtractor.apply(frame)
+                fg_mask = cv2.erode(fg_mask, None, iterations=2)
+                fg_mask = cv2.dilate(fg_mask, None, iterations=4)
+                _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+        else:
+            fg_mask = bg_subtractor.apply(frame)
+            fg_mask = cv2.erode(fg_mask, None, iterations=2)
+            fg_mask = cv2.dilate(fg_mask, None, iterations=4)
+            _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
 
         if roi_poly is not None:
             roi_mask = np.zeros_like(fg_mask)
@@ -199,10 +249,18 @@ def process_checkout_frame(
                     allow_inference = frame_count % max(1, detect_every_n_frames) == 0
 
                 if allow_inference:
-                    emb = build_query_embedding(crop, model_bundle)
+                    if frame_profiler is not None:
+                        with frame_profiler.measure("embed"):
+                            emb = build_query_embedding(crop, model_bundle)
+                    else:
+                        emb = build_query_embedding(crop, model_bundle)
                     query = np.expand_dims(emb, axis=0)
 
-                    distances, indices = faiss_index.search(query, 1)
+                    if frame_profiler is not None:
+                        with frame_profiler.measure("faiss"):
+                            distances, indices = faiss_index.search(query, 1)
+                    else:
+                        distances, indices = faiss_index.search(query, 1)
                     best_idx = int(indices[0][0])
                     best_score = float(distances[0][0])
 
@@ -251,5 +309,9 @@ def process_checkout_frame(
     # Draw ROI polygon
     if roi_poly is not None:
         cv2.polylines(display_frame, [roi_poly], True, (0, 181, 255), 2)
+
+    if frame_profiler is not None:
+        frame_profiler.add_ms("total", (time.perf_counter() - total_start) * 1000.0)
+        frame_profiler.finish()
 
     return display_frame
