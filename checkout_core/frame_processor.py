@@ -14,10 +14,14 @@ from checkout_core.inference import build_query_embedding
 try:
     from backend import config as backend_config
     from backend.association import associate_hands_products
+    from backend.event_engine import AddEventEngine
+    from backend.snapshots import SnapshotBuffer
     from backend.utils.profiler import ProfileCollector
 except Exception:  # pragma: no cover - optional in non-backend contexts
     backend_config = None
     associate_hands_products = None
+    AddEventEngine = None
+    SnapshotBuffer = None
     ProfileCollector = None
 
 
@@ -136,6 +140,53 @@ def _match_with_voting(
     return None, avg_score, topk_candidates, confidence
 
 
+def _classify_snapshots_with_votes(
+    *,
+    crops: list[np.ndarray],
+    model_bundle,
+    faiss_index,
+    labels,
+    match_threshold: float,
+    faiss_top_k: int,
+    frame_profiler,
+) -> tuple[str | None, float, list[dict[str, float]], float]:
+    if not crops:
+        return None, 0.0, [], 0.0
+
+    aggregated: dict[str, float] = {}
+    search_k = max(1, min(int(faiss_top_k), int(faiss_index.ntotal)))
+    for crop in crops:
+        if frame_profiler is not None:
+            with frame_profiler.measure("embed"):
+                emb = build_query_embedding(crop, model_bundle)
+        else:
+            emb = build_query_embedding(crop, model_bundle)
+        query = np.expand_dims(emb, axis=0)
+        if frame_profiler is not None:
+            with frame_profiler.measure("faiss"):
+                distances, indices = faiss_index.search(query, search_k)
+        else:
+            distances, indices = faiss_index.search(query, search_k)
+
+        for idx, score in zip(indices[0], distances[0]):
+            label_idx = int(idx)
+            if label_idx < 0 or label_idx >= len(labels):
+                continue
+            name = str(labels[label_idx])
+            aggregated[name] = aggregated.get(name, 0.0) + float(score)
+
+    topk_candidates = _build_topk_response(aggregated, faiss_top_k)
+    confidence = _compute_confidence(topk_candidates)
+    if not topk_candidates:
+        return None, 0.0, [], confidence
+
+    best_label = str(topk_candidates[0]["label"])
+    best_avg_score = float(topk_candidates[0]["score"]) / max(1, len(crops))
+    if best_avg_score >= match_threshold:
+        return best_label, best_avg_score, topk_candidates, confidence
+    return None, best_avg_score, topk_candidates, confidence
+
+
 def create_bg_subtractor():
     return cv2.createBackgroundSubtractorKNN(
         history=300,
@@ -219,6 +270,70 @@ def process_checkout_frame(
             cv2.line(display_frame, (hcx, hcy), (pcx, pcy), (255, 180, 0), 2)
         else:
             state["best_pair"] = None
+
+        event_mode_enabled = bool(getattr(backend_config, "EVENT_MODE", False))
+        if event_mode_enabled and AddEventEngine is not None and SnapshotBuffer is not None:
+            event_engine = state.get("_event_engine")
+            if event_engine is None:
+                event_engine = AddEventEngine(
+                    t_grasp_min_frames=getattr(backend_config, "T_GRASP_MIN_FRAMES", 4),
+                    t_place_stable_frames=getattr(backend_config, "T_PLACE_STABLE_FRAMES", 12),
+                )
+                state["_event_engine"] = event_engine
+
+            snapshot_buffer = state.get("_snapshot_buffer")
+            if snapshot_buffer is None:
+                snapshot_buffer = SnapshotBuffer(max_frames=getattr(backend_config, "SNAPSHOT_MAX_FRAMES", 8))
+                state["_snapshot_buffer"] = snapshot_buffer
+
+            event_update = event_engine.update(
+                best_pair=state.get("best_pair"),
+                products=all_products,
+                roi_poly=roi_poly,
+                frame_shape=frame.shape,
+            )
+            state["event_state"] = event_update.state
+            state["last_status"] = event_update.status
+
+            if event_update.track_box is not None and event_update.state in (event_engine.GRASP, event_engine.PLACE_CHECK):
+                snapshot_buffer.add(frame, event_update.track_box)
+            elif event_update.state == event_engine.IDLE:
+                snapshot_buffer.clear()
+
+            if event_update.add_confirmed and faiss_index is not None and faiss_index.ntotal > 0:
+                crops = snapshot_buffer.best_crops(limit=getattr(backend_config, "SNAPSHOT_MAX_FRAMES", 8))
+                name, best_score, topk_candidates, confidence = _classify_snapshots_with_votes(
+                    crops=crops,
+                    model_bundle=model_bundle,
+                    faiss_index=faiss_index,
+                    labels=labels,
+                    match_threshold=match_threshold,
+                    faiss_top_k=faiss_top_k,
+                    frame_profiler=frame_profiler,
+                )
+                state["topk_candidates"] = topk_candidates
+                state["confidence"] = confidence
+
+                if name is not None:
+                    state["last_label"] = name
+                    state["last_score"] = best_score
+                    state["last_status"] = "ADD 확정"
+                    state.setdefault("item_scores", {})[name] = best_score
+                    billing_items = state.setdefault("billing_items", {})
+                    billing_items[name] = int(billing_items.get(name, 0)) + 1
+                else:
+                    state["last_label"] = "미매칭"
+                    state["last_score"] = best_score
+                    state["last_status"] = "ADD 미확정"
+                snapshot_buffer.clear()
+
+            # In EVENT_MODE, defer embedding/FAISS to event confirmation only.
+            if roi_poly is not None:
+                cv2.polylines(display_frame, [roi_poly], True, (0, 181, 255), 2)
+            if frame_profiler is not None:
+                frame_profiler.add_ms("total", (time.perf_counter() - total_start) * 1000.0)
+                frame_profiler.finish()
+            return display_frame
 
         # Filter only product detections and keep largest K for stable throughput.
         frame_h, frame_w = frame.shape[:2]

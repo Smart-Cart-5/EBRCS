@@ -88,6 +88,7 @@ def _process_frame_sync(
             "topk_candidates": session.state.get("topk_candidates", []),
             "confidence": round(float(session.state.get("confidence", 0.0)), 4),
             "best_pair": session.state.get("best_pair"),
+            "event_state": session.state.get("event_state"),
         }
         return display_frame, state_snapshot
 
@@ -129,6 +130,7 @@ def _process_frame_sync(
         "topk_candidates": session.state.get("topk_candidates", []),
         "confidence": round(float(session.state.get("confidence", 0.0)), 4),
         "best_pair": session.state.get("best_pair"),
+        "event_state": session.state.get("event_state"),
     }
 
     return display_frame, state_snapshot

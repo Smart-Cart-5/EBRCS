@@ -33,6 +33,7 @@ class CheckoutSession:
         "topk_candidates": [],
         "confidence": 0.0,
         "best_pair": None,
+        "event_state": "IDLE",
         "last_label": "-",
         "last_score": 0.0,
         "last_status": "대기",
@@ -74,11 +75,14 @@ class CheckoutSession:
         self.state["topk_candidates"] = []
         self.state["confidence"] = 0.0
         self.state["best_pair"] = None
+        self.state["event_state"] = "IDLE"
         self.state["last_label"] = "-"
         self.state["last_score"] = 0.0
         self.state["last_status"] = "대기"
         self.state["roi_occupied"] = False
         self.state["roi_empty_frames"] = 0
+        self.state.pop("_event_engine", None)
+        self.state.pop("_snapshot_buffer", None)
         self.frame_count = 0
         self.bg_subtractor = cv2.createBackgroundSubtractorKNN(history=300)
 
