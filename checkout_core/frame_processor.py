@@ -13,9 +13,11 @@ from checkout_core.inference import build_query_embedding
 
 try:
     from backend import config as backend_config
+    from backend.association import associate_hands_products
     from backend.utils.profiler import ProfileCollector
 except Exception:  # pragma: no cover - optional in non-backend contexts
     backend_config = None
+    associate_hands_products = None
     ProfileCollector = None
 
 
@@ -178,6 +180,8 @@ def process_checkout_frame(
     # Initialize detection_boxes in state if not present
     if "detection_boxes" not in state:
         state["detection_boxes"] = []
+    if "best_pair" not in state:
+        state["best_pair"] = None
 
     # Choose detection method: YOLO or background subtraction
     if yolo_detector is not None:
@@ -188,10 +192,37 @@ def process_checkout_frame(
         else:
             detections = yolo_detector.detect(frame)
         state["detection_boxes"] = detections  # Store all detections (product + hand)
+        hands = [d for d in detections if d.get("class") == "hand"]
+        all_products = [d for d in detections if d.get("class") == "product"]
+
+        if associate_hands_products is not None:
+            assoc_matches = associate_hands_products(
+                hands,
+                all_products,
+                iou_weight=getattr(backend_config, "ASSOCIATION_IOU_WEIGHT", 0.5),
+                dist_weight=getattr(backend_config, "ASSOCIATION_DIST_WEIGHT", 0.5),
+                max_center_dist=getattr(backend_config, "ASSOCIATION_MAX_CENTER_DIST", 0.35),
+                min_score=getattr(backend_config, "ASSOCIATION_MIN_SCORE", 0.1),
+            )
+        else:
+            assoc_matches = []
+
+        if assoc_matches:
+            state["best_pair"] = assoc_matches[0]
+            hb = assoc_matches[0]["hand_box"]
+            pb = assoc_matches[0]["product_box"]
+            h, w = frame.shape[:2]
+            hcx = int(((hb[0] + hb[2]) * 0.5) * w)
+            hcy = int(((hb[1] + hb[3]) * 0.5) * h)
+            pcx = int(((pb[0] + pb[2]) * 0.5) * w)
+            pcy = int(((pb[1] + pb[3]) * 0.5) * h)
+            cv2.line(display_frame, (hcx, hcy), (pcx, pcy), (255, 180, 0), 2)
+        else:
+            state["best_pair"] = None
 
         # Filter only product detections and keep largest K for stable throughput.
         frame_h, frame_w = frame.shape[:2]
-        product_detections = [d for d in detections if d["class"] == "product"]
+        product_detections = list(all_products)
         if product_detections:
             product_detections = sorted(
                 product_detections,
@@ -297,6 +328,7 @@ def process_checkout_frame(
     else:
         # Fallback: Background subtraction (original logic)
         state["detection_boxes"] = []  # No YOLO detections
+        state["best_pair"] = None
 
         if frame_profiler is not None:
             with frame_profiler.measure("detect"):

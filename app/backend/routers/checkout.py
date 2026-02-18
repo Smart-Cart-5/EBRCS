@@ -87,6 +87,7 @@ def _process_frame_sync(
             "detection_boxes": session.state.get("detection_boxes", []),  # YOLO detections
             "topk_candidates": session.state.get("topk_candidates", []),
             "confidence": round(float(session.state.get("confidence", 0.0)), 4),
+            "best_pair": session.state.get("best_pair"),
         }
         return display_frame, state_snapshot
 
@@ -127,6 +128,7 @@ def _process_frame_sync(
         "detection_boxes": session.state.get("detection_boxes", []),  # YOLO detections
         "topk_candidates": session.state.get("topk_candidates", []),
         "confidence": round(float(session.state.get("confidence", 0.0)), 4),
+        "best_pair": session.state.get("best_pair"),
     }
 
     return display_frame, state_snapshot

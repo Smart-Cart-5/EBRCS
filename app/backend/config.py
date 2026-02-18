@@ -45,5 +45,9 @@ STREAM_SEND_IMAGES = os.getenv("STREAM_SEND_IMAGES", "false").lower() == "true" 
 FAISS_TOP_K = int(os.getenv("FAISS_TOP_K", "3"))
 VOTE_WINDOW_SIZE = int(os.getenv("VOTE_WINDOW_SIZE", "5"))
 VOTE_MIN_SAMPLES = int(os.getenv("VOTE_MIN_SAMPLES", "3"))
+ASSOCIATION_IOU_WEIGHT = float(os.getenv("ASSOCIATION_IOU_WEIGHT", "0.5"))
+ASSOCIATION_DIST_WEIGHT = float(os.getenv("ASSOCIATION_DIST_WEIGHT", "0.5"))
+ASSOCIATION_MAX_CENTER_DIST = float(os.getenv("ASSOCIATION_MAX_CENTER_DIST", "0.35"))
+ASSOCIATION_MIN_SCORE = float(os.getenv("ASSOCIATION_MIN_SCORE", "0.1"))
 ENABLE_PROFILING = os.getenv("ENABLE_PROFILING", "false").lower() == "true"
 PROFILE_EVERY_N_FRAMES = int(os.getenv("PROFILE_EVERY_N_FRAMES", "30"))

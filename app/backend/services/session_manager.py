@@ -32,6 +32,7 @@ class CheckoutSession:
         "candidate_history": [],
         "topk_candidates": [],
         "confidence": 0.0,
+        "best_pair": None,
         "last_label": "-",
         "last_score": 0.0,
         "last_status": "대기",
@@ -72,6 +73,7 @@ class CheckoutSession:
         self.state["candidate_history"] = []
         self.state["topk_candidates"] = []
         self.state["confidence"] = 0.0
+        self.state["best_pair"] = None
         self.state["last_label"] = "-"
         self.state["last_score"] = 0.0
         self.state["last_status"] = "대기"
