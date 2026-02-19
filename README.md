@@ -6,9 +6,9 @@ DINOv3 + CLIP 하이브리드 임베딩을 활용한 상품 자동 인식 및 �
 
 [![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-green.svg)](https://fastapi.tiangolo.com/)
-[![React](https://img.shields.io/badge/React-18-blue.svg)](https://react.dev/)
+[![React](https://img.shields.io/badge/React-19-blue.svg)](https://react.dev/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.39+-red.svg)](https://streamlit.io/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/YOUR_USERNAME/EBRCS_streaming)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/Smart-Cart-5/EBRCS)
 
 ## 📑 목차
 
@@ -89,7 +89,7 @@ DINOv3 + CLIP 하이브리드 임베딩을 활용한 상품 자동 인식 및 �
 ## 📁 프로젝트 구조
 
 ```
-EBRCS_streaming/
+EBRCS/
 ├── streamlit/              # Streamlit 데모 (독립 실행)
 │   ├── .venv/             # 전용 가상환경
 │   ├── app.py             # 메인 앱
@@ -207,7 +207,7 @@ Authorization: Bearer <your_jwt_token>
 ### 요구사항
 
 - **Python**: 3.11+
-- **Node.js**: 18+
+- **Node.js**: 20.19.0+
 - **Git**: 2.0+
 - **CUDA** (선택): GPU 가속용
 
@@ -222,8 +222,8 @@ Authorization: Bearer <your_jwt_token>
 
 ```cmd
 # 1. 저장소 클론
-git clone https://github.com/YOUR_USERNAME/EBRCS_streaming.git
-cd EBRCS_streaming
+git clone https://github.com/Smart-Cart-5/EBRCS.git
+cd EBRCS
 
 # 2. 환경 변수 설정
 copy .env.example .env
@@ -244,8 +244,8 @@ run.bat
 
 ```bash
 # 1. 저장소 클론
-git clone https://github.com/YOUR_USERNAME/EBRCS_streaming.git
-cd EBRCS_streaming
+git clone https://github.com/Smart-Cart-5/EBRCS.git
+cd EBRCS
 
 # 2. 환경 변수 설정
 cp .env.example .env
@@ -482,17 +482,16 @@ ls -lh data/
 
 ```bash
 # EC2 Ubuntu 22.04 인스턴스에서
-wget https://raw.githubusercontent.com/YOUR_USERNAME/EBRCS_streaming/main/setup_aws_ec2.sh
+wget https://raw.githubusercontent.com/Smart-Cart-5/EBRCS/main/setup_aws_ec2.sh
 chmod +x setup_aws_ec2.sh
 ./setup_aws_ec2.sh
 ```
 
 스크립트가 자동으로:
-1. Python 3.11, Node.js 20 설치
+1. Python 3.11, Node.js 20.19+ 설치
 2. 저장소 클론
-3. 가상환경 설정 (Streamlit + Backend)
-4. Frontend 빌드
-5. 실행 스크립트 권한 설정
+3. 가상환경 및 의존성 설치 (Backend + Frontend)
+4. 실행 스크립트 권한 설정
 
 ### 프로덕션 실행
 
@@ -548,7 +547,7 @@ docker-compose -f docker-compose.yml up
 - **Pydantic** - 요청/응답 데이터 검증
 
 ### Frontend
-- **React 18** + TypeScript
+- **React 19** + TypeScript
 - **Vite** - 빌드 도구
 - **Tailwind CSS v4** - 스타일링
 - **Zustand** - 상태 관리
@@ -753,7 +752,7 @@ chmod +x setup_aws_ec2_complete.sh
 ```
 
 **자동으로 설치되는 것**:
-- ✅ Python 3.11 + Node.js 20
+- ✅ Python 3.11 + Node.js 20.19+
 - ✅ Backend/Frontend 환경 설정
 - ✅ Nginx 리버스 프록시 (80 포트)
 - ✅ 모든 의존성 패키지
@@ -893,4 +892,3 @@ MIT License - 자유롭게 사용, 수정, 배포 가능
 5. Open a Pull Request
 
 ---
-

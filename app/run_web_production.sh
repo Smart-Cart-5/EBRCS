@@ -2,6 +2,11 @@
 # EBRCS 웹앱 프로덕션 실행 스크립트 (AWS EC2용)
 
 set -e
+MIN_NODE_VERSION="20.19.0"
+
+version_lt() {
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" != "$1" ]
+}
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$APP_DIR")"
@@ -23,6 +28,20 @@ source "$APP_DIR/backend/.venv/bin/activate"
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 
+if ! command -v node >/dev/null 2>&1; then
+    echo "❌ Node.js를 찾을 수 없습니다. setup_venv.sh를 먼저 실행하세요."
+    exit 1
+fi
+if ! command -v lsof >/dev/null 2>&1; then
+    echo "❌ lsof를 찾을 수 없습니다. (Ubuntu: sudo apt-get install -y lsof)"
+    exit 1
+fi
+NODE_VERSION="$(node -v | sed 's/^v//')"
+if version_lt "$MIN_NODE_VERSION" "$NODE_VERSION"; then
+    echo "❌ Node.js 버전이 낮습니다. 현재: v${NODE_VERSION}, 필요: v${MIN_NODE_VERSION}+"
+    exit 1
+fi
+
 # 환경 변수 확인
 if [ ! -f "$PROJECT_ROOT/.env" ]; then
     echo "❌ .env 파일이 없습니다."
@@ -30,7 +49,10 @@ if [ ! -f "$PROJECT_ROOT/.env" ]; then
 fi
 
 # .env 로드
-export $(grep -v '^#' "$PROJECT_ROOT/.env" | xargs)
+set -a
+# shellcheck disable=SC1090
+source "$PROJECT_ROOT/.env"
+set +a
 
 # 로그 디렉토리 생성
 mkdir -p "$APP_DIR/logs"
@@ -118,6 +140,10 @@ echo $FRONTEND_PID > "$APP_DIR/logs/frontend.pid"
 
 # 대기
 sleep 3
+PUBLIC_IP="$(curl -s ifconfig.me || true)"
+if [ -z "$PUBLIC_IP" ]; then
+    PUBLIC_IP="YOUR_EC2_IP"
+fi
 
 # 상태 확인
 echo ""
@@ -125,9 +151,13 @@ echo "================================"
 if ps -p $BACKEND_PID > /dev/null && ps -p $FRONTEND_PID > /dev/null; then
     echo "✅ 웹앱 실행 성공!"
     echo ""
-    echo "🌐 접속 주소 (Nginx 리버스 프록시):"
-    echo "  웹앱: http://$(curl -s ifconfig.me)"
-    echo "  API 테스트: http://$(curl -s ifconfig.me)/api/health"
+    echo "🌐 접속 주소 (직접 접속):"
+    echo "  웹앱: http://${PUBLIC_IP}:5173"
+    echo "  API 테스트: http://${PUBLIC_IP}:8000/api/health"
+    echo ""
+    echo "🌐 Nginx 리버스 프록시를 설정한 경우:"
+    echo "  웹앱: http://${PUBLIC_IP}"
+    echo "  API 테스트: http://${PUBLIC_IP}/api/health"
     echo ""
     echo "📝 내부 서비스 (localhost only):"
     echo "  Backend: http://localhost:8000"

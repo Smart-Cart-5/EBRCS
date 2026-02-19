@@ -107,7 +107,7 @@ ssh -i ~/Downloads/ebrcs-key.pem ubuntu@YOUR_EC2_PUBLIC_IP
 mkdir -p ~/temp && cd ~/temp
 
 # 2. 설정 스크립트 다운로드
-wget https://raw.githubusercontent.com/YOUR_USERNAME/EBRCS_streaming/main/setup_aws_ec2.sh
+wget https://raw.githubusercontent.com/Smart-Cart-5/EBRCS/main/setup_aws_ec2.sh
 
 # 3. 실행 권한
 chmod +x setup_aws_ec2.sh
@@ -118,7 +118,7 @@ chmod +x setup_aws_ec2.sh
 
 **입력할 내용:**
 ```
-GitHub 저장소 URL 입력: https://github.com/YOUR_USERNAME/EBRCS_streaming.git
+GitHub 저장소 URL 입력: https://github.com/Smart-Cart-5/EBRCS.git
 ```
 
 ### B. 환경 변수 설정
@@ -143,7 +143,7 @@ HUGGINGFACE_HUB_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 **로컬 터미널에서 (새 터미널):**
 ```bash
 # data 폴더 압축 (로컬)
-cd /Users/kimminseong/Desktop/UNIV/LIKE_LION/last_project/EBRCS_streaming
+cd /path/to/EBRCS
 tar -czf data.tar.gz data/
 
 # EC2로 업로드
@@ -164,7 +164,7 @@ rm data.tar.gz
 ### Option A: 수동 실행 (테스트용)
 
 ```bash
-cd ~/ebrcs_streaming
+cd ~/ebrcs_streaming/app
 ./run_web_production.sh
 ```
 
@@ -176,7 +176,7 @@ http://YOUR_EC2_PUBLIC_IP:5173
 ### Option B: systemd 서비스 (프로덕션 추천)
 
 ```bash
-cd ~/ebrcs_streaming
+cd ~/ebrcs_streaming/app
 ./setup_systemd.sh
 ```
 
@@ -292,7 +292,7 @@ https://ebrcs.yourdomain.com
 
 **로그 확인:**
 ```bash
-tail -f ~/ebrcs_streaming/logs/backend.log
+tail -f ~/ebrcs_streaming/app/logs/backend.log
 ```
 
 **HF_TOKEN 확인:**
@@ -304,7 +304,7 @@ cat ~/ebrcs_streaming/.env
 
 **Node.js 버전 확인:**
 ```bash
-node -v  # v20.x 이상
+node -v  # v20.19.0 이상
 npm -v
 ```
 
@@ -335,7 +335,7 @@ cd ~/ebrcs_streaming
 git pull origin main
 
 # Frontend 재빌드
-cd frontend
+cd app/frontend
 npm ci
 npm run build
 cd ..
@@ -347,10 +347,12 @@ sudo systemctl restart ebrcs
 ### 의존성 업데이트
 
 ```bash
-source venv/bin/activate
+cd ~/ebrcs_streaming/app/backend
+source .venv/bin/activate
 pip install -r requirements.txt --upgrade
+deactivate
 
-cd frontend
+cd ../frontend
 npm ci
 cd ..
 

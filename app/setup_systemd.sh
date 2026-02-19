@@ -2,6 +2,7 @@
 # systemd 서비스 설정 스크립트
 
 set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "⚙️  systemd 서비스 설정"
 echo "====================="
@@ -9,7 +10,7 @@ echo ""
 
 # 서비스 파일 복사
 echo "📋 서비스 파일 복사 중..."
-sudo cp ebrcs.service /etc/systemd/system/
+sudo cp "$SCRIPT_DIR/ebrcs.service" /etc/systemd/system/
 
 # systemd 리로드
 echo "🔄 systemd 리로드 중..."

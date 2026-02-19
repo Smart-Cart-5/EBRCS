@@ -2,6 +2,11 @@
 # EBRCS 완전 자동 AWS EC2 배포 스크립트
 
 set -e
+MIN_NODE_VERSION="20.19.0"
+
+version_lt() {
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" != "$1" ]
+}
 
 echo "🚀 EBRCS AWS EC2 완전 자동 배포"
 echo "================================"
@@ -14,7 +19,7 @@ sudo apt-get upgrade -y
 
 # 2. Python 설치 확인 (Ubuntu 24.04는 Python 3.12가 기본)
 echo "🐍 Python 확인 중..."
-sudo apt-get install -y python3 python3-venv python3-pip
+sudo apt-get install -y python3 python3-venv python3-pip curl ca-certificates lsof
 python3 --version
 
 # 3. 기존 Node.js 제거
@@ -29,6 +34,12 @@ export NVM_DIR="$HOME/.nvm"
 nvm install 20
 nvm use 20
 nvm alias default 20
+NODE_VERSION="$(node -v | sed 's/^v//')"
+if version_lt "$MIN_NODE_VERSION" "$NODE_VERSION"; then
+    echo "❌ Node.js 버전이 낮습니다. 현재: v${NODE_VERSION}, 필요: v${MIN_NODE_VERSION}+"
+    exit 1
+fi
+echo "✓ Node.js v${NODE_VERSION}"
 
 # 5. Git 설치
 echo "📚 Git 설치 중..."
@@ -51,28 +62,13 @@ else
 fi
 cd ebrcs_streaming
 
-# 8. Backend 가상환경 설정
-echo "🔨 Backend 가상환경 설정 중..."
-cd app/backend
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-deactivate
-cd ../..
-
-# 9. Frontend 패키지 설치
-echo "📦 Frontend 패키지 설치 중..."
-cd app/frontend
-
-# Node 경로 확인 및 설정
+# 8. 웹앱 의존성 설정
+echo "🔨 웹앱 환경 설정 중..."
+cd app
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-
-npm install
-
-echo "✓ Frontend 패키지 설치 완료"
-cd ../..
+./setup_venv.sh
+cd ..
 
 # 12. .env 파일 생성
 echo "⚙️  환경 변수 설정 중..."
@@ -150,7 +146,7 @@ echo "✅ 설정 완료!"
 echo ""
 echo "📝 다음 단계:"
 echo "  1. data 폴더에 파일 업로드:"
-echo "     로컬에서: scp -i jang.pem -r data/* ubuntu@34.213.7.57:~/ebrcs_streaming/data/"
+echo "     로컬에서: scp -i <your-key>.pem -r data/* ubuntu@<YOUR_EC2_IP>:~/ebrcs_streaming/data/"
 echo ""
 echo "  2. .env 파일 수정 (HF_TOKEN 설정):"
 echo "     nano .env"

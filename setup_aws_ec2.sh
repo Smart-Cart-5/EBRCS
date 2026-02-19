@@ -2,6 +2,11 @@
 # AWS EC2 Ubuntu에서 EBRCS 웹앱 설정 스크립트
 
 set -e
+MIN_NODE_VERSION="20.19.0"
+
+version_lt() {
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" != "$1" ]
+}
 
 echo "🚀 EBRCS 웹앱 AWS EC2 설정"
 echo "=========================="
@@ -11,6 +16,7 @@ echo ""
 echo "📦 시스템 업데이트 중..."
 sudo apt-get update
 sudo apt-get upgrade -y
+sudo apt-get install -y curl ca-certificates lsof
 
 # 2. Python 3.11 설치
 echo "🐍 Python 3.11 설치 중..."
@@ -18,10 +24,6 @@ sudo apt-get install -y software-properties-common
 sudo add-apt-repository -y ppa:deadsnakes/ppa
 sudo apt-get update
 sudo apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip
-
-# Python 기본 버전 설정
-sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
-sudo update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
 
 # 3. Node.js 20 설치
 echo "📗 Node.js 20 설치 중..."
@@ -43,8 +45,20 @@ sudo apt-get install -y \
 # 6. 저장소 클론
 echo "📥 GitHub 저장소 클론 중..."
 read -p "GitHub 저장소 URL 입력: " REPO_URL
-git clone "$REPO_URL" ebrcs_streaming
+if [ -d "ebrcs_streaming" ]; then
+    echo "⚠️  ebrcs_streaming 폴더가 이미 존재합니다. 기존 폴더를 사용합니다."
+else
+    git clone "$REPO_URL" ebrcs_streaming
+fi
 cd ebrcs_streaming
+
+NODE_VERSION="$(node -v | sed 's/^v//')"
+if version_lt "$MIN_NODE_VERSION" "$NODE_VERSION"; then
+    echo "❌ Node.js 버전이 낮습니다. 현재: v${NODE_VERSION}, 필요: v${MIN_NODE_VERSION}+"
+    exit 1
+fi
+echo "✓ Node.js v${NODE_VERSION}"
+python3.11 --version
 
 # 7. 웹앱 환경 설정
 echo "🔨 웹앱 환경 설정 중..."
