@@ -3,11 +3,13 @@ from __future__ import annotations
 from collections.abc import MutableMapping
 import logging
 import os
+import re
 import time
 from typing import Any
 
 import cv2
 import numpy as np
+import pytesseract
 
 from checkout_core.counting import should_count_product
 from checkout_core.inference import build_query_embedding
@@ -28,6 +30,43 @@ except Exception:  # pragma: no cover - optional in non-backend contexts
 
 logger = logging.getLogger("checkout_core.frame_processor")
 _FRAME_PROFILER = None
+_OCR_LANG_CACHE: str | None = None
+
+try:
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    print("Tesseract version:", pytesseract.get_tesseract_version())
+except Exception:
+    logger.exception("Failed to initialize pytesseract executable path")
+
+
+def _resolve_ocr_lang_once() -> str:
+    global _OCR_LANG_CACHE
+    if _OCR_LANG_CACHE is not None:
+        return _OCR_LANG_CACHE
+    candidates: list[str] = []
+    tess_prefix = str(os.getenv("TESSDATA_PREFIX", "")).strip()
+    if tess_prefix:
+        candidates.append(os.path.join(tess_prefix, "tessdata", "kor.traineddata"))
+        candidates.append(os.path.join(tess_prefix, "kor.traineddata"))
+    candidates.append(r"C:\Program Files\Tesseract-OCR\tessdata\kor.traineddata")
+    has_kor = any(os.path.exists(p) for p in candidates)
+    if has_kor:
+        _OCR_LANG_CACHE = "kor+eng"
+    else:
+        _OCR_LANG_CACHE = "eng"
+        logger.warning("kor traineddata not found, fallback to eng")
+    return _OCR_LANG_CACHE
+
+
+_OCR_LABEL_KEYWORDS: dict[str, list[str]] = {
+    "짜파": ["짜파"],
+    "짜파게티": ["짜파"],
+    "새우": ["새우"],
+    "새우탕": ["새우"],
+    "황태": ["황태"],
+    "황태국밥": ["황태"],
+    "짜장": ["짜장"],
+}
 
 
 def _get_frame_profiler():
@@ -100,6 +139,462 @@ def _score_to_percent(score: float) -> float:
     return float(score) * 100.0
 
 
+def _normalize_ocr_text(text: str) -> str:
+    lowered = str(text or "").lower()
+    return re.sub(r"[^0-9a-z가-힣]", "", lowered)
+
+
+def _label_keywords(label: str) -> list[str]:
+    norm_label = _normalize_ocr_text(label)
+    matched: list[str] = []
+    for key, keywords in _OCR_LABEL_KEYWORDS.items():
+        if _normalize_ocr_text(key) in norm_label:
+            matched.extend(keywords)
+    return matched
+
+
+def _preprocess_ocr_slice(slice_img: np.ndarray, *, thresh_mode: str) -> np.ndarray:
+    gray = cv2.cvtColor(slice_img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    if str(thresh_mode) == "adaptive":
+        return cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            2,
+        )
+    _, bin_img = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return bin_img
+
+
+def _ocr_tokens_from_data(data: dict[str, Any], conf_min: float) -> tuple[list[str], float]:
+    tokens: list[str] = []
+    confs: list[float] = []
+    texts = data.get("text", [])
+    conf_list = data.get("conf", [])
+    n = min(len(texts), len(conf_list))
+    for i in range(n):
+        raw = str(texts[i] or "").strip()
+        if not raw:
+            continue
+        try:
+            conf = float(conf_list[i])
+        except Exception:
+            continue
+        if conf < float(conf_min):
+            continue
+        norm = _normalize_ocr_text(raw)
+        if not norm:
+            continue
+        # noise reduction: keep len>=2, but allow single digit
+        if len(norm) == 1 and not norm.isdigit():
+            continue
+        tokens.append(norm)
+        confs.append(conf)
+    avg_conf = float(np.mean(confs)) if confs else 0.0
+    return tokens, avg_conf
+
+
+def run_ocr_hybrid(
+    image_crop: np.ndarray,
+    *,
+    frame_id: int | None,
+    session_id: str | None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ocr_text": "",
+        "chosen_slice": None,
+        "chosen_psm": None,
+        "chosen_thresh": None,
+        "chosen_conf_cut": None,
+        "chosen_lang": _resolve_ocr_lang_once(),
+        "token_count": 0,
+        "korean_char_count": 0,
+        "avg_conf": 0.0,
+        "matched_keywords": {},
+        "ocr_used": False,
+        "ocr_attempted": False,
+        "ocr_error": None,
+    }
+    if image_crop is None or image_crop.size == 0:
+        result["ocr_error"] = "empty_crop"
+        return result
+
+    h, w = image_crop.shape[:2]
+    if h < 8 or w < 8:
+        result["ocr_error"] = "tiny_crop"
+        return result
+
+    slices = {
+        "top": image_crop[0 : max(1, int(round(h * 0.45))), :],
+        "mid": image_crop[max(0, int(round(h * 0.25))) : max(1, int(round(h * 0.75))), :],
+        "bot": image_crop[max(0, int(round(h * 0.55))) : h, :],
+    }
+
+    lang = str(result["chosen_lang"])
+    base_conf = float(getattr(backend_config, "OCR_MIN_CONFIDENCE", 40.0))
+    psm_candidates = [6, 11]
+    thresh_candidates = ["otsu", "adaptive"]
+    best: dict[str, Any] | None = None
+    slice_errors: list[str] = []
+    for slice_name, slice_img in slices.items():
+        if slice_img is None or slice_img.size == 0:
+            continue
+        for psm in psm_candidates:
+            for thresh_mode in thresh_candidates:
+                try:
+                    pre = _preprocess_ocr_slice(slice_img, thresh_mode=thresh_mode)
+                    result["ocr_attempted"] = True
+                    data = pytesseract.image_to_data(
+                        pre,
+                        lang=lang,
+                        output_type=pytesseract.Output.DICT,
+                        config=f"--oem 1 --psm {int(psm)}",
+                    )
+                    chosen_conf_cut = base_conf
+                    tokens, avg_conf = _ocr_tokens_from_data(data, chosen_conf_cut)
+                    if len(tokens) < 2:
+                        chosen_conf_cut = 35.0
+                        tokens, avg_conf = _ocr_tokens_from_data(data, chosen_conf_cut)
+                    if len(tokens) < 2:
+                        chosen_conf_cut = 30.0
+                        tokens, avg_conf = _ocr_tokens_from_data(data, chosen_conf_cut)
+                    text_joined = " ".join(tokens).strip()
+                    korean_chars = len(re.findall(r"[가-힣]", text_joined))
+                    entry = {
+                        "slice": slice_name,
+                        "psm": int(psm),
+                        "thresh": str(thresh_mode),
+                        "conf_cut": float(chosen_conf_cut),
+                        "tokens": tokens,
+                        "ocr_text": text_joined,
+                        "token_count": len(tokens),
+                        "korean_char_count": korean_chars,
+                        "avg_conf": float(avg_conf),
+                    }
+                    logger.debug(
+                        "OCR combo debug: session=%s frame_id=%s slice=%s psm=%d thresh=%s conf_cut=%.0f token_count=%d korean_char_count=%d avg_conf=%.2f text_preview=%s",
+                        session_id,
+                        frame_id,
+                        slice_name,
+                        int(psm),
+                        str(thresh_mode),
+                        float(chosen_conf_cut),
+                        int(entry["token_count"]),
+                        int(entry["korean_char_count"]),
+                        float(entry["avg_conf"]),
+                        str(text_joined)[:30],
+                    )
+                    if best is None:
+                        best = entry
+                    else:
+                        best_key = (int(best["korean_char_count"]), int(best["token_count"]), float(best["avg_conf"]))
+                        cur_key = (int(entry["korean_char_count"]), int(entry["token_count"]), float(entry["avg_conf"]))
+                        if cur_key > best_key:
+                            best = entry
+                except Exception as exc:
+                    slice_errors.append(f"{slice_name}/psm{psm}/{thresh_mode}:{exc}")
+                    continue
+
+    if best is None:
+        if slice_errors:
+            result["ocr_error"] = "; ".join(slice_errors)[:200]
+        elif result["ocr_attempted"]:
+            result["ocr_error"] = "no_valid_tokens"
+        else:
+            result["ocr_error"] = "ocr_not_attempted"
+        return result
+
+    result["chosen_slice"] = best["slice"]
+    result["chosen_psm"] = int(best["psm"])
+    result["chosen_thresh"] = str(best["thresh"])
+    result["chosen_conf_cut"] = float(best["conf_cut"])
+    result["ocr_text"] = str(best["ocr_text"])
+    result["token_count"] = int(best["token_count"])
+    result["korean_char_count"] = int(best["korean_char_count"])
+    result["avg_conf"] = float(best["avg_conf"])
+    return result
+
+
+def apply_ocr_rerank(
+    topk_candidates: list[dict[str, float]],
+    *,
+    ocr_result: dict[str, Any],
+    occluded_by_hand: bool,
+) -> tuple[list[dict[str, float]], dict[str, list[str]], float, bool]:
+    if not topk_candidates:
+        return topk_candidates, {}, 0.0, False
+    ocr_text = _normalize_ocr_text(str(ocr_result.get("ocr_text", "")))
+    if not ocr_text:
+        return topk_candidates, {}, 0.0, False
+    lam = float(getattr(backend_config, "OCR_RERANK_LAMBDA_OCCLUDED", 0.05)) if occluded_by_hand else float(
+        getattr(backend_config, "OCR_RERANK_LAMBDA", 0.10)
+    )
+    per_hit_bonus = 0.03
+    max_bonus = 0.06
+    matched_keywords: dict[str, list[str]] = {}
+    best_text_score = 0.0
+    reranked: list[dict[str, float]] = []
+    for cand in topk_candidates:
+        label = str(cand.get("label", "UNKNOWN"))
+        visual_score = float(cand.get("raw_score", cand.get("score", 0.0)))
+        kws = _label_keywords(label)
+        hits: list[str] = []
+        for kw in kws:
+            nkw = _normalize_ocr_text(kw)
+            if nkw and nkw in ocr_text:
+                hits.append(kw)
+        if hits:
+            matched_keywords[label] = hits
+        text_score = min(max_bonus, per_hit_bonus * float(len(hits)))
+        final_score = visual_score + (lam * text_score)
+        best_text_score = max(best_text_score, text_score)
+        new_c = dict(cand)
+        new_c["text_score"] = float(text_score)
+        new_c["final_score"] = float(final_score)
+        reranked.append(new_c)
+    reranked.sort(key=lambda x: float(x.get("final_score", x.get("raw_score", x.get("score", 0.0)))), reverse=True)
+    used = len(matched_keywords) > 0
+    if not used:
+        return topk_candidates, {}, 0.0, False
+    return reranked, matched_keywords, best_text_score, True
+
+
+def _is_cup_category_label(label: str) -> bool:
+    norm = _normalize_ocr_text(label)
+    tokens = ("컵", "컵밥", "라면", "사발", "우동", "짜장", "밥", "덮밥", "국밥", "죽", "cup", "ramen", "rice")
+    return any(token in norm for token in tokens)
+
+
+def _apply_ocr_rerank_if_ambiguous(
+    *,
+    crop: np.ndarray,
+    topk_candidates: list[dict[str, float]],
+    state: MutableMapping[str, Any],
+    frame_id: int | None,
+    session_id: str | None,
+) -> list[dict[str, float]]:
+    state["ocr_used"] = False
+    state["ocr_attempted"] = False
+    state["ocr_error"] = None
+    state["ocr_skip_reason"] = None
+    state["ocr_text"] = ""
+    state["ocr_matched_keywords"] = {}
+    state["ocr_text_score"] = 0.0
+    state["ocr_ambiguous"] = False
+    state["ocr_chosen_slice"] = None
+    state["ocr_chosen_psm"] = None
+    state["ocr_chosen_thresh"] = None
+    state["ocr_chosen_conf_cut"] = None
+    state["ocr_chosen_lang"] = _resolve_ocr_lang_once()
+    state["ocr_token_count"] = 0
+    state["ocr_korean_char_count"] = 0
+    state["ocr_avg_conf"] = 0.0
+    state["ocr_reranked_topk"] = []
+    state["ocr_chosen_slice"] = None
+    state["ocr_chosen_psm"] = None
+    state["ocr_chosen_thresh"] = None
+    state["ocr_chosen_conf_cut"] = None
+    state["ocr_chosen_lang"] = _resolve_ocr_lang_once()
+    state["ocr_token_count"] = 0
+    state["ocr_korean_char_count"] = 0
+    state["ocr_avg_conf"] = 0.0
+    state["ocr_reranked_topk"] = []
+
+    if not topk_candidates:
+        return topk_candidates
+
+    top1 = topk_candidates[0]
+    top2 = topk_candidates[1] if len(topk_candidates) > 1 else None
+    top1_label = str(top1.get("label", "UNKNOWN"))
+    top1_raw = float(top1.get("raw_score", top1.get("score", 0.0)))
+    original_top1_label = top1_label
+    original_top1_score = top1_raw
+    top2_raw = float(top2.get("raw_score", top2.get("score", 0.0))) if top2 is not None else None
+    original_top2_label = str(top2.get("label", "UNKNOWN")) if top2 is not None else None
+    original_top2_score = top2_raw
+    gap = (top1_raw - top2_raw) if top2_raw is not None else None
+    gap_reason = "top2_present" if top2_raw is not None else "no_top2"
+
+    gap_th = float(getattr(backend_config, "OCR_AMBIGUOUS_GAP_THRESHOLD", 0.02))
+    score_th = float(getattr(backend_config, "OCR_AMBIGUOUS_SCORE_THRESHOLD", 0.50))
+    cup_like = _is_cup_category_label(top1_label) or (top2 is not None and _is_cup_category_label(str(top2.get("label", ""))))
+    ambiguous = bool((top2 is not None and gap is not None and gap < gap_th) or (top1_raw < score_th and cup_like))
+    state["ocr_ambiguous"] = ambiguous
+    crop_min_side_after = int(state.get("search_crop_min_side_after") or min(crop.shape[:2])) if crop is not None else 0
+    if not ambiguous:
+        if bool(getattr(backend_config, "OCR_DEBUG_LOG", True)):
+            logger.info(
+                "OCR hybrid: session=%s frame_id=%s ambiguous=%s gap=%s gap_reason=%s chosen_lang=%s chosen_slice=%s chosen_psm=%s chosen_thresh=%s chosen_conf_cut=%s token_count=%d korean_char_count=%d avg_conf=%.2f ocr_attempted=%s ocr_used=%s ocr_error=%s ocr_skip_reason=%s ocr_text=%s matched_keywords=%s reranked_topk=%s final_top1=%s final_score=%.4f original_top1=%s:%.4f original_top2=%s:%s",
+                session_id,
+                frame_id,
+                ambiguous,
+                f"{gap:.4f}" if gap is not None else "-",
+                gap_reason,
+                str(state.get("ocr_chosen_lang")),
+                str(state.get("ocr_chosen_slice")),
+                str(state.get("ocr_chosen_psm")),
+                str(state.get("ocr_chosen_thresh")),
+                str(state.get("ocr_chosen_conf_cut")),
+                int(state.get("ocr_token_count", 0)),
+                int(state.get("ocr_korean_char_count", 0)),
+                float(state.get("ocr_avg_conf", 0.0)),
+                False,
+                False,
+                None,
+                None,
+                "",
+                {},
+                [],
+                top1_label,
+                top1_raw,
+                original_top1_label,
+                original_top1_score,
+                original_top2_label or "-",
+                f"{float(original_top2_score):.4f}" if original_top2_score is not None else "-",
+            )
+        return topk_candidates
+
+    occluded = bool(state.get("occluded_by_hand", False))
+    if crop_min_side_after < 240:
+        state["ocr_skip_reason"] = "crop_too_small"
+        if bool(getattr(backend_config, "OCR_DEBUG_LOG", True)):
+            logger.info(
+                "OCR hybrid: session=%s frame_id=%s ambiguous=%s gap=%s gap_reason=%s chosen_lang=%s chosen_slice=%s chosen_psm=%s chosen_thresh=%s chosen_conf_cut=%s token_count=%d korean_char_count=%d avg_conf=%.2f ocr_attempted=%s ocr_used=%s ocr_error=%s ocr_skip_reason=%s ocr_text=%s matched_keywords=%s reranked_topk=%s final_top1=%s final_score=%.4f original_top1=%s:%.4f original_top2=%s:%s",
+                session_id,
+                frame_id,
+                ambiguous,
+                f"{gap:.4f}" if gap is not None else "-",
+                gap_reason,
+                str(state.get("ocr_chosen_lang")),
+                str(state.get("ocr_chosen_slice")),
+                str(state.get("ocr_chosen_psm")),
+                str(state.get("ocr_chosen_thresh")),
+                str(state.get("ocr_chosen_conf_cut")),
+                int(state.get("ocr_token_count", 0)),
+                int(state.get("ocr_korean_char_count", 0)),
+                float(state.get("ocr_avg_conf", 0.0)),
+                False,
+                False,
+                None,
+                str(state.get("ocr_skip_reason")),
+                "",
+                {},
+                [],
+                0.0,
+                top1_label,
+                top1_raw,
+                original_top1_label,
+                original_top1_score,
+                original_top2_label or "-",
+                f"{float(original_top2_score):.4f}" if original_top2_score is not None else "-",
+            )
+        return topk_candidates
+
+    ocr_result = run_ocr_hybrid(
+        crop,
+        frame_id=frame_id,
+        session_id=session_id,
+    )
+    state["ocr_attempted"] = bool(ocr_result.get("ocr_attempted", False))
+    state["ocr_error"] = ocr_result.get("ocr_error")
+    state["ocr_chosen_slice"] = ocr_result.get("chosen_slice")
+    state["ocr_chosen_psm"] = ocr_result.get("chosen_psm")
+    state["ocr_chosen_thresh"] = ocr_result.get("chosen_thresh")
+    state["ocr_chosen_conf_cut"] = ocr_result.get("chosen_conf_cut")
+    state["ocr_chosen_lang"] = ocr_result.get("chosen_lang", _resolve_ocr_lang_once())
+    state["ocr_token_count"] = int(ocr_result.get("token_count", 0))
+    state["ocr_korean_char_count"] = int(ocr_result.get("korean_char_count", 0))
+    state["ocr_avg_conf"] = float(ocr_result.get("avg_conf", 0.0))
+    state["ocr_text"] = str(ocr_result.get("ocr_text", ""))
+    normalized_text = _normalize_ocr_text(state["ocr_text"])
+    if len(normalized_text) < max(1, int(getattr(backend_config, "OCR_MIN_TEXT_LENGTH", 2))):
+        if bool(getattr(backend_config, "OCR_DEBUG_LOG", True)):
+            logger.info(
+                "OCR hybrid: session=%s frame_id=%s ambiguous=%s gap=%s gap_reason=%s chosen_lang=%s chosen_slice=%s chosen_psm=%s chosen_thresh=%s chosen_conf_cut=%s token_count=%d korean_char_count=%d avg_conf=%.2f ocr_attempted=%s ocr_used=%s ocr_error=%s ocr_skip_reason=%s ocr_text=%s matched_keywords=%s reranked_topk=%s final_top1=%s final_score=%.4f original_top1=%s:%.4f original_top2=%s:%s",
+                session_id,
+                frame_id,
+                ambiguous,
+                f"{gap:.4f}" if gap is not None else "-",
+                gap_reason,
+                str(state.get("ocr_chosen_lang")),
+                str(state.get("ocr_chosen_slice")),
+                str(state.get("ocr_chosen_psm")),
+                str(state.get("ocr_chosen_thresh")),
+                str(state.get("ocr_chosen_conf_cut")),
+                int(state.get("ocr_token_count", 0)),
+                int(state.get("ocr_korean_char_count", 0)),
+                float(state.get("ocr_avg_conf", 0.0)),
+                bool(state.get("ocr_attempted", False)),
+                False,
+                state.get("ocr_error"),
+                state.get("ocr_skip_reason"),
+                str(state.get("ocr_text", ""))[:80],
+                {},
+                [],
+                top1_label,
+                top1_raw,
+                original_top1_label,
+                original_top1_score,
+                original_top2_label or "-",
+                f"{float(original_top2_score):.4f}" if original_top2_score is not None else "-",
+            )
+        return topk_candidates
+
+    reranked, matched_keywords, best_text_score, any_keyword_hit = apply_ocr_rerank(
+        topk_candidates,
+        ocr_result=ocr_result,
+        occluded_by_hand=occluded,
+    )
+    top1_final = reranked[0] if reranked else top1
+    state["ocr_used"] = bool(any_keyword_hit)
+    state["ocr_matched_keywords"] = matched_keywords
+    state["ocr_text_score"] = float(best_text_score)
+    state["ocr_reranked_topk"] = [
+        {
+            "label": str(c.get("label", "UNKNOWN")),
+            "score": float(c.get("final_score", c.get("raw_score", c.get("score", 0.0)))),
+        }
+        for c in reranked[:5]
+    ]
+
+    if bool(getattr(backend_config, "OCR_DEBUG_LOG", True)):
+        top3_labels = [str(c.get("label", "UNKNOWN")) for c in reranked[:3]]
+        top3_keywords = {k: v for k, v in matched_keywords.items() if k in top3_labels}
+        logger.info(
+            "OCR hybrid: session=%s frame_id=%s ambiguous=%s gap=%s gap_reason=%s chosen_lang=%s chosen_slice=%s chosen_psm=%s chosen_thresh=%s chosen_conf_cut=%s token_count=%d korean_char_count=%d avg_conf=%.2f ocr_attempted=%s ocr_used=%s ocr_error=%s ocr_skip_reason=%s ocr_text=%s matched_keywords=%s reranked_topk=%s final_top1=%s final_score=%.4f original_top1=%s:%.4f original_top2=%s:%s",
+            session_id,
+            frame_id,
+            ambiguous,
+            f"{gap:.4f}" if gap is not None else "-",
+            gap_reason,
+            str(state.get("ocr_chosen_lang")),
+            str(state.get("ocr_chosen_slice")),
+            str(state.get("ocr_chosen_psm")),
+            str(state.get("ocr_chosen_thresh")),
+            str(state.get("ocr_chosen_conf_cut")),
+            int(state.get("ocr_token_count", 0)),
+            int(state.get("ocr_korean_char_count", 0)),
+            float(state.get("ocr_avg_conf", 0.0)),
+            bool(state.get("ocr_attempted", False)),
+            bool(state.get("ocr_used", False)),
+            state.get("ocr_error"),
+            state.get("ocr_skip_reason"),
+            str(state.get("ocr_text", ""))[:80],
+            top3_keywords,
+            state.get("ocr_reranked_topk", [])[:3],
+            str(top1_final.get("label", "UNKNOWN")),
+            float(top1_final.get("final_score", top1_final.get("raw_score", top1_final.get("score", 0.0)))),
+            original_top1_label,
+            original_top1_score,
+            original_top2_label or "-",
+            f"{float(original_top2_score):.4f}" if original_top2_score is not None else "-",
+        )
+    return reranked
+
+
 def _apply_unknown_decision(
     state: MutableMapping[str, Any],
     *,
@@ -110,11 +605,13 @@ def _apply_unknown_decision(
 ) -> tuple[str, bool, str | None, float, float | None]:
     score_th = float(getattr(backend_config, "UNKNOWN_SCORE_THRESHOLD", 0.45))
     gap_th = float(getattr(backend_config, "UNKNOWN_GAP_THRESHOLD", 0.02))
+    ambiguous_gap_th = float(getattr(backend_config, "OCR_AMBIGUOUS_GAP_THRESHOLD", 0.02))
     stable_need = max(1, int(getattr(backend_config, "STABLE_RESULT_FRAMES", 3)))
     high_conf_th = float(getattr(backend_config, "HIGH_CONFIDENCE_THRESHOLD", 0.65))
     high_conf_th_occluded = float(getattr(backend_config, "HIGH_CONFIDENCE_THRESHOLD_OCCLUDED", max(0.65, high_conf_th + 0.1)))
     occluded_by_hand = bool(state.get("occluded_by_hand", False))
     iou_max = float(state.get("overlap_hand_iou_max", 0.0))
+    ocr_used = bool(state.get("ocr_used", False))
     effective_high_conf_th = high_conf_th_occluded if occluded_by_hand else high_conf_th
 
     if not topk_candidates:
@@ -150,7 +647,10 @@ def _apply_unknown_decision(
 
         decision = "UNKNOWN"
         decision_reason = "score_below_threshold"
-        if top1_raw > effective_high_conf_th:
+        if top2_raw is not None and gap is not None and gap < ambiguous_gap_th and not ocr_used:
+            decision = "UNKNOWN"
+            decision_reason = "ambiguous_small_gap"
+        elif top1_raw > effective_high_conf_th:
             decision = "CONFIRMED"
             decision_reason = "high_confidence_fast_track_occluded" if occluded_by_hand else "high_confidence_fast_track"
         elif top1_raw < score_th:
@@ -354,6 +854,13 @@ def _match_with_voting(
             logger.info("Search debug topk(raw): session=%s frame_id=%s topk=%s", session_id, frame_id, debug_topk)
 
         topk_candidates = _build_topk_response(current_scores, search_k)
+        topk_candidates = _apply_ocr_rerank_if_ambiguous(
+            crop=crop,
+            topk_candidates=topk_candidates,
+            state=state,
+            frame_id=frame_id,
+            session_id=session_id,
+        )
         confidence = _compute_confidence(topk_candidates)
         state["topk_candidates"] = topk_candidates
         state["confidence"] = confidence
@@ -407,9 +914,12 @@ def _classify_snapshots_with_votes(
     model_bundle,
     faiss_index,
     labels,
+    state: MutableMapping[str, Any] | None,
     match_threshold: float,
     faiss_top_k: int,
     frame_profiler,
+    frame_id: int | None = None,
+    session_id: str | None = None,
 ) -> tuple[str | None, float, list[dict[str, float]], float]:
     if not crops:
         return None, 0.0, [], 0.0
@@ -418,6 +928,7 @@ def _classify_snapshots_with_votes(
     vote_counts: dict[str, int] = {}
     last_scores: dict[str, float] = {}
     last_topk_candidates: list[dict[str, float]] = []
+    last_crop_for_ocr: np.ndarray | None = None
     effective_top_k = max(5, int(faiss_top_k))
     search_k = max(1, min(int(effective_top_k), int(faiss_index.ntotal)))
     for crop in crops:
@@ -444,6 +955,7 @@ def _classify_snapshots_with_votes(
         if not current_scores:
             continue
 
+        last_crop_for_ocr = crop
         last_scores = current_scores
         last_topk_candidates = _build_topk_response(current_scores, search_k)
         if not last_topk_candidates:
@@ -454,6 +966,14 @@ def _classify_snapshots_with_votes(
 
     def _finalize() -> tuple[str | None, float, list[dict[str, float]], float]:
         topk_candidates = last_topk_candidates
+        if state is not None and last_crop_for_ocr is not None:
+            topk_candidates = _apply_ocr_rerank_if_ambiguous(
+                crop=last_crop_for_ocr,
+                topk_candidates=topk_candidates,
+                state=state,
+                frame_id=frame_id,
+                session_id=session_id,
+            )
         confidence = _compute_confidence(topk_candidates)
         if not topk_candidates:
             return None, 0.0, [], confidence
@@ -873,6 +1393,14 @@ def process_checkout_frame(
         state["best_pair"] = None
     state["did_search"] = False
     state["skip_reason"] = "pending"
+    state["ocr_used"] = False
+    state["ocr_attempted"] = False
+    state["ocr_error"] = None
+    state["ocr_skip_reason"] = None
+    state["ocr_text"] = ""
+    state["ocr_matched_keywords"] = {}
+    state["ocr_text_score"] = 0.0
+    state["ocr_ambiguous"] = False
 
     # Choose detection method: YOLO or background subtraction
     if yolo_detector is not None:
@@ -1105,9 +1633,12 @@ def process_checkout_frame(
                     model_bundle=model_bundle,
                     faiss_index=faiss_index,
                     labels=labels,
+                    state=state,
                     match_threshold=match_threshold,
                     faiss_top_k=faiss_top_k,
                     frame_profiler=frame_profiler,
+                    frame_id=frame_id,
+                    session_id=session_id,
                 )
                 state["topk_candidates"] = topk_candidates
                 state["confidence"] = confidence

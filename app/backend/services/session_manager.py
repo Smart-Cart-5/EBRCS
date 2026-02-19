@@ -39,6 +39,23 @@ class CheckoutSession:
         "search_crop_min_side_before": None,
         "search_crop_min_side_after": None,
         "search_crop_padding_ratio": 0.0,
+        "ocr_used": False,
+        "ocr_attempted": False,
+        "ocr_error": None,
+        "ocr_skip_reason": None,
+        "ocr_text": "",
+        "ocr_matched_keywords": {},
+        "ocr_text_score": 0.0,
+        "ocr_ambiguous": False,
+        "ocr_chosen_slice": None,
+        "ocr_chosen_psm": None,
+        "ocr_chosen_thresh": None,
+        "ocr_chosen_conf_cut": None,
+        "ocr_chosen_lang": None,
+        "ocr_token_count": 0,
+        "ocr_korean_char_count": 0,
+        "ocr_avg_conf": 0.0,
+        "ocr_reranked_topk": [],
         "did_search": False,
         "skip_reason": "init",
         "last_result_name": None,
@@ -105,6 +122,23 @@ class CheckoutSession:
         self.state["search_crop_min_side_before"] = None
         self.state["search_crop_min_side_after"] = None
         self.state["search_crop_padding_ratio"] = 0.0
+        self.state["ocr_used"] = False
+        self.state["ocr_attempted"] = False
+        self.state["ocr_error"] = None
+        self.state["ocr_skip_reason"] = None
+        self.state["ocr_text"] = ""
+        self.state["ocr_matched_keywords"] = {}
+        self.state["ocr_text_score"] = 0.0
+        self.state["ocr_ambiguous"] = False
+        self.state["ocr_chosen_slice"] = None
+        self.state["ocr_chosen_psm"] = None
+        self.state["ocr_chosen_thresh"] = None
+        self.state["ocr_chosen_conf_cut"] = None
+        self.state["ocr_chosen_lang"] = None
+        self.state["ocr_token_count"] = 0
+        self.state["ocr_korean_char_count"] = 0
+        self.state["ocr_avg_conf"] = 0.0
+        self.state["ocr_reranked_topk"] = []
         self.state["did_search"] = False
         self.state["skip_reason"] = "init"
         self.state["last_result_name"] = None

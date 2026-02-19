@@ -1,6 +1,16 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
+REM ============================================================
+REM  Ensure Tesseract is visible to processes launched from here
+REM ============================================================
+set "TESSERACT_DIR=C:\Program Files\Tesseract-OCR"
+set "PATH=%TESSERACT_DIR%;%PATH%"
+
+REM Optional: show where tesseract is resolved from (debug)
+REM where tesseract
+REM tesseract --version
+
 REM --- Find REPO_ROOT by walking up from this script directory (max 6 levels) ---
 for %%I in ("%~dp0.") do set "CUR=%%~fI"
 set "REPO_ROOT="
@@ -44,6 +54,22 @@ if "%VENV_DIR%"=="" (
   exit /b 1
 )
 
+REM ============================================================
+REM  Activate venv in THIS script (only for sanity check)
+REM ============================================================
+call "%VENV_DIR%\Scripts\activate.bat" >nul 2>&1
+
+REM --- Sanity check: pytesseract can see tesseract (can be disabled) ---
+REM Set to 0 if you don't want this check:
+set "RUN_TESS_CHECK=1"
+
+if "%RUN_TESS_CHECK%"=="1" (
+  echo [CHECK] Verifying tesseract is reachable...
+  where tesseract
+  python -c "import pytesseract; print('TEST VERSION:', pytesseract.get_tesseract_version())"
+  echo [CHECK] Done.
+)
+
 REM --- Write runtime env file for the backend runner ---
 set "ENV_FILE=%~dp0_run_backend_env.cmd"
 > "%ENV_FILE%" (
@@ -51,6 +77,8 @@ set "ENV_FILE=%~dp0_run_backend_env.cmd"
   echo set "REPO_ROOT=%REPO_ROOT%"
   echo set "APP_DIR=%APP_DIR%"
   echo set "VENV_DIR=%VENV_DIR%"
+  echo set "TESSERACT_DIR=%TESSERACT_DIR%"
+  echo set "PATH=%TESSERACT_DIR%;%%PATH%%"
 )
 
 REM --- Launch backend window (call separate cmd to avoid escaping issues) ---
