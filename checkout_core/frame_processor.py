@@ -112,6 +112,10 @@ def _apply_unknown_decision(
     gap_th = float(getattr(backend_config, "UNKNOWN_GAP_THRESHOLD", 0.02))
     stable_need = max(1, int(getattr(backend_config, "STABLE_RESULT_FRAMES", 3)))
     high_conf_th = float(getattr(backend_config, "HIGH_CONFIDENCE_THRESHOLD", 0.65))
+    high_conf_th_occluded = float(getattr(backend_config, "HIGH_CONFIDENCE_THRESHOLD_OCCLUDED", max(0.65, high_conf_th + 0.1)))
+    occluded_by_hand = bool(state.get("occluded_by_hand", False))
+    iou_max = float(state.get("overlap_hand_iou_max", 0.0))
+    effective_high_conf_th = high_conf_th_occluded if occluded_by_hand else high_conf_th
 
     if not topk_candidates:
         result_label = "UNKNOWN"
@@ -146,9 +150,9 @@ def _apply_unknown_decision(
 
         decision = "UNKNOWN"
         decision_reason = "score_below_threshold"
-        if top1_raw > high_conf_th:
+        if top1_raw > effective_high_conf_th:
             decision = "CONFIRMED"
-            decision_reason = "high_confidence_fast_track"
+            decision_reason = "high_confidence_fast_track_occluded" if occluded_by_hand else "high_confidence_fast_track"
         elif top1_raw < score_th:
             decision = "UNKNOWN"
             decision_reason = "score_below_threshold"
@@ -170,7 +174,7 @@ def _apply_unknown_decision(
         top2_raw_log = f"{top2_raw:.4f}" if top2_raw is not None else "-"
         gap_log = f"{gap:.4f}" if gap is not None else "-"
         logger.info(
-            "Unknown decision: session=%s frame_id=%s top1_label=%s top1_raw=%.4f top2_label=%s top2_raw=%s gap=%s gap_reason=%s stable_count=%d thresholds(score=%.4f,gap=%.4f,stable=%d,high=%.4f) decision=%s decision_reason=%s",
+            "Unknown decision: session=%s frame_id=%s top1_label=%s top1_raw=%.4f top2_label=%s top2_raw=%s gap=%s gap_reason=%s stable_count=%d occluded_by_hand=%s iou_max=%.4f thresholds(score=%.4f,gap=%.4f,stable=%d,high=%.4f,high_occ=%.4f,high_eff=%.4f) decision=%s decision_reason=%s",
             session_id,
             frame_id,
             top1_label,
@@ -180,10 +184,14 @@ def _apply_unknown_decision(
             gap_log,
             gap_reason,
             stable_count,
+            occluded_by_hand,
+            iou_max,
             score_th,
             gap_th,
             stable_need,
             high_conf_th,
+            high_conf_th_occluded,
+            effective_high_conf_th,
             decision,
             decision_reason,
         )
@@ -271,7 +279,8 @@ def _match_with_voting(
 
     query = np.expand_dims(emb, axis=0)
     query_norm = float(np.linalg.norm(query[0]))
-    search_k = max(1, min(int(faiss_top_k), int(faiss_index.ntotal)))
+    effective_top_k = max(5, int(faiss_top_k))
+    search_k = max(1, min(int(effective_top_k), int(faiss_index.ntotal)))
     if frame_profiler is not None:
         with frame_profiler.measure("faiss"):
             distances, indices = faiss_index.search(query, search_k)
@@ -333,7 +342,7 @@ def _match_with_voting(
             current_scores[name] = max(current_scores.get(name, -1e9), float(score))
 
         if debug_enabled and current_scores:
-            ranked_debug = sorted(current_scores.items(), key=lambda x: x[1], reverse=True)[: max(1, int(faiss_top_k))]
+            ranked_debug = sorted(current_scores.items(), key=lambda x: x[1], reverse=True)[:5]
             debug_topk = [
                 {
                     "label": label,
@@ -344,16 +353,32 @@ def _match_with_voting(
             ]
             logger.info("Search debug topk(raw): session=%s frame_id=%s topk=%s", session_id, frame_id, debug_topk)
 
-        topk_candidates = _build_topk_response(current_scores, faiss_top_k)
+        topk_candidates = _build_topk_response(current_scores, search_k)
         confidence = _compute_confidence(topk_candidates)
         state["topk_candidates"] = topk_candidates
         state["confidence"] = confidence
 
         if not topk_candidates:
+            _save_search_crop_if_needed(
+                crop,
+                state=state,
+                session_id=session_id,
+                frame_id=frame_id,
+                top1_label="UNKNOWN",
+                top1_raw=0.0,
+            )
             return None, 0.0, topk_candidates, confidence
 
         top1_label = str(topk_candidates[0]["label"])
         top1_raw = float(topk_candidates[0]["raw_score"])
+        _save_search_crop_if_needed(
+            crop,
+            state=state,
+            session_id=session_id,
+            frame_id=frame_id,
+            top1_label=top1_label,
+            top1_raw=top1_raw,
+        )
         history, vote_counts = _update_candidate_votes(state, top1_label, vote_window_size)
 
         voted_label = max(
@@ -393,7 +418,8 @@ def _classify_snapshots_with_votes(
     vote_counts: dict[str, int] = {}
     last_scores: dict[str, float] = {}
     last_topk_candidates: list[dict[str, float]] = []
-    search_k = max(1, min(int(faiss_top_k), int(faiss_index.ntotal)))
+    effective_top_k = max(5, int(faiss_top_k))
+    search_k = max(1, min(int(effective_top_k), int(faiss_index.ntotal)))
     for crop in crops:
         if frame_profiler is not None:
             with frame_profiler.measure("embed"):
@@ -419,7 +445,7 @@ def _classify_snapshots_with_votes(
             continue
 
         last_scores = current_scores
-        last_topk_candidates = _build_topk_response(current_scores, faiss_top_k)
+        last_topk_candidates = _build_topk_response(current_scores, search_k)
         if not last_topk_candidates:
             continue
         top1_label = str(last_topk_candidates[0]["label"])
@@ -572,6 +598,143 @@ def _mask_hand_regions_in_crop(
         if cx2 > cx1 and cy2 > cy1:
             masked[cy1:cy2, cx1:cx2] = 0
     return masked
+
+
+def _expand_search_box(
+    box: list[float],
+    frame_shape: tuple[int, ...],
+    *,
+    target_min_side: int,
+    pad_ratio: float,
+    edge_pad_ratio: float,
+) -> tuple[list[float], float]:
+    h, w = frame_shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in box]
+    x1_px = x1 * w
+    y1_px = y1 * h
+    x2_px = x2 * w
+    y2_px = y2 * h
+
+    bw = max(1.0, x2_px - x1_px)
+    bh = max(1.0, y2_px - y1_px)
+    cx = (x1_px + x2_px) * 0.5
+    cy = (y1_px + y2_px) * 0.5
+
+    new_w = bw * (1.0 + max(0.0, float(pad_ratio)))
+    new_h = bh * (1.0 + max(0.0, float(pad_ratio)))
+    min_side = float(max(1, int(target_min_side)))
+    cur_min = min(new_w, new_h)
+    if cur_min < min_side:
+        scale = min_side / max(1.0, cur_min)
+        new_w *= scale
+        new_h *= scale
+
+    edge_px = float(max(0.0, edge_pad_ratio) * min(w, h))
+    edge_touch = bool(x1_px <= edge_px or y1_px <= edge_px or x2_px >= (w - edge_px) or y2_px >= (h - edge_px))
+    if edge_touch:
+        new_w *= 1.12
+        new_h *= 1.12
+
+    nx1 = max(0.0, cx - (new_w * 0.5))
+    ny1 = max(0.0, cy - (new_h * 0.5))
+    nx2 = min(float(w), cx + (new_w * 0.5))
+    ny2 = min(float(h), cy + (new_h * 0.5))
+
+    effective_padding_ratio = max((new_w / max(1.0, bw)) - 1.0, (new_h / max(1.0, bh)) - 1.0)
+    return ([
+        float(nx1 / max(1.0, float(w))),
+        float(ny1 / max(1.0, float(h))),
+        float(nx2 / max(1.0, float(w))),
+        float(ny2 / max(1.0, float(h))),
+    ], float(effective_padding_ratio))
+
+
+def _pad_crop_for_embedding(
+    crop: np.ndarray,
+    *,
+    target_min_side: int,
+    aspect_min_hw: float,
+    aspect_max_hw: float,
+) -> np.ndarray:
+    if crop is None or crop.size == 0:
+        return crop
+    h, w = crop.shape[:2]
+    target_h = max(int(h), int(target_min_side))
+    target_w = max(int(w), int(target_min_side))
+
+    aspect_min_hw = max(0.1, float(aspect_min_hw))
+    aspect_max_hw = max(aspect_min_hw, float(aspect_max_hw))
+    hw_ratio = target_h / max(1, target_w)
+    if hw_ratio < aspect_min_hw:
+        target_h = int(np.ceil(aspect_min_hw * target_w))
+    elif hw_ratio > aspect_max_hw:
+        target_w = int(np.ceil(target_h / max(1e-6, aspect_max_hw)))
+
+    pad_top = max(0, (target_h - h) // 2)
+    pad_bottom = max(0, target_h - h - pad_top)
+    pad_left = max(0, (target_w - w) // 2)
+    pad_right = max(0, target_w - w - pad_left)
+    if pad_top <= 0 and pad_bottom <= 0 and pad_left <= 0 and pad_right <= 0:
+        return crop
+    return cv2.copyMakeBorder(
+        crop,
+        pad_top,
+        pad_bottom,
+        pad_left,
+        pad_right,
+        borderType=cv2.BORDER_REPLICATE,
+    )
+
+
+def _parse_debug_frame_ids(raw: str) -> set[int]:
+    frame_ids: set[int] = set()
+    for token in str(raw or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            frame_ids.add(int(token))
+        except ValueError:
+            continue
+    return frame_ids
+
+
+def _save_search_crop_if_needed(
+    crop: np.ndarray,
+    *,
+    state: MutableMapping[str, Any],
+    session_id: str | None,
+    frame_id: int | None,
+    top1_label: str,
+    top1_raw: float,
+) -> None:
+    if not bool(getattr(backend_config, "SEARCH_DEBUG_SAVE_SEARCH_CROP", False)):
+        return
+    save_frame_ids = state.get("_search_debug_save_frame_ids")
+    if not isinstance(save_frame_ids, set):
+        save_frame_ids = _parse_debug_frame_ids(getattr(backend_config, "SEARCH_DEBUG_SAVE_FRAME_IDS", ""))
+        state["_search_debug_save_frame_ids"] = save_frame_ids
+
+    low_score_th = float(getattr(backend_config, "SEARCH_DEBUG_SAVE_LOW_SCORE_THRESHOLD", 0.35))
+    forced_frame = frame_id is not None and int(frame_id) in save_frame_ids
+    low_score = float(top1_raw) < low_score_th
+    if not (forced_frame or low_score):
+        return
+    if crop is None or crop.size == 0:
+        return
+
+    crop_dir = str(getattr(backend_config, "SEARCH_DEBUG_CROP_DIR", "debug_crops"))
+    os.makedirs(crop_dir, exist_ok=True)
+    safe_session = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(session_id or "na"))
+    safe_label = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(top1_label or "UNKNOWN"))
+    safe_frame = int(frame_id) if frame_id is not None else -1
+    reason = "frameid" if forced_frame else "lowraw"
+    out_name = f"search_{safe_session}_f{safe_frame}_{safe_label}_{float(top1_raw):.4f}_{reason}.jpg"
+    out_path = os.path.join(crop_dir, out_name)
+    try:
+        cv2.imwrite(out_path, crop)
+    except Exception:
+        logger.exception("Failed to save search crop: %s", out_path)
 
 
 def _record_search_debug_stats(
@@ -970,6 +1133,7 @@ def process_checkout_frame(
                     state.setdefault("item_scores", {})[result_label] = top1_raw
                     billing_items = state.setdefault("billing_items", {})
                     billing_items[result_label] = int(billing_items.get(result_label, 0)) + 1
+                    state["_last_confirmed_ms"] = int(time.time() * 1000)
                     state.setdefault("in_cart_sequence", []).append(result_label)
                 else:
                     state["last_label"] = "UNKNOWN"
@@ -1017,6 +1181,11 @@ def process_checkout_frame(
         has_conf_low_search = False
         has_crop_small = False
         has_outside_roi = False
+        state["occluded_by_hand"] = False
+        state["overlap_hand_iou_max"] = 0.0
+        state["search_crop_min_side_before"] = None
+        state["search_crop_min_side_after"] = None
+        state["search_crop_padding_ratio"] = 0.0
         if roi_poly is None:
             state["skip_reason"] = "roi_not_set"
             state["last_status"] = "ROI 미설정"
@@ -1036,14 +1205,13 @@ def process_checkout_frame(
                 bh = max(0.0, (box[3] - box[1]) * frame_h)
                 bbox_area_px = bw * bh
                 area_ratio = bbox_area_px / frame_area
-                min_ratio = max(float(min_box_area_ratio), float(product_min_area_ratio), float(min_search_area_ratio))
+                min_ratio = max(float(min_box_area_ratio), float(product_min_area_ratio))
                 if bbox_area_px < max(1, int(min_product_bbox_area)) or area_ratio < min_ratio:
                     has_too_small = True
                     continue
                 crop_min_side = min(int(round(bw)), int(round(bh)))
                 if crop_min_side < max(1, int(min_crop_size)):
                     has_crop_small = True
-                    continue
 
                 x1, y1, x2, y2 = box
                 cx = (x1 + x2) * 0.5 * frame_w
@@ -1063,6 +1231,7 @@ def process_checkout_frame(
                         "area_ratio": float(area_ratio),
                         "roi_iou": float(roi_iou_val),
                         "crop_min_side": int(crop_min_side),
+                        "needs_padding": bool(crop_min_side < max(1, int(min_crop_size))),
                         "selection_score": (
                             float(search_select_w_conf) * conf
                             + float(search_select_w_area) * float(area_ratio)
@@ -1085,6 +1254,7 @@ def process_checkout_frame(
                         "inside_roi": bool(c["inside_roi"]),
                         "roi_iou": round(float(c["roi_iou"]), 4),
                         "crop_min_side": int(c["crop_min_side"]),
+                        "needs_padding": bool(c["needs_padding"]),
                         "selection_score": round(float(c["selection_score"]), 4),
                     }
                     for c in ranked_candidates[:5]
@@ -1146,6 +1316,18 @@ def process_checkout_frame(
                 else:
                     state["skip_reason"] = "no_eligible_product"
                     state["last_status"] = "후보 없음"
+                if bool(getattr(backend_config, "SEARCH_DEBUG_LOG", False)):
+                    logger.info(
+                        "Search skip: session=%s frame_id=%s reason=%s occluded_by_hand=%s iou_max=%.4f crop_min_side_before=%s crop_min_side_after=%s padding_ratio=%.4f",
+                        session_id,
+                        frame_id,
+                        state["skip_reason"],
+                        bool(state.get("occluded_by_hand", False)),
+                        float(state.get("overlap_hand_iou_max", 0.0)),
+                        state.get("search_crop_min_side_before"),
+                        state.get("search_crop_min_side_after"),
+                        float(state.get("search_crop_padding_ratio", 0.0)),
+                    )
 
         if candidate is None:
             state["_search_track_box"] = None
@@ -1164,23 +1346,98 @@ def process_checkout_frame(
             state["_search_track_count"] = stable_count
             state["_search_track_frame"] = frame_count
 
-            if stable_count < max(1, int(stable_frames_for_search)):
-                state["skip_reason"] = "not_stable"
-                state["last_status"] = "안정화중"
+            state["search_track_stable"] = bool(stable_count >= max(1, int(stable_frames_for_search)))
+            now_ms = int(time.time() * 1000)
+            last_search_ms = int(state.get("_last_search_ms", 0))
+            last_confirmed_ms = int(state.get("_last_confirmed_ms", 0))
+            post_confirm_window_ms = max(0, int(getattr(backend_config, "SEARCH_POST_CONFIRM_WINDOW_MS", 2500)))
+            preconfirm_cooldown_ms = max(0, int(getattr(backend_config, "SEARCH_COOLDOWN_MS_PRECONFIRM", 50)))
+            strong_cooldown_ms = max(0, int(search_cooldown_ms))
+            confirmed_recently = last_confirmed_ms > 0 and (now_ms - last_confirmed_ms) <= post_confirm_window_ms
+            cooldown_ms = strong_cooldown_ms if confirmed_recently else preconfirm_cooldown_ms
+            if now_ms - last_search_ms < cooldown_ms:
+                state["skip_reason"] = "cooldown"
+                state["last_status"] = "쿨다운"
+                if bool(getattr(backend_config, "SEARCH_DEBUG_LOG", False)):
+                    logger.info(
+                        "Search skip: session=%s frame_id=%s reason=%s occluded_by_hand=%s iou_max=%.4f crop_min_side_before=%s crop_min_side_after=%s padding_ratio=%.4f confirmed_recently=%s cooldown_ms=%d",
+                        session_id,
+                        frame_id,
+                        state["skip_reason"],
+                        bool(state.get("occluded_by_hand", False)),
+                        float(state.get("overlap_hand_iou_max", 0.0)),
+                        state.get("search_crop_min_side_before"),
+                        state.get("search_crop_min_side_after"),
+                        float(state.get("search_crop_padding_ratio", 0.0)),
+                        confirmed_recently,
+                        int(cooldown_ms),
+                    )
+            elif faiss_index is None or faiss_index.ntotal <= 0:
+                state["skip_reason"] = "faiss_unavailable"
+                state["last_status"] = "검색 불가"
+                if bool(getattr(backend_config, "SEARCH_DEBUG_LOG", False)):
+                    logger.info(
+                        "Search skip: session=%s frame_id=%s reason=%s occluded_by_hand=%s iou_max=%.4f crop_min_side_before=%s crop_min_side_after=%s padding_ratio=%.4f",
+                        session_id,
+                        frame_id,
+                        state["skip_reason"],
+                        bool(state.get("occluded_by_hand", False)),
+                        float(state.get("overlap_hand_iou_max", 0.0)),
+                        state.get("search_crop_min_side_before"),
+                        state.get("search_crop_min_side_after"),
+                        float(state.get("search_crop_padding_ratio", 0.0)),
+                    )
             else:
-                now_ms = int(time.time() * 1000)
-                last_search_ms = int(state.get("_last_search_ms", 0))
-                if now_ms - last_search_ms < max(0, int(search_cooldown_ms)):
-                    state["skip_reason"] = "cooldown"
-                    state["last_status"] = "쿨다운"
-                elif faiss_index is None or faiss_index.ntotal <= 0:
-                    state["skip_reason"] = "faiss_unavailable"
-                    state["last_status"] = "검색 불가"
+                bw = max(0.0, (box[2] - box[0]) * frame_w)
+                bh = max(0.0, (box[3] - box[1]) * frame_h)
+                crop_min_side_before = int(min(round(bw), round(bh)))
+                state["search_crop_min_side_before"] = crop_min_side_before
+                expanded_box, padding_ratio = _expand_search_box(
+                    box,
+                    frame.shape,
+                    target_min_side=int(getattr(backend_config, "SEARCH_CROP_MIN_SIDE", 320)),
+                    pad_ratio=float(getattr(backend_config, "SEARCH_CROP_PAD_RATIO", 0.20)),
+                    edge_pad_ratio=float(getattr(backend_config, "SEARCH_CROP_EDGE_PAD_RATIO", 0.02)),
+                )
+                state["search_crop_padding_ratio"] = float(padding_ratio)
+                crop = yolo_detector.extract_crop(frame, expanded_box)
+                if crop is None:
+                    state["skip_reason"] = "crop_failed"
+                    state["last_status"] = "크롭 실패"
+                    if bool(getattr(backend_config, "SEARCH_DEBUG_LOG", False)):
+                        logger.info(
+                            "Search skip: session=%s frame_id=%s reason=%s occluded_by_hand=%s iou_max=%.4f crop_min_side_before=%s crop_min_side_after=%s padding_ratio=%.4f",
+                            session_id,
+                            frame_id,
+                            state["skip_reason"],
+                            bool(state.get("occluded_by_hand", False)),
+                            float(state.get("overlap_hand_iou_max", 0.0)),
+                            state.get("search_crop_min_side_before"),
+                            state.get("search_crop_min_side_after"),
+                            float(state.get("search_crop_padding_ratio", 0.0)),
+                        )
                 else:
-                    crop = yolo_detector.extract_crop(frame, box)
+                    crop_min_side_after = int(min(crop.shape[0], crop.shape[1]))
+                    state["search_crop_min_side_after"] = crop_min_side_after
+                    min_after_expand = max(1, int(getattr(backend_config, "SEARCH_CROP_MIN_SIDE_AFTER_EXPAND", 240)))
+                    if crop_min_side_after < min_after_expand:
+                        state["skip_reason"] = "crop_too_small_after_expand"
+                        state["last_status"] = "크롭 작음(확장후)"
+                        if bool(getattr(backend_config, "SEARCH_DEBUG_LOG", False)):
+                            logger.info(
+                                "Search skip: session=%s frame_id=%s reason=%s occluded_by_hand=%s iou_max=%.4f crop_min_side_before=%s crop_min_side_after=%s padding_ratio=%.4f",
+                                session_id,
+                                frame_id,
+                                state["skip_reason"],
+                                bool(state.get("occluded_by_hand", False)),
+                                float(state.get("overlap_hand_iou_max", 0.0)),
+                                state.get("search_crop_min_side_before"),
+                                state.get("search_crop_min_side_after"),
+                                float(state.get("search_crop_padding_ratio", 0.0)),
+                            )
+                        crop = None
                     if crop is None:
-                        state["skip_reason"] = "crop_failed"
-                        state["last_status"] = "크롭 실패"
+                        pass
                     else:
                         overlap_hands: list[list[float]] = []
                         max_hand_iou = 0.0
@@ -1193,47 +1450,38 @@ def process_checkout_frame(
                                 max_hand_iou = iou
                             if iou > float(hand_overlap_iou):
                                 overlap_hands.append(hbox)
-
-                        if overlap_hands and not bool(search_mask_hand):
-                            state["skip_reason"] = "overlap_hand"
-                            state["last_status"] = "손 겹침"
-                            state["_search_track_box"] = None
-                            state["_search_track_count"] = 0
-                            state["_search_track_frame"] = frame_count
-                            state["_overlap_hand_skip_count"] = int(state.get("_overlap_hand_skip_count", 0)) + 1
-                            state["_overlap_hand_last_iou"] = float(max_hand_iou)
-                            if bool(getattr(backend_config, "SEARCH_DEBUG_LOG", False)) and _should_debug_log(
-                                state,
-                                int(getattr(backend_config, "SEARCH_DEBUG_LOG_INTERVAL_MS", 5000)),
-                                key="_overlap_hand_debug_last_log_ms",
-                            ):
-                                logger.info(
-                                    "Search overlap_hand skip: session=%s frame_id=%s iou_max=%.4f skip_count=%d threshold=%.2f",
-                                    session_id,
-                                    frame_id,
-                                    float(max_hand_iou),
-                                    int(state.get("_overlap_hand_skip_count", 0)),
-                                    float(hand_overlap_iou),
-                                )
-                            _record_search_debug_stats(state, frame_id=frame_id, session_id=session_id)
-                            if frame_profiler is not None:
-                                frame_profiler.add_ms("total", (time.perf_counter() - total_start) * 1000.0)
-                                if owns_profiler:
-                                    frame_profiler.finish()
-                            return display_frame
+                        state["overlap_hand_iou_max"] = float(max_hand_iou)
+                        state["occluded_by_hand"] = bool(overlap_hands)
 
                         if overlap_hands and bool(search_mask_hand):
                             crop = _mask_hand_regions_in_crop(
                                 crop,
-                                product_box=box,
+                                product_box=expanded_box,
                                 hand_boxes=overlap_hands,
                                 frame_shape=frame.shape,
                             )
                             state["_overlap_hand_last_iou"] = float(max_hand_iou)
+                        crop = _pad_crop_for_embedding(
+                            crop,
+                            target_min_side=int(getattr(backend_config, "SEARCH_CROP_MIN_SIDE", 320)),
+                            aspect_min_hw=float(getattr(backend_config, "SEARCH_CROP_ASPECT_MIN", 0.5)),
+                            aspect_max_hw=float(getattr(backend_config, "SEARCH_CROP_ASPECT_MAX", 2.0)),
+                        )
 
                         state["did_search"] = True
                         state["skip_reason"] = "searched"
                         state["_last_search_ms"] = now_ms
+                        if bool(getattr(backend_config, "SEARCH_DEBUG_LOG", False)):
+                            logger.info(
+                                "Search run: session=%s frame_id=%s occluded_by_hand=%s iou_max=%.4f crop_min_side_before=%s crop_min_side_after=%s padding_ratio=%.4f",
+                                session_id,
+                                frame_id,
+                                bool(state.get("occluded_by_hand", False)),
+                                float(state.get("overlap_hand_iou_max", 0.0)),
+                                state.get("search_crop_min_side_before"),
+                                state.get("search_crop_min_side_after"),
+                                float(state.get("search_crop_padding_ratio", 0.0)),
+                            )
                         name, best_score, topk_candidates, confidence = _match_with_voting(
                             crop=crop,
                             model_bundle=model_bundle,
@@ -1282,6 +1530,7 @@ def process_checkout_frame(
                             if can_count:
                                 billing_items = state.setdefault("billing_items", {})
                                 billing_items[result_label] = int(billing_items.get(result_label, 0)) + 1
+                                state["_last_confirmed_ms"] = now_ms
                         else:
                             state["last_label"] = "UNKNOWN"
                             state["last_score"] = top1_raw

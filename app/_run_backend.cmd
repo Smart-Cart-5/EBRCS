@@ -46,12 +46,34 @@ REM Throttle heavy stages (embedding/FAISS/voting) to every Nth frame
 REM - Faster / more realtime: 8~12
 REM - Balanced: 5~7
 REM - More frequent recognition: 3~4 (slower)
-set "SEARCH_EVERY_N_FRAMES=10"
+set "SEARCH_EVERY_N_FRAMES=6"
+
+REM ============================================================
+REM  Responsive preset
+REM ============================================================
+set "FAISS_TOP_K=5"
+set "SEARCH_COOLDOWN_MS_PRECONFIRM=20"
+set "SEARCH_COOLDOWN_MS=450"
+set "SEARCH_POST_CONFIRM_WINDOW_MS=1800"
+
+set "SEARCH_CROP_MIN_SIDE=320"
+set "SEARCH_CROP_PAD_RATIO=0.25"
+set "SEARCH_CROP_MIN_SIDE_AFTER_EXPAND=220"
+set "SEARCH_CROP_ASPECT_MIN=0.45"
+set "SEARCH_CROP_ASPECT_MAX=2.2"
+
+set "UNKNOWN_SCORE_THRESHOLD=0.43"
+set "UNKNOWN_GAP_THRESHOLD=0.015"
+set "STABLE_RESULT_FRAMES=2"
+set "HIGH_CONFIDENCE_THRESHOLD=0.65"
+set "HIGH_CONFIDENCE_THRESHOLD_OCCLUDED=0.82"
+
+set "SEARCH_MASK_HAND=true"
+set "HAND_OVERLAP_IOU=0.50"
 
 REM Optional tuning (override defaults only if needed):
 REM set "DETECT_EVERY_N_FRAMES=6"
 REM set "MAX_PRODUCTS_PER_FRAME=3"
-REM set "FAISS_TOP_K=3"
 REM set "VOTE_WINDOW_SIZE=5"
 REM set "VOTE_MIN_SAMPLES=3"
 

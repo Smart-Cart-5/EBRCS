@@ -34,6 +34,11 @@ class CheckoutSession:
         "confidence": 0.0,
         "best_pair": None,
         "event_state": "IDLE",
+        "occluded_by_hand": False,
+        "overlap_hand_iou_max": 0.0,
+        "search_crop_min_side_before": None,
+        "search_crop_min_side_after": None,
+        "search_crop_padding_ratio": 0.0,
         "did_search": False,
         "skip_reason": "init",
         "last_result_name": None,
@@ -95,6 +100,11 @@ class CheckoutSession:
         self.state["confidence"] = 0.0
         self.state["best_pair"] = None
         self.state["event_state"] = "IDLE"
+        self.state["occluded_by_hand"] = False
+        self.state["overlap_hand_iou_max"] = 0.0
+        self.state["search_crop_min_side_before"] = None
+        self.state["search_crop_min_side_after"] = None
+        self.state["search_crop_padding_ratio"] = 0.0
         self.state["did_search"] = False
         self.state["skip_reason"] = "init"
         self.state["last_result_name"] = None
