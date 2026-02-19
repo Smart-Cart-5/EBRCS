@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import nullcontext
+import time
 
 import cv2
 import faiss
@@ -14,7 +16,13 @@ import torch.nn as nn
 from PIL import Image
 from torch.nn import functional as F
 from torchvision import transforms
-from transformers import AutoImageProcessor, AutoModel, CLIPModel, CLIPProcessor, CLIPVisionModel
+from transformers import (
+    AutoImageProcessor,
+    AutoModel,
+    CLIPModel,
+    CLIPProcessor,
+    CLIPVisionModel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +33,66 @@ CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 
 DINO_WEIGHT = 0.7
 CLIP_WEIGHT = 0.3
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_device() -> torch.device:
+    requested = (os.getenv("EMBEDDING_DEVICE") or "").strip().lower()
+    cuda_ok = torch.cuda.is_available()
+    if requested in {"cuda", "gpu"}:
+        if cuda_ok:
+            return torch.device("cuda")
+        logger.warning("EMBEDDING_DEVICE=cuda requested but CUDA unavailable; falling back to CPU")
+        return torch.device("cpu")
+    if requested == "cpu":
+        return torch.device("cpu")
+    return torch.device("cuda" if cuda_ok else "cpu")
+
+
+def _amp_context(bundle: dict):
+    if not bundle.get("use_amp", False):
+        return nullcontext()
+    if str(bundle.get("device", "cpu")) != "cuda":
+        return nullcontext()
+    amp_dtype = bundle.get("amp_dtype", torch.float16)
+    return torch.autocast(device_type="cuda", dtype=amp_dtype)
+
+
+def _model_param_device(model) -> torch.device | None:
+    try:
+        return next(model.parameters()).device
+    except Exception:
+        return None
+
+
+def _debug_device_check(bundle: dict, *, tag: str, model, input_tensor: torch.Tensor | None) -> None:
+    if not _env_flag("EMBEDDING_DEBUG_DEVICE_CHECK", False):
+        return
+    interval_ms = int(os.getenv("EMBEDDING_DEBUG_DEVICE_CHECK_INTERVAL_MS", "5000"))
+    now_ms = int(time.time() * 1000)
+    last_ms = int(bundle.get("_device_check_last_log_ms", 0))
+    if now_ms - last_ms < max(0, interval_ms):
+        return
+    bundle["_device_check_last_log_ms"] = now_ms
+
+    resolved = bundle.get("device")
+    model_dev = _model_param_device(model)
+    input_dev = input_tensor.device if torch.is_tensor(input_tensor) else None
+    match = model_dev is not None and input_dev is not None and str(model_dev) == str(input_dev)
+    logger.info(
+        "[EMBED_DEVICE] tag=%s resolved=%s model_device=%s input_device=%s match=%s",
+        tag,
+        resolved,
+        str(model_dev),
+        str(input_dev),
+        match,
+    )
 
 
 def get_hf_token() -> str | None:
@@ -71,6 +139,7 @@ def safe_cls_from_output(output):
 # Mode detection
 # ---------------------------------------------------------------------------
 
+
 def _detect_data_mode(adapter_dir: str) -> str:
     """Detect data mode from adapter_config.json.
 
@@ -91,6 +160,7 @@ def _detect_data_mode(adapter_dir: str) -> str:
 # UltimateFusionModel (matches training code exactly)
 # ---------------------------------------------------------------------------
 
+
 class UltimateFusionModel(nn.Module):
     """DINOv3-Base (timm) + CLIP-Base/32 -> Bottleneck -> 512d.
 
@@ -105,10 +175,14 @@ class UltimateFusionModel(nn.Module):
     def __init__(self, num_products: int, num_majors: int):
         super().__init__()
         self.dino = timm.create_model(
-            "vit_base_patch16_dinov3.lvd1689m", pretrained=False, num_classes=0,
+            "vit_base_patch16_dinov3.lvd1689m",
+            pretrained=False,
+            num_classes=0,
         )
         self.clip = CLIPVisionModel.from_pretrained(CLIP_MODEL_NAME)
-        self.clip_resizer = nn.Upsample(size=(224, 224), mode="bilinear", align_corners=False)
+        self.clip_resizer = nn.Upsample(
+            size=(224, 224), mode="bilinear", align_corners=False
+        )
 
         feature_dim = 768 + 768  # DINO CLS + CLIP pooler
         self.bottleneck = nn.Sequential(
@@ -122,7 +196,7 @@ class UltimateFusionModel(nn.Module):
 
     def forward_embedding(self, x: torch.Tensor) -> torch.Tensor:
         """Extract 512-d L2-normalized embedding for FAISS search."""
-        with torch.no_grad():
+        with torch.inference_mode():
             dino_feat = self.dino(x)  # [B, 768]
             clip_feat = self.clip(self.clip_resizer(x)).pooler_output  # [B, 768]
         fusion_feat = torch.cat([dino_feat, clip_feat], dim=-1)  # [B, 1536]
@@ -134,10 +208,22 @@ class UltimateFusionModel(nn.Module):
 # load_models
 # ---------------------------------------------------------------------------
 
+
 @st.cache_resource(show_spinner=False)
 def load_models(adapter_dir: str = "data"):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_device()
     token = get_hf_token()
+    use_amp = _env_flag("EMBEDDING_USE_AMP", True) and device.type == "cuda"
+    amp_dtype_name = (os.getenv("EMBEDDING_AMP_DTYPE") or "float16").strip().lower()
+    amp_dtype = torch.bfloat16 if amp_dtype_name in {"bf16", "bfloat16"} else torch.float16
+    if device.type == "cpu":
+        cpu_threads = int(os.getenv("EMBEDDING_CPU_THREADS", "0"))
+        if cpu_threads > 0:
+            try:
+                torch.set_num_threads(cpu_threads)
+                logger.info("Set torch CPU threads=%d", cpu_threads)
+            except Exception as exc:
+                logger.warning("Failed to set torch CPU threads: %s", exc)
 
     mode = _detect_data_mode(adapter_dir)
 
@@ -165,6 +251,7 @@ def load_models(adapter_dir: str = "data"):
         if os.path.exists(adapter_path):
             try:
                 from safetensors.torch import load_file
+
                 state_dict = load_file(adapter_path)
 
                 # Direct load: safetensors keys match model keys exactly
@@ -177,7 +264,9 @@ def load_models(adapter_dir: str = "data"):
                 loaded = len(state_dict) - unexpected
                 logger.info(
                     "Loaded weights: %d tensors, missing=%d, unexpected=%d",
-                    loaded, missing, unexpected,
+                    loaded,
+                    missing,
+                    unexpected,
                 )
                 if result.missing_keys:
                     logger.warning("Missing keys: %s", result.missing_keys[:5])
@@ -190,17 +279,21 @@ def load_models(adapter_dir: str = "data"):
         fusion_model.to(device).eval()
 
         # Build transform matching training code
-        fusion_transform = transforms.Compose([
-            transforms.Resize((input_size, input_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=norm_mean, std=norm_std),
-        ])
+        fusion_transform = transforms.Compose(
+            [
+                transforms.Resize((input_size, input_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=norm_mean, std=norm_std),
+            ]
+        )
 
         return {
             "device": device,
             "mode": "fusion",
             "fusion_model": fusion_model,
             "fusion_transform": fusion_transform,
+            "use_amp": use_amp,
+            "amp_dtype": amp_dtype,
             "dino_dim": 0,  # Signal to load_db: embeddings are 512d, not split
             "clip_dim": 512,
             "lora_loaded": weights_loaded,
@@ -214,10 +307,14 @@ def load_models(adapter_dir: str = "data"):
         from peft import PeftModel
 
         dino_processor = AutoImageProcessor.from_pretrained(
-            DINO_PROCESSOR_ID, use_fast=True, token=token,
+            DINO_PROCESSOR_ID,
+            use_fast=True,
+            token=token,
         )
         dino_model = AutoModel.from_pretrained(
-            DINO_MODEL_NAME, trust_remote_code=True, token=token,
+            DINO_MODEL_NAME,
+            trust_remote_code=True,
+            token=token,
         )
 
         lora_loaded = False
@@ -249,6 +346,8 @@ def load_models(adapter_dir: str = "data"):
             "dino_model": dino_model,
             "clip_processor": clip_processor,
             "clip_model": clip_model,
+            "use_amp": use_amp,
+            "amp_dtype": amp_dtype,
             "dino_dim": int(dino_dim),
             "clip_dim": int(clip_dim),
             "lora_loaded": lora_loaded,
@@ -260,9 +359,17 @@ def load_models(adapter_dir: str = "data"):
 # load_db
 # ---------------------------------------------------------------------------
 
+
 def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     return matrix / np.maximum(norms, 1e-12)
+
+
+def _normalize_vector(vec: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vec))
+    if norm <= 1e-12:
+        return vec.astype(np.float32)
+    return (vec / norm).astype(np.float32)
 
 
 @st.cache_data(show_spinner=False)
@@ -285,49 +392,92 @@ def load_db(
     embeddings = np.load(embeddings_path).astype(np.float32)
     labels = np.load(labels_path)
 
+    if embeddings.ndim != 2:
+        raise ValueError(f"embeddings.npy must be 2D array (got shape {embeddings.shape}).")
+    if embeddings.shape[0] != len(labels):
+        raise ValueError("embeddings.npy and labels.npy rows do not match.")
+
+    actual_dim = int(embeddings.shape[1])
+
+    # ----------------------------
+    # Fusion mode: embeddings are 512-d (bottleneck output)
+    # ----------------------------
     if dino_dim == 0:
-        # Fusion mode: embeddings are already 512-d normalized vectors
-        if embeddings.shape[1] != clip_dim:
+        if actual_dim != int(clip_dim):
             raise ValueError(
-                f"embeddings.npy must be {clip_dim} dims (got {embeddings.shape[1]})."
+                f"[fusion] embeddings.npy must be {clip_dim} dims (got {actual_dim})."
             )
-        if embeddings.shape[0] != len(labels):
-            raise ValueError("embeddings.npy and labels.npy rows do not match.")
+        db_mode = "fusion"
         weighted = _normalize_rows(embeddings)
+
+    # ----------------------------
+    # Ensemble pipeline:
+    # allow 1536 (DINO+CLIP), 1024 (DINO-only), 512 (CLIP-only)
+    # ----------------------------
     else:
-        # Ensemble mode: DINO + CLIP concatenated
-        expected_dim = dino_dim + clip_dim
-        if embeddings.shape[1] != expected_dim:
+        expected_dim = int(dino_dim + clip_dim)
+
+        if actual_dim == expected_dim:
+            # DINO+CLIP concat DB
+            db_mode = "ensemble"
+            dino = embeddings[:, :dino_dim]
+            clip = embeddings[:, dino_dim : dino_dim + clip_dim]
+            dino = _normalize_rows(dino)
+            clip = _normalize_rows(clip)
+            weighted = np.concatenate(
+                [dino * DINO_WEIGHT, clip * CLIP_WEIGHT], axis=1
+            ).astype(np.float32)
+            weighted = _normalize_rows(weighted)
+
+        elif actual_dim == int(dino_dim):
+            # DINO-only legacy DB
+            db_mode = "dino"
+            weighted = _normalize_rows(embeddings)
+
+        elif actual_dim == int(clip_dim):
+            # CLIP-only legacy DB  <-- your current embeddings.npy (309,512)
+            db_mode = "clip"
+            weighted = _normalize_rows(embeddings)
+
+        else:
             raise ValueError(
-                f"embeddings.npy must be {expected_dim} dims (DINO {dino_dim} + CLIP {clip_dim})."
+                f"embeddings.npy dims mismatch. "
+                f"Expected {expected_dim} (DINO {dino_dim} + CLIP {clip_dim}) "
+                f"or {dino_dim} (DINO-only) or {clip_dim} (CLIP-only), got {actual_dim}."
             )
-        if embeddings.shape[0] != len(labels):
-            raise ValueError("embeddings.npy and labels.npy rows do not match.")
 
-        dino = embeddings[:, :dino_dim]
-        clip = embeddings[:, dino_dim:dino_dim + clip_dim]
-
-        dino = _normalize_rows(dino)
-        clip = _normalize_rows(clip)
-
-        weighted = np.concatenate(
-            [dino * DINO_WEIGHT, clip * CLIP_WEIGHT], axis=1
-        ).astype(np.float32)
-        weighted = _normalize_rows(weighted)
-
-    return weighted, labels
+    logger.info("DB loaded: mode=%s dim=%d rows=%d", db_mode, actual_dim, embeddings.shape[0])
+    db_norms = np.linalg.norm(weighted, axis=1)
+    logger.info(
+        "DB norm stats after normalize: mean=%.4f std=%.4f min=%.4f max=%.4f",
+        float(np.mean(db_norms)),
+        float(np.std(db_norms)),
+        float(np.min(db_norms)),
+        float(np.max(db_norms)),
+    )
+    return weighted, labels, db_mode, actual_dim
 
 
 # ---------------------------------------------------------------------------
 # FAISS index
 # ---------------------------------------------------------------------------
 
+
 def build_or_load_index(weighted_db: np.ndarray, index_path: str) -> faiss.IndexFlatIP:
     dim = weighted_db.shape[1]
     if os.path.exists(index_path):
         index = faiss.read_index(index_path)
-        if index.d == dim and index.ntotal == weighted_db.shape[0]:
+        metric_ok = getattr(index, "metric_type", None) == faiss.METRIC_INNER_PRODUCT
+        if index.d == dim and index.ntotal == weighted_db.shape[0] and metric_ok:
             return index
+        logger.warning(
+            "Rebuilding FAISS index due to mismatch: d=%s ntotal=%s metric_type=%s (expect d=%d ntotal=%d metric=IP)",
+            getattr(index, "d", None),
+            getattr(index, "ntotal", None),
+            getattr(index, "metric_type", None),
+            dim,
+            weighted_db.shape[0],
+        )
 
     index = faiss.IndexFlatIP(dim)
     if weighted_db.shape[0] > 0:
@@ -341,14 +491,24 @@ def build_or_load_index(weighted_db: np.ndarray, index_path: str) -> faiss.Index
 # Embedding extraction
 # ---------------------------------------------------------------------------
 
-def extract_dino_embedding(image_bgr, model, processor, device):
+
+def extract_dino_embedding(image_bgr, model, processor, device, bundle: dict | None = None):
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     pil_image = Image.fromarray(image_rgb)
     inputs = processor(images=pil_image, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    with torch.no_grad():
-        output = model(**inputs)
+    amp_ctx = nullcontext()
+    if str(device) == "cuda" and _env_flag("EMBEDDING_USE_AMP", True):
+        amp_dtype_name = (os.getenv("EMBEDDING_AMP_DTYPE") or "float16").strip().lower()
+        amp_dtype = torch.bfloat16 if amp_dtype_name in {"bf16", "bfloat16"} else torch.float16
+        amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype)
+    if bundle is not None:
+        first_input = next(iter(inputs.values())) if inputs else None
+        _debug_device_check(bundle, tag="dino", model=model, input_tensor=first_input)
+    with torch.inference_mode():
+        with amp_ctx:
+            output = model(**inputs)
 
     cls_tensor = safe_cls_from_output(output)
     if cls_tensor is None:
@@ -358,16 +518,24 @@ def extract_dino_embedding(image_bgr, model, processor, device):
     return cls_tensor[0].detach().cpu().numpy().astype(np.float32)
 
 
-def extract_clip_embedding(image_bgr, model, processor, device):
+def extract_clip_embedding(image_bgr, model, processor, device, bundle: dict | None = None):
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     pil_image = Image.fromarray(image_rgb)
     inputs = processor(images=pil_image, return_tensors="pt")
     pixel_values = inputs["pixel_values"].to(device)
 
-    with torch.no_grad():
-        vision_outputs = model.vision_model(pixel_values=pixel_values)
-        pooled = vision_outputs.pooler_output
-        projected = model.visual_projection(pooled)
+    amp_ctx = nullcontext()
+    if str(device) == "cuda" and _env_flag("EMBEDDING_USE_AMP", True):
+        amp_dtype_name = (os.getenv("EMBEDDING_AMP_DTYPE") or "float16").strip().lower()
+        amp_dtype = torch.bfloat16 if amp_dtype_name in {"bf16", "bfloat16"} else torch.float16
+        amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype)
+    if bundle is not None:
+        _debug_device_check(bundle, tag="clip", model=model, input_tensor=pixel_values)
+    with torch.inference_mode():
+        with amp_ctx:
+            vision_outputs = model.vision_model(pixel_values=pixel_values)
+            pooled = vision_outputs.pooler_output
+            projected = model.visual_projection(pooled)
 
     projected = F.normalize(projected, p=2, dim=-1)
     return projected[0].detach().cpu().numpy().astype(np.float32)
@@ -387,10 +555,12 @@ def build_query_embedding(image_bgr, bundle):
 
         pixel_values = fusion_transform(pil_image).unsqueeze(0).to(device)
 
-        with torch.no_grad():
-            embedding = fusion_model.forward_embedding(pixel_values)
+        _debug_device_check(bundle, tag="fusion", model=fusion_model, input_tensor=pixel_values)
+        with torch.inference_mode():
+            with _amp_context(bundle):
+                embedding = fusion_model.forward_embedding(pixel_values)
 
-        return embedding[0].cpu().numpy().astype(np.float32)
+        return _normalize_vector(embedding[0].cpu().numpy().astype(np.float32))
 
     else:
         # Ensemble: DINO + CLIP weighted combination
@@ -399,17 +569,17 @@ def build_query_embedding(image_bgr, bundle):
             bundle["dino_model"],
             bundle["dino_processor"],
             bundle["device"],
+            bundle=bundle,
         )
         clip = extract_clip_embedding(
             image_bgr,
             bundle["clip_model"],
             bundle["clip_processor"],
             bundle["device"],
+            bundle=bundle,
         )
 
-        combined = np.concatenate([dino * DINO_WEIGHT, clip * CLIP_WEIGHT], axis=0).astype(np.float32)
-        norm = np.linalg.norm(combined)
-        if norm > 0:
-            combined = combined / norm
-
-        return combined
+        combined = np.concatenate(
+            [dino * DINO_WEIGHT, clip * CLIP_WEIGHT], axis=0
+        ).astype(np.float32)
+        return _normalize_vector(combined)

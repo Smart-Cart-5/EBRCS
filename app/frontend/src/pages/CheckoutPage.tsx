@@ -1,12 +1,37 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
 import toast, { Toaster } from "react-hot-toast";
-import { useSessionStore, type WsMessage } from "../stores/sessionStore";
+import { useSessionStore, type TopKCandidate, type WsMessage } from "../stores/sessionStore";
 import { wsCheckoutUrl, uploadVideo, videoStatusUrl, setROI, setWarp, clearWarp, setWarpEnabled } from "../api/client";
 import BillingPanel from "../components/BillingPanel";
 import StatusMetrics from "../components/StatusMetrics";
 import ProductDrawer from "../components/ProductDrawer";
 
 type Mode = "camera" | "upload";
+
+const DEFAULT_SEND_FPS = 8;
+const MIN_SEND_FPS = 5;
+const MAX_SEND_FPS = 12;
+const DEFAULT_CAPTURE_WIDTH = 640;
+const DEFAULT_JPEG_QUALITY = 0.65;
+const DEFAULT_BUFFERED_AMOUNT_LIMIT = 512 * 1024;
+
+function getSendFps(): number {
+  const raw = Number(import.meta.env.VITE_WS_SEND_FPS);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_SEND_FPS;
+  return Math.max(MIN_SEND_FPS, Math.min(MAX_SEND_FPS, Math.floor(raw)));
+}
+
+function getJpegQuality(): number {
+  const raw = Number(import.meta.env.VITE_WS_JPEG_QUALITY);
+  if (!Number.isFinite(raw) || raw <= 0 || raw > 1) return DEFAULT_JPEG_QUALITY;
+  return Math.max(0.6, Math.min(0.7, raw));
+}
+
+function getBufferedAmountLimit(): number {
+  const raw = Number(import.meta.env.VITE_WS_BUFFERED_AMOUNT_LIMIT);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_BUFFERED_AMOUNT_LIMIT;
+  return Math.floor(raw);
+}
 
 export default function CheckoutPage() {
   const [mode, setMode] = useState<Mode>("camera");
@@ -17,6 +42,20 @@ export default function CheckoutPage() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [setupMode, setSetupMode] = useState(false);
   const [calibrationPoints, setCalibrationPoints] = useState<number[][]>([]);
+  const [debugPanelOpen, setDebugPanelOpen] = useState(false);
+  const [debugView, setDebugView] = useState<{
+    sessionId: string | null;
+    didSearch: boolean;
+    skipReason: string;
+    lastResultAgeMs: number | null;
+    topkCandidates: TopKCandidate[];
+  }>({
+    sessionId: null,
+    didSearch: false,
+    skipReason: "init",
+    lastResultAgeMs: null,
+    topkCandidates: [],
+  });
 
   const {
     sessionId,
@@ -46,6 +85,14 @@ export default function CheckoutPage() {
   const prevBillingRef = useRef<Record<string, number>>({});
   const setupModeRef = useRef(false);
   const calibrationPointsRef = useRef<number[][]>([]);
+  const debugThrottleLastMsRef = useRef<number>(0);
+  const debugThrottleTimerRef = useRef<number | null>(null);
+  const pendingDebugViewRef = useRef<typeof debugView | null>(null);
+  const isDebugMode = (() => {
+    if (typeof window === "undefined") return false;
+    const params = new URLSearchParams(window.location.search);
+    return params.get("debug") === "1";
+  })();
 
   // Ensure session exists and setup virtual ROI for entry-event mode
   useEffect(() => {
@@ -101,6 +148,10 @@ export default function CheckoutPage() {
       streamRef.current?.getTracks().forEach((t) => t.stop());
       cancelAnimationFrame(captureAnimRef.current);
       cancelAnimationFrame(renderAnimRef.current);
+      if (debugThrottleTimerRef.current !== null) {
+        window.clearTimeout(debugThrottleTimerRef.current);
+        debugThrottleTimerRef.current = null;
+      }
     };
   }, []);
 
@@ -196,6 +247,33 @@ export default function CheckoutPage() {
           last_label: data.last_label,
         });
         updateFromWsMessage(data);
+        if (isDebugMode) {
+          const nextDebug = {
+            sessionId,
+            didSearch: !!data.did_search,
+            skipReason: data.skip_reason ?? "unknown",
+            lastResultAgeMs: data.last_result_age_ms ?? null,
+            topkCandidates: data.topk_candidates ?? [],
+          };
+          const now = performance.now();
+          const elapsed = now - debugThrottleLastMsRef.current;
+          if (elapsed >= 200) {
+            debugThrottleLastMsRef.current = now;
+            setDebugView(nextDebug);
+          } else {
+            pendingDebugViewRef.current = nextDebug;
+            if (debugThrottleTimerRef.current === null) {
+              debugThrottleTimerRef.current = window.setTimeout(() => {
+                debugThrottleLastMsRef.current = performance.now();
+                if (pendingDebugViewRef.current) {
+                  setDebugView(pendingDebugViewRef.current);
+                }
+                pendingDebugViewRef.current = null;
+                debugThrottleTimerRef.current = null;
+              }, Math.max(1, 200 - elapsed));
+            }
+          }
+        }
       };
 
       // Wait for both camera and WebSocket to be ready
@@ -266,14 +344,21 @@ export default function CheckoutPage() {
         throw new Error("Canvas elements not found after ready check");
       }
 
-      // Use actual video dimensions (guaranteed to be > 0 now)
+      // Display canvas keeps original camera resolution; capture canvas can be downscaled
       const canvasWidth = video.videoWidth;
       const canvasHeight = video.videoHeight;
+      const captureWidth = DEFAULT_CAPTURE_WIDTH;
+      const captureHeight = Math.max(
+        1,
+        Math.round((canvasHeight * captureWidth) / Math.max(1, canvasWidth)),
+      );
 
-      console.log(`🎨 Setting canvas size: ${canvasWidth}x${canvasHeight}`);
+      console.log(
+        `🎨 Setting canvas size: display=${canvasWidth}x${canvasHeight}, capture=${captureWidth}x${captureHeight}`,
+      );
 
-      captureCanvas.width = canvasWidth;
-      captureCanvas.height = canvasHeight;
+      captureCanvas.width = captureWidth;
+      captureCanvas.height = captureHeight;
       displayCanvas.width = canvasWidth;
       displayCanvas.height = canvasHeight;
 
@@ -421,41 +506,89 @@ export default function CheckoutPage() {
         }
       };
 
-      // 10-15 FPS capture and send loop
-      let lastSend = 0;
-      let frameCount = 0;
+      // Capture/send loop with FPS throttle + backpressure
+      const sendFps = getSendFps();
+      const sendIntervalMs = 1000 / sendFps;
+      const statsIntervalMs = 5000;
+      const jpegQuality = getJpegQuality();
+      const bufferedAmountLimit = getBufferedAmountLimit();
+      let lastSendAt = 0;
+      let sendInFlight = false;
+      let totalSentFrames = 0;
+      let sentSinceLastLog = 0;
+      let skippedByBackpressure = 0;
+      let skippedByBuffered = 0;
+      let skippedByInterval = 0;
+      let skippedByWsState = 0;
+      let lastStatsAt = performance.now();
       const sendFrame = () => {
         captureAnimRef.current = requestAnimationFrame(sendFrame);
         const now = performance.now();
 
-        // Throttle to 10-15 FPS (66-100ms interval)
-        if (now - lastSend < 80) return; // ~12.5 FPS
+        if (now - lastStatsAt >= statsIntervalMs) {
+          const elapsedSec = (now - lastStatsAt) / 1000;
+          const actualFps = sentSinceLastLog / Math.max(elapsedSec, 1e-6);
+          console.log(
+            `[WS SEND] target=${sendFps}fps actual=${actualFps.toFixed(1)}fps sent=${sentSinceLastLog} total=${totalSentFrames} skip_interval=${skippedByInterval} skip_backpressure=${skippedByBackpressure} skip_buffered=${skippedByBuffered} skip_ws=${skippedByWsState} buffered=${ws.bufferedAmount}`,
+          );
+          sentSinceLastLog = 0;
+          skippedByBackpressure = 0;
+          skippedByBuffered = 0;
+          skippedByInterval = 0;
+          skippedByWsState = 0;
+          lastStatsAt = now;
+        }
+
+        if (now - lastSendAt < sendIntervalMs) {
+          skippedByInterval++;
+          return;
+        }
+
+        if (sendInFlight) {
+          skippedByBackpressure++;
+          return;
+        }
 
         if (ws.readyState !== WebSocket.OPEN) {
-          if (frameCount === 0) {
+          skippedByWsState++;
+          if (totalSentFrames === 0) {
             console.log("⏳ Waiting for WebSocket to be ready...");
           }
           return;
         }
+        if (ws.bufferedAmount > bufferedAmountLimit) {
+          skippedByBuffered++;
+          return;
+        }
 
-        captureCtx.drawImage(video, 0, 0);
+        sendInFlight = true;
+        captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
         captureCanvas.toBlob(
           (blob) => {
-            if (blob && ws.readyState === WebSocket.OPEN) {
-              ws.send(blob);
-              frameCount++;
-              if (frameCount === 1) {
-                console.log("📤 First frame sent to backend");
+            try {
+              if (blob && ws.readyState === WebSocket.OPEN) {
+                ws.send(blob);
+                totalSentFrames++;
+                sentSinceLastLog++;
+                lastSendAt = performance.now();
+                if (totalSentFrames === 1) {
+                  console.log(`📤 First frame sent to backend (target=${sendFps}fps)`);
+                }
+              } else {
+                skippedByWsState++;
               }
-              lastSend = performance.now();
+            } finally {
+              sendInFlight = false;
             }
           },
           "image/jpeg",
-          0.7,
+          jpegQuality,
         );
       };
 
-      console.log("🎬 Starting 60 FPS render loop and 12.5 FPS capture loop");
+      console.log(
+        `🎬 Starting 60 FPS render loop and ${sendFps} FPS capture loop (capture=${captureCanvas.width}x${captureCanvas.height}, jpeg=${jpegQuality}, bufferedLimit=${bufferedAmountLimit})`,
+      );
       renderFrame();
       sendFrame();
 
@@ -579,6 +712,54 @@ export default function CheckoutPage() {
             </button>
             <span className="text-white/90">Points: {calibrationPoints.length}/4 (Saved: {warpPoints?.length ?? 0})</span>
           </div>
+
+          {isDebugMode && (
+            <>
+              <button
+                onClick={() => setDebugPanelOpen((prev) => !prev)}
+                className="absolute top-3 right-3 md:top-4 md:right-4 z-30 px-3 py-1.5 rounded-lg bg-black/70 hover:bg-black/80 text-white text-xs md:text-sm font-semibold border border-white/20"
+              >
+                Debug
+              </button>
+              {debugPanelOpen && (
+                <div className="absolute top-12 right-3 md:top-14 md:right-4 z-30 w-[min(92vw,420px)] max-h-[55vh] overflow-auto rounded-xl bg-black/80 text-white text-xs p-3 border border-white/20">
+                  <div className="font-semibold mb-2">WS Debug</div>
+                  <div className="mb-1">session: {debugView.sessionId ?? "-"}</div>
+                  <div className="mb-1">did_search: {String(debugView.didSearch)}</div>
+                  <div className="mb-1">skip_reason: {debugView.skipReason}</div>
+                  <div className="mb-2">last_result_age_ms: {debugView.lastResultAgeMs ?? "-"}</div>
+                  <div className="mb-2">
+                    {(() => {
+                      const top1 = debugView.topkCandidates[0];
+                      const top2 = debugView.topkCandidates[1];
+                      const top1Raw = Number(top1?.raw_score ?? top1?.score ?? 0);
+                      const top2Raw = Number(top2?.raw_score ?? top2?.score ?? 0);
+                      const gap = top1 && top2 ? top1Raw - top2Raw : null;
+                      return (
+                        <span>top1-top2 gap: {gap === null ? "-" : gap.toFixed(4)}</span>
+                      );
+                    })()}
+                  </div>
+                  <div className="font-semibold mb-1">topk_candidates</div>
+                  {debugView.topkCandidates.length === 0 ? (
+                    <div className="text-white/70">-</div>
+                  ) : (
+                    <div className="space-y-1">
+                      {debugView.topkCandidates.map((c, i) => (
+                        <div key={`${c.label}-${i}`} className="rounded-md bg-white/10 p-2">
+                          <div>#{i + 1} {c.label}</div>
+                          <div>percent: {c.percent_score ?? "-"}</div>
+                          <div>raw: {c.raw_score ?? c.score ?? "-"}</div>
+                          <div>crop: {c.crop_w ?? "-"} x {c.crop_h ?? "-"}</div>
+                          <div>box_area_ratio: {c.box_area_ratio ?? "-"}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
 
           {mode === "camera" ? (
             connected ? (

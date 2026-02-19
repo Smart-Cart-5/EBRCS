@@ -9,6 +9,16 @@ export interface DetectionBox {
   score?: number; // Matching score (if matched via CLIP+DINO)
 }
 
+export interface TopKCandidate {
+  label: string;
+  score?: number;
+  raw_score?: number;
+  percent_score?: number;
+  crop_w?: number;
+  crop_h?: number;
+  box_area_ratio?: number;
+}
+
 interface SessionStore {
   sessionId: string | null;
   billingItems: Record<string, number>;
@@ -22,6 +32,10 @@ interface SessionStore {
   detectionBoxes: DetectionBox[]; // YOLO detection results
   warpEnabled: boolean;
   warpPoints: number[][] | null;
+  didSearch: boolean;
+  skipReason: string;
+  lastResultAgeMs: number | null;
+  topkCandidates: TopKCandidate[];
 
   createSession: () => Promise<string>;
   updateFromWsMessage: (data: WsMessage) => void;
@@ -39,6 +53,10 @@ export interface WsMessage {
   total_count: number;
   roi_polygon?: number[][] | null; // Normalized ROI polygon coordinates
   detection_boxes?: DetectionBox[]; // YOLO detection results
+  did_search?: boolean;
+  skip_reason?: string;
+  last_result_age_ms?: number | null;
+  topk_candidates?: TopKCandidate[];
   warp_enabled?: boolean;
   warp_points?: number[][] | null;
 }
@@ -56,6 +74,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   detectionBoxes: [],
   warpEnabled: false,
   warpPoints: null,
+  didSearch: false,
+  skipReason: "init",
+  lastResultAgeMs: null,
+  topkCandidates: [],
 
   createSession: async () => {
     const { session_id } = await api.createSession();
@@ -74,6 +96,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       totalCount: data.total_count,
       roiPolygon: data.roi_polygon ?? null,
       detectionBoxes: data.detection_boxes ?? [],
+      didSearch: data.did_search ?? false,
+      skipReason: data.skip_reason ?? "unknown",
+      lastResultAgeMs: data.last_result_age_ms ?? null,
+      topkCandidates: data.topk_candidates ?? [],
       warpEnabled: data.warp_enabled ?? false,
       warpPoints: data.warp_points ?? null,
     });
@@ -97,6 +123,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       detectionBoxes: [],
       warpEnabled: false,
       warpPoints: null,
+      didSearch: false,
+      skipReason: "init",
+      lastResultAgeMs: null,
+      topkCandidates: [],
     });
   },
 }));

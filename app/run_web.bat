@@ -1,46 +1,63 @@
 @echo off
-REM Run backend (FastAPI) and frontend (Vite dev) concurrently for local development.
-REM Usage: run_web.bat
+setlocal EnableExtensions EnableDelayedExpansion
 
-REM Load .env if exists
-if exist .env (
-    echo Loading environment from .env...
-    for /f "delims=" %%a in ('type .env ^| findstr /v "^#"') do set %%a
+REM --- Find REPO_ROOT by walking up from this script directory (max 6 levels) ---
+for %%I in ("%~dp0.") do set "CUR=%%~fI"
+set "REPO_ROOT="
+
+for /L %%N in (0,1,6) do (
+  if exist "!CUR!\checkout_core\" (
+    set "REPO_ROOT=!CUR!"
+    goto :ROOT_FOUND
+  )
+  for %%P in ("!CUR!\..") do set "CUR=%%~fP"
 )
 
-REM Activate backend virtual environment
-if not exist backend\.venv\Scripts\activate.bat (
-    echo ⚠️  Backend virtual environment not found. Run setup_venv.bat first.
-    pause
-    exit /b 1
-)
-
-echo Activating backend virtual environment...
-call backend\.venv\Scripts\activate.bat
-
-REM Fix OpenMP duplicate library issue
-set KMP_DUPLICATE_LIB_OK=TRUE
-
-echo === EBRCS Web App (Local Dev) ===
-echo Backend : http://localhost:8000
-echo Frontend: http://localhost:5173
-echo.
-echo Press Ctrl+C in each window to stop the servers
-echo.
-
-REM Get project root directory
-set PROJECT_ROOT=%cd%\..
-
-REM Start backend in new window
-start "EBRCS Backend" cmd /k "cd /d %cd% && call backend\.venv\Scripts\activate.bat && set PYTHONPATH=%PROJECT_ROOT% && uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload"
-
-REM Wait a bit for backend to start
-timeout /t 3 /nobreak > nul
-
-REM Start frontend in new window
-start "EBRCS Frontend" cmd /k "cd /d %cd%\frontend && npm run dev"
-
-echo.
-echo ✅ Backend and Frontend started in separate windows
-echo Close the terminal windows to stop the servers
+echo [ERROR] Cannot locate repo root (checkout_core not found).
 pause
+exit /b 1
+
+:ROOT_FOUND
+set "APP_DIR=%REPO_ROOT%\app"
+set "BACKEND_DIR=%APP_DIR%\backend"
+
+if not exist "%BACKEND_DIR%\main.py" (
+  echo [ERROR] Cannot find backend main.py: "%BACKEND_DIR%\main.py"
+  echo         REPO_ROOT=%REPO_ROOT%
+  pause
+  exit /b 1
+)
+
+REM --- Find venv (prefer repo root .venv) ---
+set "VENV_DIR="
+if exist "%REPO_ROOT%\.venv\Scripts\activate.bat" set "VENV_DIR=%REPO_ROOT%\.venv"
+if exist "%REPO_ROOT%\venv\Scripts\activate.bat"  set "VENV_DIR=%REPO_ROOT%\venv"
+if exist "%APP_DIR%\.venv\Scripts\activate.bat"   set "VENV_DIR=%APP_DIR%\.venv"
+if exist "%APP_DIR%\venv\Scripts\activate.bat"    set "VENV_DIR=%APP_DIR%\venv"
+
+if "%VENV_DIR%"=="" (
+  echo [ERROR] Cannot find venv activate.bat
+  echo Create:
+  echo   cd /d "%REPO_ROOT%"
+  echo   python -m venv .venv
+  pause
+  exit /b 1
+)
+
+REM --- Write runtime env file for the backend runner ---
+set "ENV_FILE=%~dp0_run_backend_env.cmd"
+> "%ENV_FILE%" (
+  echo @echo off
+  echo set "REPO_ROOT=%REPO_ROOT%"
+  echo set "APP_DIR=%APP_DIR%"
+  echo set "VENV_DIR=%VENV_DIR%"
+)
+
+REM --- Launch backend window (call separate cmd to avoid escaping issues) ---
+start "EBRCS Backend" cmd /k call "%~dp0_run_backend.cmd"
+
+echo [DONE] Launched backend window.
+echo        REPO_ROOT=%REPO_ROOT%
+echo        VENV_DIR=%VENV_DIR%
+endlocal
+exit /b 0

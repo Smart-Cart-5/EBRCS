@@ -10,9 +10,12 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+import torch
 
 # Configure logging for backend and checkout_core
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
+)
 logging.getLogger("backend").setLevel(logging.INFO)
 logging.getLogger("checkout_core").setLevel(logging.INFO)
 
@@ -30,6 +33,22 @@ from backend.routers import billing, checkout, products, sessions
 logger = logging.getLogger("backend")
 
 
+def _model_param_device(model) -> str:
+    try:
+        return str(next(model.parameters()).device)
+    except Exception:
+        return "unknown"
+
+
+def _cuda_device_name() -> str:
+    if not torch.cuda.is_available():
+        return "n/a"
+    try:
+        return torch.cuda.get_device_name(0)
+    except Exception:
+        return "unknown"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load models and FAISS index once at startup."""
@@ -42,6 +61,23 @@ async def lifespan(app: FastAPI):
     logger.info("Loading AI models from %s ...", config.ADAPTER_DIR)
     bundle = load_models(adapter_dir=config.ADAPTER_DIR)
     logger.info(
+        "Embedding runtime: requested_device=%s resolved_device=%s torch.cuda.is_available=%s torch.version.cuda=%s cuda_device=%s use_amp=%s amp_dtype=%s torch_num_threads=%s",
+        os.getenv("EMBEDDING_DEVICE", "auto"),
+        bundle.get("device"),
+        torch.cuda.is_available(),
+        str(torch.version.cuda),
+        _cuda_device_name(),
+        bundle.get("use_amp", False),
+        str(bundle.get("amp_dtype", "")),
+        torch.get_num_threads(),
+    )
+    if "fusion_model" in bundle:
+        logger.info("Fusion model device: %s", _model_param_device(bundle["fusion_model"]))
+    if "dino_model" in bundle:
+        logger.info("DINO model device: %s", _model_param_device(bundle["dino_model"]))
+    if "clip_model" in bundle:
+        logger.info("CLIP model device: %s", _model_param_device(bundle["clip_model"]))
+    logger.info(
         "Models loaded on %s (mode: %s, weights: %s)",
         bundle["device"],
         bundle.get("mode", "unknown"),
@@ -51,7 +87,7 @@ async def lifespan(app: FastAPI):
     emb_mtime = os.path.getmtime(config.EMBEDDINGS_PATH)
     lbl_mtime = os.path.getmtime(config.LABELS_PATH)
 
-    weighted_db, labels = load_db(
+    weighted_db, labels, db_mode, db_dim = load_db(
         bundle["dino_dim"],
         bundle["clip_dim"],
         config.EMBEDDINGS_PATH,
@@ -59,6 +95,10 @@ async def lifespan(app: FastAPI):
         emb_mtime,
         lbl_mtime,
     )
+
+    bundle["db_mode"] = db_mode
+    bundle["db_dim"] = db_dim
+
     logger.info("Embedding DB loaded: %d entries", len(labels))
 
     faiss_index = build_or_load_index(weighted_db, config.FAISS_INDEX_PATH)
@@ -79,11 +119,14 @@ async def lifespan(app: FastAPI):
                 )
                 logger.info("YOLO detector loaded: %s", config.YOLO_MODEL_PATH)
             except Exception as e:
-                logger.warning("Failed to load YOLO detector: %s (falling back to background subtraction)", e)
+                logger.warning(
+                    "Failed to load YOLO detector: %s (falling back to background subtraction)",
+                    e,
+                )
         else:
             logger.warning(
                 "YOLO model not found at %s (falling back to background subtraction)",
-                config.YOLO_MODEL_PATH
+                config.YOLO_MODEL_PATH,
             )
 
     # Populate shared state
@@ -126,7 +169,9 @@ def create_app() -> FastAPI:
             "status": "ok",
             "device": str(app_state.model_bundle.get("device", "unknown")),
             "lora_loaded": app_state.model_bundle.get("lora_loaded", False),
-            "index_vectors": app_state.faiss_index.ntotal if app_state.faiss_index else 0,
+            "index_vectors": (
+                app_state.faiss_index.ntotal if app_state.faiss_index else 0
+            ),
             "active_sessions": app_state.session_manager.active_count,
             "yolo_loaded": app_state.yolo_detector is not None,
         }
@@ -134,7 +179,9 @@ def create_app() -> FastAPI:
     # Serve frontend static files in production (Docker)
     static_dir = Path(os.getenv("STATIC_DIR", "frontend/dist"))
     if static_dir.is_dir():
-        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="frontend")
+        app.mount(
+            "/", StaticFiles(directory=str(static_dir), html=True), name="frontend"
+        )
 
     return app
 

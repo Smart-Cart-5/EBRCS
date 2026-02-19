@@ -34,6 +34,21 @@ class CheckoutSession:
         "confidence": 0.0,
         "best_pair": None,
         "event_state": "IDLE",
+        "did_search": False,
+        "skip_reason": "init",
+        "last_result_name": None,
+        "last_result_score": None,
+        "last_result_topk": [],
+        "last_result_confidence": None,
+        "last_result_at_ms": None,
+        "result_label": "-",
+        "is_unknown": True,
+        "match_score_raw": None,
+        "match_top2_raw": None,
+        "match_score_percent": None,
+        "match_gap": None,
+        "match_gap_reason": None,
+        "unknown_reason": "init",
         "in_cart_sequence": [],
         "last_label": "-",
         "last_score": 0.0,
@@ -80,6 +95,21 @@ class CheckoutSession:
         self.state["confidence"] = 0.0
         self.state["best_pair"] = None
         self.state["event_state"] = "IDLE"
+        self.state["did_search"] = False
+        self.state["skip_reason"] = "init"
+        self.state["last_result_name"] = None
+        self.state["last_result_score"] = None
+        self.state["last_result_topk"] = []
+        self.state["last_result_confidence"] = None
+        self.state["last_result_at_ms"] = None
+        self.state["result_label"] = "-"
+        self.state["is_unknown"] = True
+        self.state["match_score_raw"] = None
+        self.state["match_top2_raw"] = None
+        self.state["match_score_percent"] = None
+        self.state["match_gap"] = None
+        self.state["match_gap_reason"] = None
+        self.state["unknown_reason"] = "init"
         self.state["in_cart_sequence"] = []
         self.state["last_label"] = "-"
         self.state["last_score"] = 0.0
