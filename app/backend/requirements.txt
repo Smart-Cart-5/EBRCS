@@ -14,6 +14,7 @@ pandas
 opencv-python-headless
 transformers
 torch
+torchvision
 Pillow
 peft
 safetensors
@@ -21,6 +22,12 @@ faiss-cpu
 
 # Data
 pyarrow
+
+# Object Tracking (Phase 3)
+setuptools>=65.0.0,<71  # pkg_resources removed in setuptools>=72
+deep-sort-realtime>=1.3.2
+filterpy>=1.4.5
+scikit-learn
 
 # Authentication & Database
 sqlalchemy>=2.0.0

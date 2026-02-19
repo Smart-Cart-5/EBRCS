@@ -54,31 +54,24 @@ def _process_frame_sync(
     session.frame_count += 1
 
     # Get ROI polygon coordinates (normalized 0-1)
-    roi_polygon_normalized = session.roi_polygon if hasattr(session, 'roi_polygon') else None
+    roi_polygon_normalized = session.roi_poly_norm or None
 
-    # Fast path: skip heavy processing for non-inference frames
-    should_infer = session.frame_count % max(1, config.DETECT_EVERY_N_FRAMES) == 0
-
-    if not should_infer:
-        # Return frame quickly without heavy processing
-        display_frame = frame.copy()
-        roi_poly = session.get_roi_polygon(frame.shape)
-        if roi_poly is not None:
-            cv2.polylines(display_frame, [roi_poly], True, (0, 181, 255), 2)
-
-        state_snapshot = {
-            "billing_items": dict(session.state["billing_items"]),
-            "item_scores": {k: round(v, 4) for k, v in session.state["item_scores"].items()},
-            "last_label": session.state["last_label"],
-            "last_score": round(session.state["last_score"], 4),
-            "last_status": "표시중",  # Non-inference frame
-            "total_count": sum(session.state["billing_items"].values()),
-            "roi_polygon": roi_polygon_normalized,  # Normalized coordinates for frontend
-        }
-        return display_frame, state_snapshot
-
-    # Full processing path for inference frames
+    # Always run bg subtraction + centroid tracking on every frame.
+    # FAISS inference is gated inside process_checkout_frame by allow_inference
+    # (frame_count % DETECT_EVERY_N_FRAMES). Running every frame ensures
+    # centroid_history accumulates at full receive rate (~12 FPS) instead of
+    # only on inference frames (~4 FPS), enabling reliable direction detection
+    # even for fast swipes under 1 second.
     roi_poly = session.get_roi_polygon(frame.shape)
+
+    # Log tracking status on first inference frame
+    use_tracking = config.USE_DEEPSORT and session.tracker is not None
+    if session.frame_count == config.DETECT_EVERY_N_FRAMES:
+        logger.info(
+            f"Tracking mode: USE_DEEPSORT={config.USE_DEEPSORT}, "
+            f"tracker={'OK' if session.tracker else 'None'}, "
+            f"use_tracking={use_tracking}"
+        )
 
     display_frame = process_checkout_frame(
         frame=frame,
@@ -95,6 +88,19 @@ def _process_frame_sync(
         roi_poly=roi_poly,
         roi_clear_frames=config.ROI_CLEAR_FRAMES,
         roi_entry_mode=roi_poly is not None,
+        tracker=session.tracker,  # DeepSORT tracker (Phase 3)
+        use_tracking=use_tracking,  # Enable tracking
+        ignore_labels=config.IGNORE_LABELS,  # 후처리 필터링
+        add_direction=config.ADD_DIRECTION,  # 방향 기반 ADD/REMOVE
+        direction_min_movement=config.DIRECTION_MIN_MOVEMENT,
+        direction_history_frames=config.DIRECTION_HISTORY_FRAMES,
+        direction_min_history_points=config.DIRECTION_MIN_HISTORY_POINTS,
+        inline_direction_min_movement=config.INLINE_DIRECTION_MIN_MOVEMENT,
+        inline_direction_min_history_points=config.INLINE_DIRECTION_MIN_HISTORY_POINTS,
+        soft_reentry_frames=config.SOFT_REENTRY_FRAMES,
+        opposite_action_cooldown_seconds=config.OPPOSITE_ACTION_COOLDOWN_SECONDS,
+        label_stale_frames=config.LABEL_STALE_FRAMES,
+        warmup_frames=config.BG_WARMUP_FRAMES,
     )
 
     state_snapshot = {
@@ -104,7 +110,9 @@ def _process_frame_sync(
         "last_score": round(session.state["last_score"], 4),
         "last_status": session.state["last_status"],
         "total_count": sum(session.state["billing_items"].values()),
-        "roi_polygon": roi_polygon_normalized,  # Normalized coordinates for frontend
+        "roi_polygon": roi_polygon_normalized,
+        "count_event": session.state.get("count_event"),
+        "current_track_id": session.state.get("current_track_id"),
     }
 
     return display_frame, state_snapshot

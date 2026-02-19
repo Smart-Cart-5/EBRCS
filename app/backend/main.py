@@ -118,3 +118,6 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+# checkout_core 방향 판정 디버그 로그 활성화
+logging.getLogger("checkout_core.frame_processor").setLevel(logging.INFO)

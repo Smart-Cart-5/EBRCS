@@ -6,13 +6,15 @@ session UUID, each holding its own billing state, bg_subtractor, ROI, etc.
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-import cv2
 import numpy as np
+
+logger = logging.getLogger("backend.session_manager")
 
 
 @dataclass
@@ -28,6 +30,10 @@ class CheckoutSession:
         "billing_items": {},
         "item_scores": {},
         "last_seen_at": {},
+        "last_matched_label": "",
+        "last_match_frame": -1,
+        "direction_committed": False,
+        "centroid_history": [],
         "last_label": "-",
         "last_score": 0.0,
         "last_status": "대기",
@@ -37,6 +43,9 @@ class CheckoutSession:
 
     # OpenCV background subtractor -- per-session, not serializable
     bg_subtractor: Any = field(default=None)
+
+    # DeepSORT tracker -- per-session (Phase 3)
+    tracker: Any = field(default=None)
 
     # Frame counter for DETECT_EVERY_N_FRAMES gating
     frame_count: int = 0
@@ -55,7 +64,35 @@ class CheckoutSession:
 
     def __post_init__(self) -> None:
         if self.bg_subtractor is None:
-            self.bg_subtractor = cv2.createBackgroundSubtractorKNN(history=300)
+            from checkout_core.frame_processor import create_bg_subtractor
+            self.bg_subtractor = create_bg_subtractor()
+
+        # Initialize DeepSORT tracker if enabled (Phase 3)
+        if self.tracker is None:
+            try:
+                from backend import config
+                logger.info(f"DeepSORT config: USE_DEEPSORT={config.USE_DEEPSORT}")
+
+                if config.USE_DEEPSORT:
+                    from checkout_core.tracker import ObjectTracker
+                    self.tracker = ObjectTracker(
+                        max_age=config.DEEPSORT_MAX_AGE,
+                        n_init=config.DEEPSORT_N_INIT,
+                        max_iou_distance=config.DEEPSORT_MAX_IOU_DISTANCE,
+                        embedder=config.DEEPSORT_EMBEDDER,
+                    )
+                    logger.info("✅ DeepSORT tracker initialized successfully")
+                else:
+                    logger.info("⏸️ DeepSORT disabled in config")
+            except ImportError as e:
+                self.tracker = None
+                logger.error(f"❌ DeepSORT import failed: {e}")
+            except AttributeError as e:
+                self.tracker = None
+                logger.error(f"❌ DeepSORT config attribute error: {e}")
+            except Exception as e:
+                self.tracker = None
+                logger.error(f"❌ DeepSORT initialization failed: {e}")
 
     def touch(self) -> None:
         self.last_active = time.time()
@@ -64,13 +101,23 @@ class CheckoutSession:
         self.state["billing_items"] = {}
         self.state["item_scores"] = {}
         self.state["last_seen_at"] = {}
+        self.state["counted_tracks"] = {}  # DeepSORT Track ID 기반 중복 방지
+        self.state["last_matched_label"] = ""
+        self.state["last_match_frame"] = -1
+        self.state["direction_committed"] = False
+        self.state["centroid_history"] = []
         self.state["last_label"] = "-"
         self.state["last_score"] = 0.0
         self.state["last_status"] = "대기"
         self.state["roi_occupied"] = False
         self.state["roi_empty_frames"] = 0
         self.frame_count = 0
-        self.bg_subtractor = cv2.createBackgroundSubtractorKNN(history=300)
+        from checkout_core.frame_processor import create_bg_subtractor
+        self.bg_subtractor = create_bg_subtractor()
+
+        # Reset tracker
+        if self.tracker is not None:
+            self.tracker.reset()
 
     def get_roi_polygon(self, frame_shape: tuple[int, ...]) -> np.ndarray | None:
         """Convert normalized ROI to pixel coordinates for the given frame."""
