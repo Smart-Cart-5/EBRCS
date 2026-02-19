@@ -3,6 +3,7 @@ interface Props {
   lastScore: number;
   lastStatus: string;
   fps?: number;
+  trackId?: string | null;
 }
 
 export default function StatusMetrics({
@@ -10,6 +11,7 @@ export default function StatusMetrics({
   lastScore,
   lastStatus,
   fps,
+  trackId,
 }: Props) {
   return (
     <div className="grid grid-cols-2 gap-3">
@@ -52,16 +54,16 @@ export default function StatusMetrics({
         </p>
       </div>
 
-      {/* FPS */}
+      {/* Track ID */}
       <div className="bg-white rounded-xl p-4 border border-[var(--color-border)]">
         <div className="flex items-center gap-2 mb-2">
-          <span className="text-2xl">📷</span>
+          <span className="text-2xl">🔍</span>
           <span className="text-xs text-[var(--color-text-secondary)] font-medium">
-            FPS
+            Track ID
           </span>
         </div>
         <p className="text-xl font-bold text-[var(--color-text)]">
-          {fps !== undefined ? fps : "-"}
+          {trackId ?? "-"}
         </p>
       </div>
     </div>

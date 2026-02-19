@@ -1,20 +1,46 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import toast, { Toaster } from "react-hot-toast";
 import { useSessionStore, type WsMessage } from "../stores/sessionStore";
-import { wsCheckoutUrl, uploadVideo, videoStatusUrl, setROI } from "../api/client";
+import { wsCheckoutUrl, uploadVideo, videoStatusUrl, setROI, getHealth } from "../api/client";
 import BillingPanel from "../components/BillingPanel";
 import StatusMetrics from "../components/StatusMetrics";
 import ProductDrawer from "../components/ProductDrawer";
 
 type Mode = "camera" | "upload";
+const captureIntervalRaw = Number(import.meta.env.VITE_CAPTURE_INTERVAL_MS || 80);
+const CAPTURE_INTERVAL_MS = Number.isFinite(captureIntervalRaw)
+  ? Math.max(33, captureIntervalRaw)
+  : 80;
+
+const GUIDE_STEPS = [
+  {
+    icon: "📦",
+    title: "카트를 영역에 맞춰주세요",
+    desc: "카메라 앞에 카트나 바구니를 두고\n주황색 박스 안에 카트 입구가 들어오도록\n위치를 조정해주세요.",
+  },
+  {
+    icon: "🛍️",
+    title: "아래로 내리면 담기, 위로 올리면 빼기",
+    desc: "상품을 위에서 아래로 통과시키면 🟢 장바구니에 담깁니다.\n반대로 아래에서 위로 올리면 🔴 장바구니에서 제거됩니다.",
+  },
+  {
+    icon: "🔄",
+    title: "잘못 담았다면 반대로 통과시키세요",
+    desc: "실수로 담은 경우 상품을 아래쪽 방향으로\n다시 통과시키면 자동으로 제거됩니다.",
+  },
+];
 
 export default function CheckoutPage() {
-  const [mode, setMode] = useState<Mode>("camera");
+  const [mode] = useState<Mode>("camera");
   const [connected, setConnected] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState("");
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [modelReady, setModelReady] = useState(false);
+  const [modelLoadMsg, setModelLoadMsg] = useState("AI 모델 로딩 중...");
+  const [guideOpen, setGuideOpen] = useState(false);
+  const [guideStep, setGuideStep] = useState(0);
 
   const {
     sessionId,
@@ -27,8 +53,8 @@ export default function CheckoutPage() {
     lastLabel,
     lastScore,
     lastStatus,
-    annotatedFrame,
-    roiPolygon,
+    countEvent,
+    currentTrackId,
   } = useSessionStore();
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -38,54 +64,109 @@ export default function CheckoutPage() {
   const streamRef = useRef<MediaStream | null>(null);
   const captureAnimRef = useRef<number>(0); // For capture/send loop
   const renderAnimRef = useRef<number>(0); // For render loop (60 FPS)
-  const prevBillingRef = useRef<Record<string, number>>({});
+  const countFlashRef = useRef<number>(0); // count 이벤트 시 화면 플래시
 
-  // Ensure session exists and setup virtual ROI for entry-event mode
+  // Refs mirroring store values for use inside renderFrame closure.
+  // renderFrame is created once and runs continuously, so it captures stale
+  // closure values if we read store state directly. Refs are always current.
+  const lastLabelRef = useRef<string>(lastLabel);
+  const lastScoreRef = useRef<number>(lastScore);
+  const lastStatusRef = useRef<string>(lastStatus);
+  const currentTrackIdRef = useRef<string | null>(currentTrackId);
+
+  // Keep refs in sync with store so renderFrame closure always reads latest values
   useEffect(() => {
+    lastLabelRef.current = lastLabel;
+    lastScoreRef.current = lastScore;
+    lastStatusRef.current = lastStatus;
+    currentTrackIdRef.current = currentTrackId;
+  }, [lastLabel, lastScore, lastStatus, currentTrackId]);
+
+  // Poll backend health until models are loaded
+  useEffect(() => {
+    if (modelReady) return;
+    let cancelled = false;
+    const poll = async () => {
+      while (!cancelled) {
+        try {
+          const health = await getHealth();
+          if (health.index_vectors && Number(health.index_vectors) > 0) {
+            setModelReady(true);
+            setModelLoadMsg("");
+            return;
+          }
+          setModelLoadMsg("AI 모델 로딩 중...");
+        } catch {
+          setModelLoadMsg("서버 연결 대기 중...");
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    };
+    poll();
+    return () => { cancelled = true; };
+  }, [modelReady]);
+
+  // Ensure session exists and setup virtual ROI for entry-event mode.
+  // Gated on modelReady to avoid ECONNREFUSED on startup (frontend starts
+  // before backend is ready, and a failed createSession leaves sessionId=null).
+  useEffect(() => {
+    if (!modelReady) return;
     if (!sessionId) {
       createSession();
     } else {
       // Setup full-screen virtual ROI to enable entry-event mode
       // This prevents counting the same object multiple times
       setROI(sessionId, [
-        [0, 0],    // Top-left
-        [1, 0],    // Top-right
-        [1, 1],    // Bottom-right
-        [0, 1],    // Bottom-left
+        [0.0, 0.0],  // Top-left
+        [1.0, 0.0],  // Top-right
+        [1.0, 1.0],  // Bottom-right
+        [0.0, 1.0],  // Bottom-left
       ]).catch((err) => {
-        console.warn("Failed to set virtual ROI:", err);
+        console.warn("Failed to set ROI:", err);
       });
     }
-  }, [sessionId, createSession]);
+  }, [sessionId, createSession, modelReady]);
 
-  // Show toast when new product is detected
+  // Show toast + flash when count event fires from backend
   useEffect(() => {
-    const prevItems = prevBillingRef.current;
-    const currentItems = billingItems;
+    if (!countEvent) return;
 
-    // Check for new products or increased quantities
-    Object.keys(currentItems).forEach((productName) => {
-      const prevQty = prevItems[productName] || 0;
-      const currentQty = currentItems[productName] || 0;
+    const isRemove = countEvent.action === "remove";
 
-      if (currentQty > prevQty) {
-        const addedQty = currentQty - prevQty;
-        toast.success(`${productName} ${addedQty}개 담김!`, {
-          icon: "🛒",
-          duration: 2000,
-          position: "top-center",
-          style: {
-            background: "#22c55e",
-            color: "#fff",
-            fontWeight: "600",
-          },
-        });
-      }
-    });
+    // Trigger canvas border flash (green=add, red=remove)
+    countFlashRef.current = isRemove ? -20 : 20; // 음수 = 제거 플래시
 
-    // Update prev ref
-    prevBillingRef.current = { ...currentItems };
-  }, [billingItems]);
+    const qtyText = isRemove
+      ? countEvent.quantity === 0
+        ? '완전히 제거됨'
+        : `제거됨 (${countEvent.quantity}개 남음)`
+      : `${countEvent.quantity}개 담김`;
+
+    if (isRemove) {
+      toast(`🔴 ${countEvent.product} ${qtyText}`, {
+        duration: 2500,
+        position: "top-center",
+        style: {
+          background: "#ef4444",
+          color: "#fff",
+          fontWeight: "600",
+          fontSize: "16px",
+        },
+      });
+    } else {
+      toast.success(`🟢 ${countEvent.product} ${qtyText}`, {
+        icon: "🛒",
+        duration: 2500,
+        position: "top-center",
+        style: {
+          background: "#22c55e",
+          color: "#fff",
+          fontWeight: "600",
+          fontSize: "16px",
+        },
+      });
+    }
+  }, [countEvent]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -243,32 +324,51 @@ export default function CheckoutPage() {
         // Draw video to display canvas
         displayCtx.drawImage(video, 0, 0, displayCanvas.width, displayCanvas.height);
 
-        // Draw ROI polygon overlay
-        if (roiPolygon && roiPolygon.length > 0) {
-          displayCtx.strokeStyle = 'rgb(0, 181, 255)'; // Orange color
-          displayCtx.lineWidth = 2;
-          displayCtx.beginPath();
+        // ROI = 전체 화면이므로 테두리/오버레이 대신
+        // 상단/하단에 방향 가이드 텍스트만 표시
+        const W = displayCanvas.width, H = displayCanvas.height;
+        const midX = W / 2;
+        displayCtx.textAlign = 'center';
+        displayCtx.font = 'bold 16px sans-serif';
+        displayCtx.lineWidth = 3;
 
-          roiPolygon.forEach((point, i) => {
-            const x = point[0] * displayCanvas.width;
-            const y = point[1] * displayCanvas.height;
-            if (i === 0) {
-              displayCtx.moveTo(x, y);
-            } else {
-              displayCtx.lineTo(x, y);
-            }
-          });
+        // 상단 라벨 - 담기 (상단 진입 = 담기)
+        displayCtx.strokeStyle = 'rgba(0,0,0,0.7)';
+        displayCtx.strokeText('↓ 담기', midX, 28);
+        displayCtx.fillStyle = 'rgba(34, 197, 94, 1)';
+        displayCtx.fillText('↓ 담기', midX, 28);
 
-          displayCtx.closePath();
-          displayCtx.stroke();
+        // 하단 라벨 - 빼기 (하단 진입 = 빼기)
+        displayCtx.strokeStyle = 'rgba(0,0,0,0.7)';
+        displayCtx.strokeText('↑ 빼기', midX, H - 12);
+        displayCtx.fillStyle = 'rgba(239, 68, 68, 1)';
+        displayCtx.fillText('↑ 빼기', midX, H - 12);
+
+        displayCtx.textAlign = 'left'; // 기본값 복원
+
+        // Count flash effect (green=add, red=remove)
+        if (countFlashRef.current !== 0) {
+          const isRemoveFlash = countFlashRef.current < 0;
+          const remaining = Math.abs(countFlashRef.current);
+          const alpha = Math.min(1, remaining / 15);
+          displayCtx.strokeStyle = isRemoveFlash
+            ? `rgba(239, 68, 68, ${alpha})`   // 빨강 = 제거
+            : `rgba(34, 197, 94, ${alpha})`;   // 초록 = 담기
+          displayCtx.lineWidth = 6;
+          displayCtx.strokeRect(0, 0, displayCanvas.width, displayCanvas.height);
+          countFlashRef.current += isRemoveFlash ? 1 : -1; // 0을 향해 수렴
         }
 
-        // Draw status text overlay
-        if (lastLabel) {
-          const text = `${lastLabel} (${lastScore.toFixed(3)})`;
-          displayCtx.font = 'bold 20px sans-serif';
+        // Draw status text overlay (read from refs to get latest values)
+        const currentLabel = lastLabelRef.current;
+        const currentScore = lastScoreRef.current;
+        const currentStatus = lastStatusRef.current;
+        const currentTrack = currentTrackIdRef.current;
+        if (currentLabel && currentLabel !== "-") {
+          const trackStr = currentTrack ? ` [ID:${currentTrack}]` : "";
+          const text = `${currentLabel} (${currentScore.toFixed(3)})${trackStr}`;
+          displayCtx.font = 'bold 18px sans-serif';
 
-          // Text shadow for better visibility
           displayCtx.strokeStyle = 'black';
           displayCtx.lineWidth = 4;
           displayCtx.strokeText(text, 10, 30);
@@ -278,12 +378,16 @@ export default function CheckoutPage() {
         }
 
         // Draw status indicator
-        if (lastStatus) {
+        if (currentStatus) {
+          const statusText = currentTrack
+            ? `${currentStatus} | Track:${currentTrack}`
+            : currentStatus;
+          const textWidth = displayCtx.measureText(statusText).width + 20;
           displayCtx.font = '14px sans-serif';
           displayCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-          displayCtx.fillRect(10, displayCanvas.height - 30, 150, 20);
+          displayCtx.fillRect(10, displayCanvas.height - 30, textWidth, 20);
           displayCtx.fillStyle = 'white';
-          displayCtx.fillText(lastStatus, 15, displayCanvas.height - 15);
+          displayCtx.fillText(statusText, 15, displayCanvas.height - 15);
         }
       };
 
@@ -294,8 +398,8 @@ export default function CheckoutPage() {
         captureAnimRef.current = requestAnimationFrame(sendFrame);
         const now = performance.now();
 
-        // Throttle to 10-15 FPS (66-100ms interval)
-        if (now - lastSend < 80) return; // ~12.5 FPS
+        // Throttle capture loop (env-configurable)
+        if (now - lastSend < CAPTURE_INTERVAL_MS) return;
 
         if (ws.readyState !== WebSocket.OPEN) {
           if (frameCount === 0) {
@@ -325,13 +429,15 @@ export default function CheckoutPage() {
       renderFrame();
       sendFrame();
 
-      // All ready - show camera feed
+      // All ready - show camera feed + guide modal
       setLoadingMessage("완료!");
       setTimeout(() => {
         setConnected(true);
         setIsLoading(false);
         setLoadingMessage("");
-      }, 300); // Small delay for smooth transition
+        setGuideOpen(true);
+        setGuideStep(0);
+      }, 300);
     } catch (error) {
       console.error("❌ Camera error:", error);
       setIsLoading(false);
@@ -339,7 +445,10 @@ export default function CheckoutPage() {
       alert(`Failed to start camera: ${error instanceof Error ? error.message : String(error)}`);
       stopCamera();
     }
-  }, [sessionId, updateFromWsMessage, roiPolygon, lastLabel, lastScore, lastStatus]);
+  // Store values (roiPolygon, lastLabel, etc.) removed from deps — they're
+  // accessed via refs inside renderFrame, so startCamera doesn't need to
+  // rebuild the render loop every time the store updates.
+  }, [sessionId, updateFromWsMessage]);
 
   const stopCamera = useCallback(() => {
     wsRef.current?.close();
@@ -351,6 +460,8 @@ export default function CheckoutPage() {
     setConnected(false);
     setIsLoading(false);
     setLoadingMessage("");
+    setGuideOpen(false);
+    setGuideStep(0);
   }, []);
 
   // --- Upload mode ---
@@ -385,6 +496,45 @@ export default function CheckoutPage() {
     },
     [sessionId, setBilling],
   );
+
+  // Full-screen loading overlay while models load
+  if (!modelReady) {
+    return (
+      <div className="h-full flex items-center justify-center bg-[var(--color-bg)]">
+        <div className="text-center space-y-6 p-8">
+          {/* Animated loading indicator */}
+          <div className="relative w-20 h-20 mx-auto">
+            <div className="absolute inset-0 border-4 border-[var(--color-surface-light)] rounded-full" />
+            <div className="absolute inset-0 border-4 border-transparent border-t-[var(--color-primary)] rounded-full animate-spin" />
+          </div>
+
+          <div className="space-y-2">
+            <h2 className="text-xl font-bold text-[var(--color-text)]">
+              시스템 준비 중
+            </h2>
+            <p className="text-sm text-[var(--color-text-muted)]">
+              {modelLoadMsg}
+            </p>
+          </div>
+
+          {/* Progress dots animation */}
+          <div className="flex justify-center gap-1.5">
+            {[0, 1, 2].map((i) => (
+              <div
+                key={i}
+                className="w-2 h-2 rounded-full bg-[var(--color-primary)] animate-pulse"
+                style={{ animationDelay: `${i * 0.3}s` }}
+              />
+            ))}
+          </div>
+
+          <p className="text-xs text-[var(--color-text-muted)]">
+            DINOv2 + CLIP 모델과 FAISS 인덱스를 불러오고 있습니다
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -423,6 +573,56 @@ export default function CheckoutPage() {
                 >
                   정지
                 </button>
+
+                {/* 3-Step Guide Modal */}
+                {guideOpen && (
+                  <div className="absolute inset-0 z-20 flex items-end justify-center pb-16 md:pb-8">
+                    <div className="bg-white rounded-2xl p-5 mx-4 w-full max-w-sm shadow-2xl">
+                      <div className="text-center space-y-3">
+                        <div className="text-3xl">{GUIDE_STEPS[guideStep].icon}</div>
+                        <h3 className="font-bold text-gray-900 text-sm md:text-base">
+                          {GUIDE_STEPS[guideStep].title}
+                        </h3>
+                        <p className="text-xs md:text-sm text-gray-500 whitespace-pre-line leading-relaxed">
+                          {GUIDE_STEPS[guideStep].desc}
+                        </p>
+                        {/* Step dots */}
+                        <div className="flex justify-center gap-2 py-1">
+                          {GUIDE_STEPS.map((_, i) => (
+                            <div
+                              key={i}
+                              className={`h-2 rounded-full transition-all duration-300 ${
+                                i === guideStep ? "w-5 bg-orange-500" : "w-2 bg-gray-200"
+                              }`}
+                            />
+                          ))}
+                        </div>
+                        <div className="flex gap-2 pt-1">
+                          {guideStep > 0 && (
+                            <button
+                              onClick={() => setGuideStep(s => s - 1)}
+                              className="flex-1 py-2.5 border border-gray-200 text-gray-600 rounded-xl text-sm font-medium"
+                            >
+                              이전
+                            </button>
+                          )}
+                          <button
+                            onClick={() => {
+                              if (guideStep < GUIDE_STEPS.length - 1) {
+                                setGuideStep(s => s + 1);
+                              } else {
+                                setGuideOpen(false);
+                              }
+                            }}
+                            className="flex-1 py-2.5 bg-orange-500 hover:bg-orange-600 text-white rounded-xl text-sm font-semibold transition-colors"
+                          >
+                            {guideStep < GUIDE_STEPS.length - 1 ? "다음" : "시작하기"}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </>
             ) : (
               <div className="text-center">
@@ -484,6 +684,7 @@ export default function CheckoutPage() {
           lastScore={lastScore}
           lastStatus={lastStatus}
           fps={undefined}
+          trackId={currentTrackId}
         />
 
         {/* Product List */}
