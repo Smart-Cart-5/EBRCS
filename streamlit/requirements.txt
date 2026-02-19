@@ -14,6 +14,7 @@ Pillow
 peft
 safetensors
 faiss-cpu
+deep-sort-realtime
 
 # Data
 pyarrow

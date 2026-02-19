@@ -1,8 +1,4 @@
-"""Per-user checkout session management.
-
-Replaces Streamlit's st.session_state with an in-memory dict keyed by
-session UUID, each holding its own billing state, bg_subtractor, ROI, etc.
-"""
+"""Per-user checkout session management."""
 
 from __future__ import annotations
 
@@ -15,6 +11,14 @@ import cv2
 import numpy as np
 
 
+def _create_bg_subtractor():
+    return cv2.createBackgroundSubtractorKNN(
+        history=300,
+        dist2Threshold=500,
+        detectShadows=False,
+    )
+
+
 @dataclass
 class CheckoutSession:
     """State for a single checkout session (one user/tab)."""
@@ -23,19 +27,20 @@ class CheckoutSession:
     created_at: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
 
-    # Mutable state dict -- passed directly to process_checkout_frame(state=...)
+    # Mutable state dict passed directly to process_checkout_frame(state=...)
     state: dict[str, Any] = field(default_factory=lambda: {
         "billing_items": {},
         "item_scores": {},
         "last_seen_at": {},
         "last_label": "-",
         "last_score": 0.0,
-        "last_status": "대기",
+        "last_status": "idle",
+        "last_direction": "-",
         "roi_occupied": False,
         "roi_empty_frames": 0,
     })
 
-    # OpenCV background subtractor -- per-session, not serializable
+    # OpenCV background subtractor per session (not serializable)
     bg_subtractor: Any = field(default=None)
 
     # Frame counter for DETECT_EVERY_N_FRAMES gating
@@ -55,7 +60,7 @@ class CheckoutSession:
 
     def __post_init__(self) -> None:
         if self.bg_subtractor is None:
-            self.bg_subtractor = cv2.createBackgroundSubtractorKNN(history=300)
+            self.bg_subtractor = _create_bg_subtractor()
 
     def touch(self) -> None:
         self.last_active = time.time()
@@ -66,23 +71,28 @@ class CheckoutSession:
         self.state["last_seen_at"] = {}
         self.state["last_label"] = "-"
         self.state["last_score"] = 0.0
-        self.state["last_status"] = "대기"
+        self.state["last_status"] = "idle"
+        self.state["last_direction"] = "-"
         self.state["roi_occupied"] = False
         self.state["roi_empty_frames"] = 0
+        self.state.pop("_track_meta", None)
+        self.state.pop("_tracker", None)
+        self.state.pop("_tracker_mode", None)
+
         self.frame_count = 0
-        self.bg_subtractor = cv2.createBackgroundSubtractorKNN(history=300)
+        self.bg_subtractor = _create_bg_subtractor()
 
     def get_roi_polygon(self, frame_shape: tuple[int, ...]) -> np.ndarray | None:
         """Convert normalized ROI to pixel coordinates for the given frame."""
         if not self.roi_poly_norm or len(self.roi_poly_norm) < 3:
             return None
         h, w = frame_shape[:2]
-        pts = []
+        points = []
         for x_norm, y_norm in self.roi_poly_norm:
             x = int(max(0.0, min(1.0, x_norm)) * w)
             y = int(max(0.0, min(1.0, y_norm)) * h)
-            pts.append([x, y])
-        return np.array(pts, dtype=np.int32)
+            points.append([x, y])
+        return np.array(points, dtype=np.int32)
 
 
 class SessionManager:
@@ -96,8 +106,7 @@ class SessionManager:
     def create(self) -> CheckoutSession:
         self.cleanup_expired()
         if len(self._sessions) >= self._max_sessions:
-            # Evict oldest inactive session
-            oldest = min(self._sessions.values(), key=lambda s: s.last_active)
+            oldest = min(self._sessions.values(), key=lambda session: session.last_active)
             del self._sessions[oldest.session_id]
 
         sid = str(uuid.uuid4())
@@ -117,11 +126,11 @@ class SessionManager:
     def cleanup_expired(self) -> None:
         now = time.time()
         expired = [
-            k for k, v in self._sessions.items()
-            if now - v.last_active > self._ttl
+            sid for sid, session in self._sessions.items()
+            if now - session.last_active > self._ttl
         ]
-        for k in expired:
-            del self._sessions[k]
+        for sid in expired:
+            del self._sessions[sid]
 
     @property
     def active_count(self) -> int:
