@@ -1,18 +1,25 @@
-import { useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useSessionStore } from "../stores/sessionStore";
 import { useAuthStore } from "../stores/authStore";
-import { updateBilling, confirmBilling, createPurchase } from "../api/client";
+import { updateBilling, confirmBilling, createPurchase, getBilling } from "../api/client";
 
 export default function ValidatePage() {
   const navigate = useNavigate();
+  const [isConfirming, setIsConfirming] = useState(false);
+  const [updatingItem, setUpdatingItem] = useState<string | null>(null);
   const { token } = useAuthStore();
   const {
     sessionId,
     billingItems,
     itemScores,
+    itemUnitPrices,
+    itemLineTotals,
     totalCount,
-    setBilling,
+    totalAmount,
+    currency,
+    unpricedItems,
+    setBillingState,
     resetSession,
   } = useSessionStore();
 
@@ -20,50 +27,97 @@ export default function ValidatePage() {
     a.localeCompare(b),
   );
   const itemCount = entries.length;
+  const formatAmount = (value: number) => `₩${value.toLocaleString("ko-KR")}`;
+
+  useEffect(() => {
+    if (!sessionId) return;
+
+    let cancelled = false;
+    const syncPricing = async () => {
+      try {
+        const state = await getBilling(sessionId);
+        if (!cancelled) {
+          setBillingState(state);
+        }
+      } catch (error) {
+        console.warn("Failed to load billing prices:", error);
+      }
+    };
+
+    syncPricing();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, setBillingState]);
 
   const handleQtyChange = useCallback(
     async (name: string, delta: number) => {
-      if (!sessionId) return;
-      const updated = { ...billingItems };
-      const newQty = (updated[name] ?? 0) + delta;
-      if (newQty <= 0) {
-        delete updated[name];
-      } else {
-        updated[name] = newQty;
+      if (!sessionId || isConfirming) return;
+      setUpdatingItem(name);
+      try {
+        const updated = { ...billingItems };
+        const newQty = (updated[name] ?? 0) + delta;
+        if (newQty <= 0) {
+          delete updated[name];
+        } else {
+          updated[name] = newQty;
+        }
+        const result = await updateBilling(sessionId, updated);
+        setBillingState(result);
+      } catch (error) {
+        console.error("Quantity update failed:", error);
+        alert("수량 변경 중 오류가 발생했습니다.");
+      } finally {
+        setUpdatingItem(null);
       }
-      const result = await updateBilling(sessionId, updated);
-      setBilling(result.billing_items);
     },
-    [sessionId, billingItems, setBilling],
+    [sessionId, billingItems, setBillingState, isConfirming],
   );
 
   const handleConfirm = useCallback(async () => {
-    if (!sessionId || !token) return;
+    if (!sessionId || !token || isConfirming) return;
 
+    let purchaseSaved = false;
     try {
+      setIsConfirming(true);
+
       // Create purchase record
       const items = Object.entries(billingItems).map(([name, count]) => ({
         name,
         count,
       }));
 
-      await createPurchase(token, {
+      const created = await createPurchase(token, {
         session_id: sessionId,
         items,
       });
+      purchaseSaved = true;
 
       // Confirm billing
-      await confirmBilling(sessionId);
+      const confirmed = await confirmBilling(sessionId);
+      const finalAmount =
+        confirmed.confirmed_total_amount ?? created.total_amount;
+      const warning =
+        confirmed.unpriced_items.length > 0
+          ? `\n(가격 미확인 품목 ${confirmed.unpriced_items.length}개 포함)`
+          : "";
 
       // Reset and navigate
       resetSession();
-      alert("구매가 완료되었습니다! 마이페이지에서 구매 내역을 확인할 수 있습니다.");
+      alert(`구매가 완료되었습니다! 결제 금액: ${formatAmount(finalAmount)}${warning}`);
       navigate("/mypage");
     } catch (error) {
       console.error("Purchase confirmation failed:", error);
+      if (purchaseSaved) {
+        alert("구매 내역 저장은 완료됐지만 세션 정리 중 오류가 발생했습니다. 새로고침 후 내역을 확인해주세요.");
+        navigate("/mypage");
+        return;
+      }
       alert("구매 확정 중 오류가 발생했습니다.");
+    } finally {
+      setIsConfirming(false);
     }
-  }, [sessionId, token, billingItems, resetSession, navigate]);
+  }, [sessionId, token, billingItems, resetSession, navigate, isConfirming]);
 
   return (
     <div className="h-full flex flex-col bg-[var(--color-bg)]">
@@ -121,10 +175,10 @@ export default function ValidatePage() {
               <div className="flex items-center justify-between mb-2 md:mb-3">
                 <div className="flex items-center gap-2 md:gap-3">
                   <div className="w-8 h-8 md:w-10 md:h-10 rounded-lg md:rounded-xl bg-[var(--color-secondary-light)] flex items-center justify-center">
-                    <span className="text-xl md:text-2xl">📊</span>
+                    <span className="text-xl md:text-2xl">💰</span>
                   </div>
                   <span className="text-xs md:text-sm text-[var(--color-text-secondary)]">
-                    품목 수
+                    예상 결제금액
                   </span>
                 </div>
                 {itemCount > 0 && (
@@ -134,10 +188,21 @@ export default function ValidatePage() {
                 )}
               </div>
               <div className="text-2xl md:text-3xl font-bold text-[var(--color-text)]">
-                {itemCount}개
+                {formatAmount(totalAmount)}
               </div>
+              {currency !== "KRW" && (
+                <div className="text-xs text-[var(--color-text-secondary)] mt-1">
+                  통화: {currency}
+                </div>
+              )}
             </div>
           </div>
+
+          {unpricedItems.length > 0 && (
+            <div className="bg-red-50 text-red-700 border border-red-200 rounded-xl px-4 py-3 text-sm">
+              가격 미확인 품목 {unpricedItems.length}개가 있어 일부 금액이 0원으로 계산됩니다.
+            </div>
+          )}
 
           {/* Product List */}
           <div className="bg-white rounded-2xl border border-[var(--color-border)] shadow-sm overflow-hidden">
@@ -195,12 +260,21 @@ export default function ValidatePage() {
                         <p className="text-sm text-[var(--color-text-secondary)]">
                           유사도: {(itemScores[name] ?? 0).toFixed(3)}
                         </p>
+                        <p className="text-sm text-[var(--color-text-secondary)]">
+                          단가: {itemUnitPrices[name] == null ? "미확인" : formatAmount(itemUnitPrices[name] as number)}
+                        </p>
                       </div>
                       <div className="flex items-center gap-3">
+                        <div className="w-24 text-right">
+                          <p className="text-sm font-bold text-[var(--color-text)]">
+                            {formatAmount(itemLineTotals[name] ?? 0)}
+                          </p>
+                        </div>
                         <div className="flex items-center gap-2 bg-gray-100 rounded-lg p-1">
                           <button
                             onClick={() => handleQtyChange(name, -1)}
-                            className="w-8 h-8 rounded-lg hover:bg-white text-lg font-bold transition-colors"
+                            disabled={isConfirming || updatingItem === name}
+                            className="w-8 h-8 rounded-lg hover:bg-white text-lg font-bold transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           >
                             -
                           </button>
@@ -209,14 +283,16 @@ export default function ValidatePage() {
                           </span>
                           <button
                             onClick={() => handleQtyChange(name, 1)}
-                            className="w-8 h-8 rounded-lg hover:bg-white text-lg font-bold transition-colors"
+                            disabled={isConfirming || updatingItem === name}
+                            className="w-8 h-8 rounded-lg hover:bg-white text-lg font-bold transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           >
                             +
                           </button>
                         </div>
                         <button
                           onClick={() => handleQtyChange(name, -qty)}
-                          className="px-4 py-2 text-sm text-[var(--color-danger)] hover:bg-red-50 rounded-lg font-medium transition-colors"
+                          disabled={isConfirming || updatingItem === name}
+                          className="px-4 py-2 text-sm text-[var(--color-danger)] hover:bg-red-50 rounded-lg font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                         >
                           삭제
                         </button>
@@ -235,25 +311,26 @@ export default function ValidatePage() {
         <div className="max-w-4xl mx-auto p-4 md:p-6">
           <div className="flex items-center justify-between mb-3 md:mb-4">
             <span className="text-base md:text-lg font-semibold text-[var(--color-text)]">
-              총 상품 수
+              예상 결제금액
             </span>
             <span className="text-3xl md:text-4xl font-bold text-[var(--color-primary)]">
-              {totalCount}개
+              {formatAmount(totalAmount)}
             </span>
           </div>
           <div className="flex gap-2 md:gap-3">
             <button
               onClick={() => navigate("/checkout")}
+              disabled={isConfirming}
               className="flex-1 px-4 py-3 md:px-6 md:py-4 bg-white hover:bg-gray-50 border-2 border-[var(--color-border)] text-[var(--color-text)] rounded-lg md:rounded-xl text-sm md:text-base font-semibold transition-colors"
             >
               취소
             </button>
             <button
               onClick={handleConfirm}
-              disabled={entries.length === 0}
+              disabled={entries.length === 0 || isConfirming}
               className="flex-1 px-4 py-3 md:px-6 md:py-4 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg md:rounded-xl text-sm md:text-base font-semibold transition-colors shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              영수증 확정
+              {isConfirming ? "처리 중..." : "영수증 확정"}
             </button>
           </div>
         </div>

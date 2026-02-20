@@ -12,7 +12,12 @@ interface SessionStore {
   sessionId: string | null;
   billingItems: Record<string, number>;
   itemScores: Record<string, number>;
+  itemUnitPrices: Record<string, number | null>;
+  itemLineTotals: Record<string, number>;
   totalCount: number;
+  totalAmount: number;
+  currency: string;
+  unpricedItems: string[];
   lastLabel: string;
   lastScore: number;
   lastStatus: string;
@@ -24,6 +29,7 @@ interface SessionStore {
   createSession: () => Promise<string>;
   updateFromWsMessage: (data: WsMessage) => void;
   setBilling: (items: Record<string, number>) => void;
+  setBillingState: (state: api.BillingState) => void;
   resetSession: () => void;
 }
 
@@ -44,7 +50,12 @@ export const useSessionStore = create<SessionStore>((set) => ({
   sessionId: null,
   billingItems: {},
   itemScores: {},
+  itemUnitPrices: {},
+  itemLineTotals: {},
   totalCount: 0,
+  totalAmount: 0,
+  currency: "KRW",
+  unpricedItems: [],
   lastLabel: "",
   lastScore: 0,
   lastStatus: "",
@@ -55,27 +66,93 @@ export const useSessionStore = create<SessionStore>((set) => ({
 
   createSession: async () => {
     const { session_id } = await api.createSession();
-    set({ sessionId: session_id, billingItems: {}, itemScores: {}, totalCount: 0 });
+    set({
+      sessionId: session_id,
+      billingItems: {},
+      itemScores: {},
+      itemUnitPrices: {},
+      itemLineTotals: {},
+      totalCount: 0,
+      totalAmount: 0,
+      currency: "KRW",
+      unpricedItems: [],
+    });
     return session_id;
   },
 
   updateFromWsMessage: (data: WsMessage) => {
-    set({
-      annotatedFrame: data.frame ?? null,
-      billingItems: data.billing_items,
-      itemScores: data.item_scores,
-      lastLabel: data.last_label,
-      lastScore: data.last_score,
-      lastStatus: data.last_status,
-      totalCount: data.total_count,
-      roiPolygon: data.roi_polygon ?? null,
-      countEvent: data.count_event ?? null,
-      currentTrackId: data.current_track_id ?? null,
+    set((state) => {
+      const nextItems = data.billing_items;
+      const nextUnitPrices = Object.fromEntries(
+        Object.entries(state.itemUnitPrices).filter(([name]) => name in nextItems),
+      );
+      const nextLineTotals = Object.fromEntries(
+        Object.entries(nextItems).map(([name, qty]) => [
+          name,
+          nextUnitPrices[name] != null ? (nextUnitPrices[name] as number) * qty : 0,
+        ]),
+      );
+      const nextTotalAmount = Object.values(nextLineTotals).reduce((sum, value) => sum + value, 0);
+      const nextUnpricedItems = Object.entries(nextItems)
+        .filter(([name]) => nextUnitPrices[name] == null)
+        .map(([name]) => name);
+
+      return {
+        annotatedFrame: data.frame ?? null,
+        billingItems: nextItems,
+        itemScores: data.item_scores,
+        itemUnitPrices: nextUnitPrices,
+        itemLineTotals: nextLineTotals,
+        totalAmount: nextTotalAmount,
+        unpricedItems: nextUnpricedItems,
+        lastLabel: data.last_label,
+        lastScore: data.last_score,
+        lastStatus: data.last_status,
+        totalCount: data.total_count,
+        roiPolygon: data.roi_polygon ?? null,
+        countEvent: data.count_event ?? null,
+        currentTrackId: data.current_track_id ?? null,
+      };
     });
   },
 
   setBilling: (items: Record<string, number>) => {
-    set({ billingItems: items, totalCount: Object.values(items).reduce((a, b) => a + b, 0) });
+    set((state) => {
+      const nextUnitPrices = Object.fromEntries(
+        Object.entries(state.itemUnitPrices).filter(([name]) => name in items),
+      );
+      const nextLineTotals = Object.fromEntries(
+        Object.entries(items).map(([name, qty]) => [
+          name,
+          nextUnitPrices[name] != null ? (nextUnitPrices[name] as number) * qty : 0,
+        ]),
+      );
+      const nextTotalAmount = Object.values(nextLineTotals).reduce((sum, value) => sum + value, 0);
+
+      return {
+        billingItems: items,
+        itemUnitPrices: nextUnitPrices,
+        itemLineTotals: nextLineTotals,
+        unpricedItems: Object.entries(items)
+          .filter(([name]) => nextUnitPrices[name] == null)
+          .map(([name]) => name),
+        totalCount: Object.values(items).reduce((a, b) => a + b, 0),
+        totalAmount: nextTotalAmount,
+      };
+    });
+  },
+
+  setBillingState: (state: api.BillingState) => {
+    set({
+      billingItems: state.billing_items,
+      itemScores: state.item_scores,
+      itemUnitPrices: state.item_unit_prices,
+      itemLineTotals: state.item_line_totals,
+      totalCount: state.total_count,
+      totalAmount: state.total_amount,
+      currency: state.currency || "KRW",
+      unpricedItems: state.unpriced_items || [],
+    });
   },
 
   resetSession: () => {
@@ -83,7 +160,12 @@ export const useSessionStore = create<SessionStore>((set) => ({
       sessionId: null,
       billingItems: {},
       itemScores: {},
+      itemUnitPrices: {},
+      itemLineTotals: {},
       totalCount: 0,
+      totalAmount: 0,
+      currency: "KRW",
+      unpricedItems: [],
       lastLabel: "",
       lastScore: 0,
       lastStatus: "",

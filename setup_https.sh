@@ -5,7 +5,26 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DOMAIN="${1:-_}"  # Default to _ (catch-all)
+SSL_CERT_PATH="/etc/nginx/ssl/ebrcs.crt"
+SSL_KEY_PATH="/etc/nginx/ssl/ebrcs.key"
+DOMAIN="${1:-}"
+
+is_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+if [ -z "$DOMAIN" ]; then
+    DOMAIN="$(curl -s --max-time 5 ifconfig.me 2>/dev/null || true)"
+fi
+if [ -z "$DOMAIN" ]; then
+    DOMAIN="_"
+fi
+
+if is_ipv4 "$DOMAIN"; then
+    SAN_ENTRY="IP:${DOMAIN}"
+else
+    SAN_ENTRY="DNS:${DOMAIN}"
+fi
 
 echo "🔒 EBRCS HTTPS 설정"
 echo "=================="
@@ -29,16 +48,45 @@ fi
 echo "📁 SSL 디렉토리 생성..."
 mkdir -p /etc/nginx/ssl
 
-# 3. Generate self-signed certificate
-if [ ! -f /etc/nginx/ssl/ebrcs.crt ] || [ ! -f /etc/nginx/ssl/ebrcs.key ]; then
-    echo "🔐 자체 서명 SSL 인증서 생성 중..."
+# 3. Generate self-signed certificate (with SAN)
+CERT_MATCHED_HOST="false"
+if [ -f "$SSL_CERT_PATH" ] && [ -f "$SSL_KEY_PATH" ]; then
+    CERT_INFO="$(openssl x509 -in "$SSL_CERT_PATH" -noout -subject -ext subjectAltName 2>/dev/null || true)"
+    if echo "$CERT_INFO" | grep -q "$DOMAIN"; then
+        CERT_MATCHED_HOST="true"
+    fi
+fi
+
+if [ "$CERT_MATCHED_HOST" != "true" ]; then
+    echo "🔐 자체 서명 SSL 인증서 생성 중... (host: ${DOMAIN}, SAN: ${SAN_ENTRY})"
+    OPENSSL_CONF_TMP="$(mktemp)"
+    cat > "$OPENSSL_CONF_TMP" <<EOF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+x509_extensions = v3_req
+distinguished_name = dn
+
+[dn]
+C = US
+ST = State
+L = City
+O = EBRCS
+CN = ${DOMAIN}
+
+[v3_req]
+subjectAltName = ${SAN_ENTRY}
+EOF
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout /etc/nginx/ssl/ebrcs.key \
-        -out /etc/nginx/ssl/ebrcs.crt \
-        -subj "/C=US/ST=State/L=City/O=EBRCS/CN=${DOMAIN}"
+        -keyout "$SSL_KEY_PATH" \
+        -out "$SSL_CERT_PATH" \
+        -config "$OPENSSL_CONF_TMP" \
+        -extensions v3_req
+    rm -f "$OPENSSL_CONF_TMP"
     echo "  ✓ 인증서 생성 완료"
 else
-    echo "  ℹ️  기존 SSL 인증서 사용"
+    echo "  ℹ️  기존 SSL 인증서 사용 (host 일치: ${DOMAIN})"
 fi
 
 # 4. Copy Nginx configuration
@@ -71,7 +119,7 @@ echo "=================="
 echo "✅ HTTPS 설정 완료!"
 echo ""
 echo "📝 접속 방법:"
-echo "  https://your-server-ip"
+echo "  https://${DOMAIN}"
 echo "  (브라우저 경고가 나오면 '고급 > 계속 진행' 클릭)"
 echo ""
 echo "🔧 Let's Encrypt 인증서로 업그레이드하려면:"

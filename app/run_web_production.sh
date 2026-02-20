@@ -54,6 +54,16 @@ set -a
 source "$PROJECT_ROOT/.env"
 set +a
 
+# SessionManager is in-memory (process-local). Keep single worker by default.
+UVICORN_WORKERS="${UVICORN_WORKERS:-1}"
+if ! [[ "$UVICORN_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "⚠️  UVICORN_WORKERS 값이 올바르지 않아 1로 설정합니다: $UVICORN_WORKERS"
+    UVICORN_WORKERS="1"
+fi
+if [ "$UVICORN_WORKERS" -gt 1 ]; then
+    echo "⚠️  UVICORN_WORKERS=$UVICORN_WORKERS (세션/웹소켓은 인메모리라 멀티 워커에서 불안정할 수 있음)"
+fi
+
 # 로그 디렉토리 생성
 mkdir -p "$APP_DIR/logs"
 
@@ -116,7 +126,7 @@ export PYTHONPATH="$APP_DIR:$PROJECT_ROOT"
 nohup uvicorn backend.main:app \
     --host 0.0.0.0 \
     --port 8000 \
-    --workers 2 \
+    --workers "$UVICORN_WORKERS" \
     > "$APP_DIR/logs/backend.log" 2>&1 &
 
 BACKEND_PID=$!
@@ -138,26 +148,77 @@ echo "  ✓ Frontend PID: $FRONTEND_PID"
 echo $BACKEND_PID > "$APP_DIR/logs/backend.pid"
 echo $FRONTEND_PID > "$APP_DIR/logs/frontend.pid"
 
-# 대기
-sleep 3
+# 준비 상태 확인 (모델 로딩으로 backend startup이 오래 걸릴 수 있음)
+echo "⏳ 서비스 준비 상태 확인 중..."
+BACKEND_READY="false"
+FRONTEND_READY="false"
+
+for _ in $(seq 1 180); do
+    if ! ps -p $BACKEND_PID >/dev/null 2>&1; then
+        break
+    fi
+    if curl -sS --max-time 2 http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
+        BACKEND_READY="true"
+        break
+    fi
+    sleep 1
+done
+
+for _ in $(seq 1 30); do
+    if ! ps -p $FRONTEND_PID >/dev/null 2>&1; then
+        break
+    fi
+    if curl -sS --max-time 2 http://127.0.0.1:5173 >/dev/null 2>&1; then
+        FRONTEND_READY="true"
+        break
+    fi
+    sleep 1
+done
+
 PUBLIC_IP="$(curl -s ifconfig.me || true)"
 if [ -z "$PUBLIC_IP" ]; then
     PUBLIC_IP="YOUR_EC2_IP"
 fi
 
+# HTTPS 프록시 상태 확인 (Nginx)
+HTTPS_READY="false"
+if command -v curl >/dev/null 2>&1; then
+    if curl -k -s --max-time 3 https://127.0.0.1/ >/dev/null 2>&1; then
+        HTTPS_READY="true"
+    fi
+fi
+
+# 인증서 호스트 불일치 안내 (EC2 재시작으로 공인 IP가 바뀐 경우)
+CERT_HINT=""
+if [ -f /etc/nginx/ssl/ebrcs.crt ] && [ "$PUBLIC_IP" != "YOUR_EC2_IP" ]; then
+    CERT_INFO="$(openssl x509 -in /etc/nginx/ssl/ebrcs.crt -noout -subject -ext subjectAltName 2>/dev/null || true)"
+    if ! echo "$CERT_INFO" | grep -q "$PUBLIC_IP"; then
+        CERT_HINT="⚠️  현재 SSL 인증서와 공인 IP가 다를 수 있습니다. (권장: sudo ./setup_https.sh ${PUBLIC_IP})"
+    fi
+fi
+
 # 상태 확인
 echo ""
 echo "================================"
-if ps -p $BACKEND_PID > /dev/null && ps -p $FRONTEND_PID > /dev/null; then
+if ps -p $BACKEND_PID > /dev/null && ps -p $FRONTEND_PID > /dev/null && [ "$BACKEND_READY" = "true" ] && [ "$FRONTEND_READY" = "true" ]; then
     echo "✅ 웹앱 실행 성공!"
     echo ""
-    echo "🌐 접속 주소 (직접 접속):"
-    echo "  웹앱: http://${PUBLIC_IP}:5173"
-    echo "  API 테스트: http://${PUBLIC_IP}:8000/api/health"
+    echo "🌐 접속 주소 (카메라 사용: HTTPS 권장):"
+    echo "  웹앱(HTTPS): https://${PUBLIC_IP}"
+    echo "  API(HTTPS): https://${PUBLIC_IP}/api/health"
     echo ""
-    echo "🌐 Nginx 리버스 프록시를 설정한 경우:"
-    echo "  웹앱: http://${PUBLIC_IP}"
-    echo "  API 테스트: http://${PUBLIC_IP}/api/health"
+    if [ "$HTTPS_READY" != "true" ]; then
+        echo "⚠️  현재 HTTPS 프록시(Nginx) 응답이 없습니다."
+        echo "   sudo ./setup_https.sh ${PUBLIC_IP}"
+        echo ""
+    fi
+    if [ -n "$CERT_HINT" ]; then
+        echo "$CERT_HINT"
+        echo ""
+    fi
+    echo "🌐 직접 포트 접속 (디버깅용, 카메라 비권장):"
+    echo "  Frontend: http://${PUBLIC_IP}:5173"
+    echo "  Backend:  http://${PUBLIC_IP}:8000/api/health"
     echo ""
     echo "📝 내부 서비스 (localhost only):"
     echo "  Backend: http://localhost:8000"
@@ -171,6 +232,8 @@ if ps -p $BACKEND_PID > /dev/null && ps -p $FRONTEND_PID > /dev/null; then
     echo "  cd app && ./stop_web.sh"
 else
     echo "❌ 실행 실패. 로그를 확인하세요:"
+    echo "  Backend ready: $BACKEND_READY"
+    echo "  Frontend ready: $FRONTEND_READY"
     echo "  cat app/logs/backend.log"
     echo "  cat app/logs/frontend.log"
     exit 1

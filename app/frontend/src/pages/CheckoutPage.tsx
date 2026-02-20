@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import toast, { Toaster } from "react-hot-toast";
 import { useSessionStore, type WsMessage } from "../stores/sessionStore";
-import { wsCheckoutUrl, uploadVideo, videoStatusUrl, setROI, getHealth } from "../api/client";
+import { wsCheckoutUrl, uploadVideo, videoStatusUrl, setROI, getHealth, getBilling } from "../api/client";
 import BillingPanel from "../components/BillingPanel";
 import StatusMetrics from "../components/StatusMetrics";
 import ProductDrawer from "../components/ProductDrawer";
@@ -11,6 +11,18 @@ const captureIntervalRaw = Number(import.meta.env.VITE_CAPTURE_INTERVAL_MS || 80
 const CAPTURE_INTERVAL_MS = Number.isFinite(captureIntervalRaw)
   ? Math.max(33, captureIntervalRaw)
   : 80;
+const FULLSCREEN_ROI = [
+  [0.0, 0.0], // Top-left
+  [1.0, 0.0], // Top-right
+  [1.0, 1.0], // Bottom-right
+  [0.0, 1.0], // Bottom-left
+];
+
+function isSessionNotFoundError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message.toLowerCase();
+  return msg.includes("404") || msg.includes("session not found");
+}
 
 const GUIDE_STEPS = [
   {
@@ -41,15 +53,30 @@ export default function CheckoutPage() {
   const [modelLoadMsg, setModelLoadMsg] = useState("AI 모델 로딩 중...");
   const [guideOpen, setGuideOpen] = useState(false);
   const [guideStep, setGuideStep] = useState(0);
+  const [cameraDevices, setCameraDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null);
+  const [cameraSettingsOpen, setCameraSettingsOpen] = useState(false);
+  const [zoomSupported, setZoomSupported] = useState(false);
+  const [zoomValue, setZoomValue] = useState(1);
+  const [zoomMin, setZoomMin] = useState(1);
+  const [zoomMax, setZoomMax] = useState(1);
+  const [zoomStep, setZoomStep] = useState(0.1);
+  const [cameraHint, setCameraHint] = useState("");
 
   const {
     sessionId,
     createSession,
     updateFromWsMessage,
     setBilling,
+    setBillingState,
     billingItems,
     itemScores,
+    itemUnitPrices,
+    itemLineTotals,
     totalCount,
+    totalAmount,
+    currency,
+    unpricedItems,
     lastLabel,
     lastScore,
     lastStatus,
@@ -62,6 +89,7 @@ export default function CheckoutPage() {
   const captureCanvasRef = useRef<HTMLCanvasElement>(null); // For capturing frames to send to backend
   const displayCanvasRef = useRef<HTMLCanvasElement>(null); // For rendering at 60 FPS
   const streamRef = useRef<MediaStream | null>(null);
+  const videoTrackRef = useRef<MediaStreamTrack | null>(null);
   const captureAnimRef = useRef<number>(0); // For capture/send loop
   const renderAnimRef = useRef<number>(0); // For render loop (60 FPS)
   const countFlashRef = useRef<number>(0); // count 이벤트 시 화면 플래시
@@ -81,6 +109,102 @@ export default function CheckoutPage() {
     lastStatusRef.current = lastStatus;
     currentTrackIdRef.current = currentTrackId;
   }, [lastLabel, lastScore, lastStatus, currentTrackId]);
+
+  const selectPreferredCamera = useCallback((devices: MediaDeviceInfo[]) => {
+    if (devices.length === 0) return null;
+
+    const rearKeywords = /(back|rear|environment|후면|광각|ultra|wide)/i;
+    const rear = devices.find((d) => rearKeywords.test(d.label));
+    return rear?.deviceId ?? devices[0].deviceId;
+  }, []);
+
+  const refreshCameraDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const videos = devices.filter((d) => d.kind === "videoinput");
+    setCameraDevices(videos);
+    setSelectedCameraId((prev) => {
+      if (prev && videos.some((d) => d.deviceId === prev)) {
+        return prev;
+      }
+      return selectPreferredCamera(videos);
+    });
+  }, [selectPreferredCamera]);
+
+  const initZoomCapabilities = useCallback(async (track: MediaStreamTrack) => {
+    videoTrackRef.current = track;
+
+    const capabilities = ((track.getCapabilities?.() as {
+      zoom?: { min: number; max: number; step?: number };
+    } | undefined) ?? {});
+    const settings = (track.getSettings?.() as { zoom?: number } | undefined) ?? {};
+    const zoomCap = capabilities.zoom;
+
+    if (!zoomCap || typeof zoomCap.min !== "number" || typeof zoomCap.max !== "number") {
+      setZoomSupported(false);
+      setCameraHint("현재 기기/브라우저는 웹 줌 제어를 지원하지 않습니다.");
+      return;
+    }
+
+    const min = Number(zoomCap.min);
+    const max = Number(zoomCap.max);
+    const step = Math.max(0.01, Number(zoomCap.step ?? 0.1));
+    const current = typeof settings.zoom === "number"
+      ? settings.zoom
+      : min;
+
+    setZoomSupported(true);
+    setZoomMin(min);
+    setZoomMax(max);
+    setZoomStep(step);
+    setZoomValue(current);
+    setCameraHint(max > min ? "줌 슬라이더로 화각을 조절할 수 있습니다." : "현재 렌즈는 고정 화각입니다.");
+
+    if (max > min) {
+      try {
+        await track.applyConstraints({
+          advanced: [{ zoom: current } as unknown as MediaTrackConstraintSet],
+        });
+      } catch (error) {
+        console.warn("Failed to apply initial zoom:", error);
+      }
+    }
+  }, []);
+
+  const applyZoom = useCallback(async (nextZoom: number) => {
+    setZoomValue(nextZoom);
+    const track = videoTrackRef.current;
+    if (!track || !zoomSupported) return;
+
+    try {
+      await track.applyConstraints({
+        advanced: [{ zoom: nextZoom } as unknown as MediaTrackConstraintSet],
+      });
+    } catch (error) {
+      console.warn("Failed to apply zoom:", error);
+    }
+  }, [zoomSupported]);
+
+  const ensureSessionAndROI = useCallback(async (): Promise<string> => {
+    let activeSessionId = sessionId;
+    if (!activeSessionId) {
+      activeSessionId = await createSession();
+    }
+
+    try {
+      await setROI(activeSessionId, FULLSCREEN_ROI);
+      return activeSessionId;
+    } catch (error) {
+      if (isSessionNotFoundError(error)) {
+        console.warn("Session not found. Recreating session...");
+        activeSessionId = await createSession();
+        await setROI(activeSessionId, FULLSCREEN_ROI);
+        return activeSessionId;
+      }
+      throw error;
+    }
+  }, [sessionId, createSession]);
 
   // Poll backend health until models are loaded
   useEffect(() => {
@@ -106,26 +230,35 @@ export default function CheckoutPage() {
     return () => { cancelled = true; };
   }, [modelReady]);
 
+  useEffect(() => {
+    refreshCameraDevices().catch((error) => {
+      console.warn("Failed to enumerate cameras:", error);
+    });
+
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.addEventListener) return;
+
+    const onDeviceChange = () => {
+      refreshCameraDevices().catch((error) => {
+        console.warn("Failed to refresh cameras after device change:", error);
+      });
+    };
+
+    mediaDevices.addEventListener("devicechange", onDeviceChange);
+    return () => {
+      mediaDevices.removeEventListener("devicechange", onDeviceChange);
+    };
+  }, [refreshCameraDevices]);
+
   // Ensure session exists and setup virtual ROI for entry-event mode.
   // Gated on modelReady to avoid ECONNREFUSED on startup (frontend starts
   // before backend is ready, and a failed createSession leaves sessionId=null).
   useEffect(() => {
     if (!modelReady) return;
-    if (!sessionId) {
-      createSession();
-    } else {
-      // Setup full-screen virtual ROI to enable entry-event mode
-      // This prevents counting the same object multiple times
-      setROI(sessionId, [
-        [0.0, 0.0],  // Top-left
-        [1.0, 0.0],  // Top-right
-        [1.0, 1.0],  // Bottom-right
-        [0.0, 1.0],  // Bottom-left
-      ]).catch((err) => {
-        console.warn("Failed to set ROI:", err);
-      });
-    }
-  }, [sessionId, createSession, modelReady]);
+    ensureSessionAndROI().catch((err) => {
+      console.warn("Failed to ensure session/ROI:", err);
+    });
+  }, [modelReady, ensureSessionAndROI]);
 
   // Show toast + flash when count event fires from backend
   useEffect(() => {
@@ -173,46 +306,136 @@ export default function CheckoutPage() {
     return () => {
       wsRef.current?.close();
       streamRef.current?.getTracks().forEach((t) => t.stop());
+      videoTrackRef.current = null;
       cancelAnimationFrame(captureAnimRef.current);
       cancelAnimationFrame(renderAnimRef.current);
     };
   }, []);
 
-  // --- Camera mode ---
-  const startCamera = useCallback(async () => {
+  const billingSignature = useMemo(
+    () =>
+      JSON.stringify(
+        Object.entries(billingItems).sort(([a], [b]) => a.localeCompare(b)),
+      ),
+    [billingItems],
+  );
+
+  const hasMultipleCameras = cameraDevices.length > 1;
+  const canShowZoomSlider = zoomSupported && zoomMax - zoomMin > 0.001;
+
+  // Fetch latest pricing only when cart composition changes.
+  useEffect(() => {
     if (!sessionId) return;
 
+    let cancelled = false;
+    const fetchBillingState = async () => {
+      try {
+        const state = await getBilling(sessionId);
+        if (!cancelled) {
+          setBillingState(state);
+        }
+      } catch (error) {
+        console.warn("Failed to refresh billing prices:", error);
+      }
+    };
+
+    fetchBillingState();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, billingSignature, setBillingState]);
+
+  // --- Camera mode ---
+  const startCamera = useCallback(async (forcedDeviceId?: string) => {
     try {
       // Start loading state
       setIsLoading(true);
+      setLoadingMessage("세션 준비 중...");
+
+      // Ensure session exists on backend before opening WebSocket
+      const activeSessionId = await ensureSessionAndROI();
+
       setLoadingMessage("카메라 권한 요청 중...");
 
       // Request camera and WebSocket in parallel for better UX
       console.log("📷 Requesting camera access...");
 
       // Start both operations in parallel
+      const activeCameraId = forcedDeviceId ?? selectedCameraId;
+      const preferredConstraints: MediaTrackConstraints = activeCameraId
+        ? {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            aspectRatio: { ideal: 16 / 9 },
+            frameRate: { ideal: 30, max: 60 },
+            deviceId: { exact: activeCameraId },
+          }
+        : {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            aspectRatio: { ideal: 16 / 9 },
+            frameRate: { ideal: 30, max: 60 },
+            facingMode: { ideal: "environment" },
+          };
+
+      const fallbackConstraints: MediaTrackConstraints = {
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        aspectRatio: { ideal: 16 / 9 },
+        frameRate: { ideal: 30, max: 60 },
+        facingMode: { ideal: "environment" },
+      };
+
       const cameraPromise = navigator.mediaDevices.getUserMedia({
-        video: { width: 960, height: 540, facingMode: "environment" },
+        video: preferredConstraints,
+      }).catch(async (error) => {
+        if (!activeCameraId) {
+          throw error;
+        }
+        console.warn("Selected camera unavailable, fallback to environment lens:", error);
+        return navigator.mediaDevices.getUserMedia({ video: fallbackConstraints });
       });
 
-      const ws = new WebSocket(wsCheckoutUrl(sessionId));
+      const ws = new WebSocket(wsCheckoutUrl(activeSessionId));
       wsRef.current = ws;
 
       const wsPromise = new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => {
+          cleanup();
           reject(new Error("WebSocket connection timeout"));
-        }, 10000); // Increased to 10 seconds
+        }, 10000);
 
-        ws.onopen = () => {
+        const cleanup = () => {
           clearTimeout(timeout);
+          ws.removeEventListener("open", onOpen);
+          ws.removeEventListener("error", onError);
+          ws.removeEventListener("close", onCloseBeforeOpen);
+        };
+
+        const onOpen = () => {
+          cleanup();
           console.log("✅ WebSocket connected");
           resolve();
         };
-        ws.onerror = (err) => {
-          clearTimeout(timeout);
+
+        const onError = (err: Event) => {
+          cleanup();
           console.error("❌ WebSocket error:", err);
           reject(new Error("WebSocket connection failed"));
         };
+
+        const onCloseBeforeOpen = (event: CloseEvent) => {
+          cleanup();
+          reject(
+            new Error(
+              `WebSocket closed before connected (code=${event.code})`,
+            ),
+          );
+        };
+
+        ws.addEventListener("open", onOpen);
+        ws.addEventListener("error", onError);
+        ws.addEventListener("close", onCloseBeforeOpen);
       });
 
       // Setup WebSocket message handlers
@@ -237,6 +460,14 @@ export default function CheckoutPage() {
 
       console.log("✅ Camera access granted");
       streamRef.current = stream;
+      const videoTrack = stream.getVideoTracks()[0] ?? null;
+      if (videoTrack) {
+        await initZoomCapabilities(videoTrack);
+      } else {
+        setZoomSupported(false);
+        setCameraHint("카메라 트랙을 찾지 못했습니다.");
+      }
+      await refreshCameraDevices();
 
       const video = videoRef.current!;
       video.srcObject = stream;
@@ -448,13 +679,20 @@ export default function CheckoutPage() {
   // Store values (roiPolygon, lastLabel, etc.) removed from deps — they're
   // accessed via refs inside renderFrame, so startCamera doesn't need to
   // rebuild the render loop every time the store updates.
-  }, [sessionId, updateFromWsMessage]);
+  }, [
+    ensureSessionAndROI,
+    initZoomCapabilities,
+    refreshCameraDevices,
+    selectedCameraId,
+    updateFromWsMessage,
+  ]);
 
   const stopCamera = useCallback(() => {
     wsRef.current?.close();
     wsRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
+    videoTrackRef.current = null;
     cancelAnimationFrame(captureAnimRef.current);
     cancelAnimationFrame(renderAnimRef.current);
     setConnected(false);
@@ -462,7 +700,18 @@ export default function CheckoutPage() {
     setLoadingMessage("");
     setGuideOpen(false);
     setGuideStep(0);
+    setCameraSettingsOpen(false);
+    setZoomSupported(false);
   }, []);
+
+  const handleCameraDeviceChange = useCallback(async (deviceId: string) => {
+    setSelectedCameraId(deviceId);
+    if (!connected) return;
+
+    stopCamera();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    void startCamera(deviceId);
+  }, [connected, startCamera, stopCamera]);
 
   // --- Upload mode ---
   const handleUpload = useCallback(
@@ -566,6 +815,59 @@ export default function CheckoutPage() {
                   <span className="w-1.5 h-1.5 md:w-2 md:h-2 bg-white rounded-full animate-pulse" />
                   Live
                 </div>
+                <button
+                  onClick={() => setCameraSettingsOpen((prev) => !prev)}
+                  className="absolute top-3 right-3 md:top-4 md:right-4 px-3 py-1.5 bg-black/50 hover:bg-black/65 text-white rounded-lg text-xs md:text-sm font-semibold transition-colors"
+                >
+                  카메라 설정
+                </button>
+                {cameraSettingsOpen && (
+                  <div className="absolute top-14 right-3 md:top-16 md:right-4 z-20 w-72 bg-white/95 backdrop-blur rounded-xl border border-gray-200 shadow-xl p-3 space-y-3">
+                    <div>
+                      <p className="text-xs font-semibold text-gray-700 mb-1">렌즈 선택</p>
+                      <select
+                        value={selectedCameraId ?? ""}
+                        onChange={(e) => {
+                          const next = e.target.value;
+                          if (next) {
+                            void handleCameraDeviceChange(next);
+                          }
+                        }}
+                        className="w-full border border-gray-300 rounded-lg px-2 py-1.5 text-sm"
+                        disabled={!hasMultipleCameras}
+                      >
+                        {cameraDevices.length === 0 && (
+                          <option value="">카메라를 찾는 중...</option>
+                        )}
+                        {cameraDevices.map((device, idx) => (
+                          <option key={device.deviceId} value={device.deviceId}>
+                            {device.label || `카메라 ${idx + 1}`}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between mb-1">
+                        <p className="text-xs font-semibold text-gray-700">디지털 줌</p>
+                        <p className="text-xs text-gray-500">{zoomValue.toFixed(2)}x</p>
+                      </div>
+                      <input
+                        type="range"
+                        min={zoomMin}
+                        max={zoomMax}
+                        step={zoomStep}
+                        value={zoomValue}
+                        disabled={!canShowZoomSlider}
+                        onChange={(e) => void applyZoom(Number(e.target.value))}
+                        className="w-full accent-[var(--color-primary)] disabled:opacity-40"
+                      />
+                      <p className="text-[11px] text-gray-500 mt-1">
+                        {cameraHint || "렌즈마다 지원 가능한 줌 범위가 다릅니다."}
+                      </p>
+                    </div>
+                  </div>
+                )}
                 {/* Stop Button */}
                 <button
                   onClick={stopCamera}
@@ -638,12 +940,33 @@ export default function CheckoutPage() {
                   </div>
                 )}
                 <button
-                  onClick={startCamera}
+                  onClick={() => void startCamera()}
                   disabled={isLoading}
                   className="px-5 py-2.5 md:px-6 md:py-3 bg-[var(--color-success)] hover:bg-[var(--color-success-hover)] text-white rounded-lg md:rounded-xl text-sm md:text-base font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-lg"
                 >
                   {isLoading ? "준비 중..." : "카메라 시작"}
                 </button>
+                {cameraDevices.length > 0 && (
+                  <div className="mt-4 max-w-xs mx-auto text-left bg-black/30 border border-white/20 rounded-xl p-3 space-y-2">
+                    <p className="text-xs text-gray-200 font-semibold">렌즈 미리 선택</p>
+                    <select
+                      value={selectedCameraId ?? ""}
+                      onChange={(e) => {
+                        const next = e.target.value;
+                        if (next) {
+                          void handleCameraDeviceChange(next);
+                        }
+                      }}
+                      className="w-full border border-gray-500 bg-black/20 text-gray-100 rounded-lg px-2 py-1.5 text-sm"
+                    >
+                      {cameraDevices.map((device, idx) => (
+                        <option key={device.deviceId} value={device.deviceId} className="text-black">
+                          {device.label || `카메라 ${idx + 1}`}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
               </div>
             )
           ) : uploadProgress !== null ? (
@@ -692,7 +1015,12 @@ export default function CheckoutPage() {
           <BillingPanel
             billingItems={billingItems}
             itemScores={itemScores}
+            itemUnitPrices={itemUnitPrices}
+            itemLineTotals={itemLineTotals}
             totalCount={totalCount}
+            totalAmount={totalAmount}
+            currency={currency}
+            unpricedItems={unpricedItems}
           />
         </div>
       </div>
@@ -714,13 +1042,18 @@ export default function CheckoutPage() {
     </button>
 
     {/* Product Drawer - Mobile Only */}
-    <ProductDrawer
-      isOpen={drawerOpen}
-      onClose={() => setDrawerOpen(false)}
-      billingItems={billingItems}
-      itemScores={itemScores}
-      totalCount={totalCount}
-    />
+      <ProductDrawer
+        isOpen={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        billingItems={billingItems}
+        itemScores={itemScores}
+        itemUnitPrices={itemUnitPrices}
+        itemLineTotals={itemLineTotals}
+        totalCount={totalCount}
+        totalAmount={totalAmount}
+        currency={currency}
+        unpricedItems={unpricedItems}
+      />
   </>
   );
 }

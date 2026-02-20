@@ -4,6 +4,7 @@ import { getAllPurchases } from "../api/client";
 
 export default function AdminPurchasesPage() {
   const { token } = useAuthStore();
+  const formatAmount = (value: number) => `₩${value.toLocaleString("ko-KR")}`;
 
   const { data: purchases, isLoading } = useQuery({
     queryKey: ["purchases", "all"],
@@ -94,6 +95,9 @@ export default function AdminPurchasesPage() {
                   <th className="px-6 py-3 text-left text-xs font-semibold text-[var(--color-text-secondary)] uppercase tracking-wider">
                     총 개수
                   </th>
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-[var(--color-text-secondary)] uppercase tracking-wider">
+                    총 금액
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[var(--color-border)]">
@@ -130,6 +134,11 @@ export default function AdminPurchasesPage() {
                     <td className="px-6 py-4 whitespace-nowrap">
                       <span className="text-sm font-semibold text-[var(--color-text)]">
                         {purchase.items.reduce((sum: number, item: any) => sum + item.count, 0)}개
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className="text-sm font-semibold text-[var(--color-primary)]">
+                        {formatAmount(purchase.total_amount ?? 0)}
                       </span>
                     </td>
                   </tr>

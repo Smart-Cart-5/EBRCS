@@ -4,6 +4,7 @@ import { getMyPurchases } from "../api/client";
 
 export default function MyPage() {
   const { user, token } = useAuthStore();
+  const formatAmount = (value: number) => `₩${value.toLocaleString("ko-KR")}`;
 
   const { data: purchases, isLoading } = useQuery({
     queryKey: ["purchases", "my"],
@@ -49,6 +50,9 @@ export default function MyPage() {
                         {new Date(purchase.timestamp).toLocaleString("ko-KR")}
                       </p>
                     </div>
+                    <p className="text-sm font-semibold text-[var(--color-primary)]">
+                      {formatAmount(purchase.total_amount ?? 0)}
+                    </p>
                   </div>
                   <div className="space-y-2">
                     {purchase.items.map((item: any, itemIdx: number) => (
@@ -59,9 +63,16 @@ export default function MyPage() {
                         <span className="text-[var(--color-text)]">
                           {item.name}
                         </span>
-                        <span className="text-[var(--color-text-secondary)]">
-                          {item.count}개
-                        </span>
+                        <div className="text-right">
+                          <p className="text-[var(--color-text-secondary)]">
+                            {item.count}개
+                          </p>
+                          {item.line_total != null && (
+                            <p className="text-[var(--color-primary)] font-medium">
+                              {formatAmount(item.line_total)}
+                            </p>
+                          )}
+                        </div>
                       </div>
                     ))}
                   </div>

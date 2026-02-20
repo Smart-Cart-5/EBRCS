@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from backend import models
 from backend.database import get_db
 from backend.routers.auth import get_current_user
+from backend.services.pricing import quote_named_items
 
 router = APIRouter(prefix="/purchases", tags=["purchases"])
 
@@ -120,13 +121,24 @@ def create_purchase(
     db: Session = Depends(get_db),
 ):
     """Create a new purchase record."""
-    # Convert items to dict format for JSON storage
-    items_list = [{"name": item.name, "count": item.count} for item in purchase_data.items]
+    normalized_items = [
+        {"name": item.name.strip(), "count": int(item.count)}
+        for item in purchase_data.items
+        if item.name.strip() and item.count > 0
+    ]
+
+    if not normalized_items:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one valid item is required",
+        )
+
+    quote = quote_named_items(db, normalized_items)
 
     new_purchase = models.PurchaseHistory(
         user_id=current_user.id,
-        items=items_list,
-        total_amount=0,  # TODO: Calculate based on product prices
+        items=quote["items"],
+        total_amount=quote["total_amount"],
         notes=purchase_data.notes,
     )
 

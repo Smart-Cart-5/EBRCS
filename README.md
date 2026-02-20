@@ -292,6 +292,28 @@ cd app
 - **Frontend**: http://localhost:5173
 - **Backend API**: http://localhost:8000/docs
 
+#### DB 연결 설정 (SQLite / MySQL 선택)
+
+기본값은 SQLite(`data/ebrcs.db`)이며, `.env`에 `DATABASE_URL`을 설정하면 MySQL로 전환됩니다.
+
+**🪟 Windows (.env)**
+```env
+# SQLite (기본)
+# DATABASE_URL=sqlite:///data/ebrcs.db
+
+# MySQL (운영 권장)
+DATABASE_URL=mysql+pymysql://<USER>:<PASSWORD>@127.0.0.1:3306/item_db
+```
+
+**🍎 macOS / 🐧 Linux (.env)**
+```env
+# SQLite (기본)
+# DATABASE_URL=sqlite:///data/ebrcs.db
+
+# MySQL (운영 권장)
+DATABASE_URL=mysql+pymysql://<USER>:<PASSWORD>@127.0.0.1:3306/item_db
+```
+
 ### 3️⃣ 관리자 계정 생성
 
 웹앱을 처음 실행하면 일반 사용자 계정만 생성됩니다. 관리자 계정을 만들려면:
@@ -541,7 +563,7 @@ docker-compose -f docker-compose.yml up
 - **SSE (Server-Sent Events)** - 비디오 처리 진행률
 - **aiorwlock** - 비동기 Reader-Writer Lock
 - **SQLAlchemy** - ORM (데이터베이스 추상화)
-- **SQLite** - 개발용 데이터베이스
+- **SQLite / MySQL** - 개발/운영 데이터베이스
 - **python-jose** - JWT 토큰 생성/검증
 - **bcrypt** - 비밀번호 해싱
 - **Pydantic** - 요청/응답 데이터 검증
@@ -584,6 +606,10 @@ HUGGINGFACE_HUB_TOKEN=your_huggingface_token_here
 # JWT 인증용 비밀 키 (Phase 2)
 # 랜덤 문자열 생성 권장
 SECRET_KEY=your_random_secret_key_here
+
+# DB 연결 (미설정 시 SQLite 사용)
+# DATABASE_URL=sqlite:///data/ebrcs.db
+# DATABASE_URL=mysql+pymysql://<USER>:<PASSWORD>@127.0.0.1:3306/item_db
 
 # 선택 사항
 # KMP_DUPLICATE_LIB_OK=TRUE  # macOS OpenMP 이슈 해결

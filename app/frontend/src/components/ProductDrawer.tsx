@@ -1,11 +1,17 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 
 interface ProductDrawerProps {
   isOpen: boolean;
   onClose: () => void;
   billingItems: Record<string, number>;
   itemScores: Record<string, number>;
+  itemUnitPrices: Record<string, number | null>;
+  itemLineTotals: Record<string, number>;
   totalCount: number;
+  totalAmount: number;
+  currency: string;
+  unpricedItems: string[];
 }
 
 export default function ProductDrawer({
@@ -13,14 +19,21 @@ export default function ProductDrawer({
   onClose,
   billingItems,
   itemScores,
+  itemUnitPrices,
+  itemLineTotals,
   totalCount,
+  totalAmount,
+  currency,
+  unpricedItems,
 }: ProductDrawerProps) {
+  const navigate = useNavigate();
   const [touchStart, setTouchStart] = useState(0);
   const [touchEnd, setTouchEnd] = useState(0);
 
   const entries = Object.entries(billingItems).sort(([a], [b]) =>
     a.localeCompare(b),
   );
+  const formatAmount = (value: number) => `₩${value.toLocaleString("ko-KR")}`;
 
   // Swipe down to close
   const handleTouchStart = (e: React.TouchEvent) => {
@@ -118,11 +131,19 @@ export default function ProductDrawer({
                       </span>
                     </div>
                     <p className="text-xs text-[var(--color-text-secondary)]">
+                      단가: {itemUnitPrices[name] == null ? "미확인" : formatAmount(itemUnitPrices[name] as number)}
+                    </p>
+                    <p className="text-xs text-[var(--color-text-secondary)]">
                       유사도: {(itemScores[name] ?? 0).toFixed(3)}
                     </p>
                   </div>
-                  <div className="w-10 h-10 rounded-full bg-[var(--color-primary)] text-white flex items-center justify-center font-bold">
-                    {qty}
+                  <div className="text-right">
+                    <p className="text-sm font-bold text-[var(--color-text)]">
+                      {formatAmount(itemLineTotals[name] ?? 0)}
+                    </p>
+                    <div className="w-10 h-10 mt-1 rounded-full bg-[var(--color-primary)] text-white flex items-center justify-center font-bold ml-auto">
+                      {qty}
+                    </div>
                   </div>
                 </div>
               ))}
@@ -132,6 +153,24 @@ export default function ProductDrawer({
 
         {/* Footer */}
         <div className="p-4 border-t border-[var(--color-border)] bg-gray-50">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-medium text-[var(--color-text)]">
+              예상 결제금액
+            </span>
+            <span className="text-xl font-bold text-[var(--color-primary)]">
+              {formatAmount(totalAmount)}
+            </span>
+          </div>
+          {currency !== "KRW" && (
+            <p className="text-xs text-[var(--color-text-secondary)] text-right mb-2">
+              통화: {currency}
+            </p>
+          )}
+          {unpricedItems.length > 0 && (
+            <p className="text-xs text-[var(--color-danger)] mb-2">
+              가격 미확인 {unpricedItems.length}개 품목
+            </p>
+          )}
           <div className="flex items-center justify-between">
             <span className="text-sm font-medium text-[var(--color-text)]">
               총 상품 수
@@ -140,6 +179,17 @@ export default function ProductDrawer({
               {totalCount}개
             </span>
           </div>
+          {totalCount > 0 && (
+            <button
+              onClick={() => {
+                onClose();
+                navigate("/validate");
+              }}
+              className="w-full mt-3 py-3 px-4 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white font-bold rounded-xl transition-colors"
+            >
+              영수증 확인
+            </button>
+          )}
         </div>
       </div>
     </>

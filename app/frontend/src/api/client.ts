@@ -53,6 +53,11 @@ export interface BillingState {
   billing_items: Record<string, number>;
   item_scores: Record<string, number>;
   total_count: number;
+  item_unit_prices: Record<string, number | null>;
+  item_line_totals: Record<string, number>;
+  total_amount: number;
+  currency: string;
+  unpriced_items: string[];
 }
 
 export function getBilling(sessionId: string): Promise<BillingState> {
@@ -71,7 +76,14 @@ export function updateBilling(
 }
 
 export function confirmBilling(sessionId: string) {
-  return request<{ status: string; confirmed_items: Record<string, number> }>(
+  return request<{
+    status: string;
+    confirmed_items: Record<string, number>;
+    confirmed_total: number;
+    confirmed_total_amount: number;
+    currency: string;
+    unpriced_items: string[];
+  }>(
     `/sessions/${sessionId}/billing/confirm`,
     { method: "POST" },
   );
@@ -188,6 +200,11 @@ export function getMe(token: string): Promise<User> {
 export interface PurchaseItem {
   name: string;
   count: number;
+  unit_price?: number | null;
+  line_total?: number;
+  currency?: string;
+  product_name?: string;
+  price_found?: boolean;
 }
 
 export interface Purchase {
