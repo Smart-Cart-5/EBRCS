@@ -11,7 +11,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: "http://localhost:8000",
+        target: "http://127.0.0.1:8000",
         changeOrigin: true,
         ws: true,
       },
@@ -22,7 +22,7 @@ export default defineConfig({
     host: '0.0.0.0',  // 외부 접속 허용
     proxy: {
       "/api": {
-        target: "http://localhost:8000",
+        target: "http://127.0.0.1:8000",
         changeOrigin: true,
         ws: true,
       },
