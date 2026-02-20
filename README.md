@@ -134,6 +134,8 @@ EBRCS/
 │   │   │   └── App.tsx
 │   │   ├── package.json
 │   │   └── vite.config.ts
+│   ├── setup_db.sh       # DB 스키마 초기화/검증
+│   ├── setup_all.sh      # 환경+DB 원샷 세팅
 │   ├── run_web.sh        # 개발 모드
 │   └── run_web_production.sh  # 프로덕션
 │
@@ -153,6 +155,15 @@ EBRCS/
 │   ├── 콜라/
 │   ├── 사이다/
 │   └── ...
+│
+├── db/                    # 가격 DB 시드(export/import) 스크립트
+│   ├── export_price_seed.sh
+│   ├── import_price_seed.sh
+│   ├── start_local_mysql.sh
+│   ├── stop_local_mysql.sh
+│   ├── docker-compose.mysql.yml
+│   ├── seeds/
+│   └── README.md
 │
 ├── generate_embeddings.py # 임베딩 DB 생성 스크립트
 ├── setup_aws_ec2.sh       # AWS EC2 자동 설정
@@ -274,8 +285,14 @@ source .venv/bin/activate
 cd app
 setup_venv.bat
 
-# 2. 개발 모드 실행
+# 2. DB 스키마 초기화/검증
+setup_db.bat
+
+# 3. 개발 모드 실행
 run_web.bat
+
+# (선택) 원샷 설정
+# setup_all.bat
 ```
 
 #### 🍎 macOS / 🐧 Linux
@@ -285,34 +302,81 @@ run_web.bat
 cd app
 ./setup_venv.sh
 
-# 2. 개발 모드 실행
+# 2. DB 스키마 초기화/검증
+./setup_db.sh
+
+# 3. 개발 모드 실행
 ./run_web.sh
+
+# (선택) 원샷 설정
+# ./setup_all.sh
 ```
 
 - **Frontend**: http://localhost:5173
 - **Backend API**: http://localhost:8000/docs
 
-#### DB 연결 설정 (SQLite / MySQL 선택)
+#### DB 연결 설정 (SQLite / MySQL / Docker MySQL)
 
-기본값은 SQLite(`data/ebrcs.db`)이며, `.env`에 `DATABASE_URL`을 설정하면 MySQL로 전환됩니다.
+기본값은 SQLite(`data/ebrcs.db`)이며, `.env`의 `DATABASE_URL`을 설정하면 MySQL로 전환됩니다.
 
-**🪟 Windows (.env)**
+`DATABASE_URL` 변경 후에는 스키마를 다시 맞춰주세요:
+
+**🪟 Windows**
+```cmd
+cd app
+setup_db.bat
+```
+
+**🍎 macOS / 🐧 Linux**
+```bash
+cd app
+./setup_db.sh
+```
+
+`.env` 예시:
+
 ```env
 # SQLite (기본)
 # DATABASE_URL=sqlite:///data/ebrcs.db
 
-# MySQL (운영 권장)
-DATABASE_URL=mysql+pymysql://<USER>:<PASSWORD>@127.0.0.1:3306/item_db
+# MySQL (운영/공유 DB)
+# DATABASE_URL=mysql+pymysql://<USER>:<PASSWORD>@127.0.0.1:3306/item_db
+
+# Docker 로컬 MySQL (권장)
+# DATABASE_URL=mysql+pymysql://ebrcs_app:ebrcs_pass@127.0.0.1:3307/item_db
 ```
 
-**🍎 macOS / 🐧 Linux (.env)**
-```env
-# SQLite (기본)
-# DATABASE_URL=sqlite:///data/ebrcs.db
+#### ✅ 가격 DB 협업 파이프라인 체크리스트
 
-# MySQL (운영 권장)
-DATABASE_URL=mysql+pymysql://<USER>:<PASSWORD>@127.0.0.1:3306/item_db
+- [ ] `app/setup_db`로 스키마 준비 (`users`, `purchase_history`, `products`, `product_prices`)
+- [ ] 운영 DB(EC2)에서 `./db/export_price_seed.sh`로 가격 시드 덤프 생성
+- [ ] 덤프 파일(`.sql`/`.sql.gz`)을 GitHub가 아닌 공유 스토리지로 전달
+- [ ] 각 개발자는 DB 타겟 선택
+- [ ] 시드 임포트: `./db/import_price_seed.sh --seed <seed_file>`
+- [ ] 검증: `cd app && ./setup_db.sh --check`
+- [ ] 실행: `cd app && ./run_web.sh`
+
+DB 타겟 선택:
+- EC2 공유 DB: EC2가 켜져 있어야 접속/가격계산 가능
+- 로컬 Docker MySQL: EC2 없이 독립 실행 가능
+
+로컬 Docker MySQL 시작:
+
+```bash
+./db/start_local_mysql.sh
 ```
+
+로컬 Docker MySQL 종료:
+
+```bash
+./db/stop_local_mysql.sh
+```
+
+GitHub 반영 시:
+- 포함: `app/setup_db*`, `app/backend/db_bootstrap.py`, `db/*.sh`, `db/docker-compose.mysql.yml`, `db/README.md`
+- 제외: `db/seeds/*.sql`, `db/seeds/*.sql.gz` (자동 ignore)
+
+자세한 절차는 `db/README.md` 참고.
 
 ### 3️⃣ 관리자 계정 생성
 
@@ -519,6 +583,7 @@ chmod +x setup_aws_ec2.sh
 
 ```bash
 cd ebrcs_streaming/app
+./setup_db.sh
 ./run_web_production.sh
 ```
 
@@ -610,6 +675,7 @@ SECRET_KEY=your_random_secret_key_here
 # DB 연결 (미설정 시 SQLite 사용)
 # DATABASE_URL=sqlite:///data/ebrcs.db
 # DATABASE_URL=mysql+pymysql://<USER>:<PASSWORD>@127.0.0.1:3306/item_db
+# DATABASE_URL=mysql+pymysql://ebrcs_app:ebrcs_pass@127.0.0.1:3307/item_db
 
 # 선택 사항
 # KMP_DUPLICATE_LIB_OK=TRUE  # macOS OpenMP 이슈 해결

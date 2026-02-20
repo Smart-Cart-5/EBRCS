@@ -50,3 +50,7 @@ data/ebrcs.db
 data/ebrcs.db-journal
 *.db
 *.db-journal
+
+# Generated DB seeds/dumps
+db/seeds/*
+!db/seeds/.gitkeep
