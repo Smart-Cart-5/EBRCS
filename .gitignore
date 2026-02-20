@@ -45,9 +45,7 @@ yarn-debug.log*
 app/frontend/dist/
 app/frontend/.vite/
 
-# Database
-data/ebrcs.db
-data/ebrcs.db-journal
+# Local DB artifacts
 *.db
 *.db-journal
 

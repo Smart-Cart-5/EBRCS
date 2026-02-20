@@ -1,1 +1,0 @@
-"""Mobile checkout pages."""

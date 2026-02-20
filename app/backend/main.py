@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-# --- Streamlit shim MUST be imported before checkout_core ---
+# --- checkout_core shim MUST be imported before checkout_core ---
 import backend.st_shim  # noqa: F401
 
 from backend import config

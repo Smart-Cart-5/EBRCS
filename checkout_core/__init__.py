@@ -1,1 +1,1 @@
-"""Core checkout utilities shared across Streamlit pages."""
+"""Core checkout utilities shared across web checkout flows."""

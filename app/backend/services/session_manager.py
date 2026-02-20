@@ -1,7 +1,7 @@
 """Per-user checkout session management.
 
-Replaces Streamlit's st.session_state with an in-memory dict keyed by
-session UUID, each holding its own billing state, bg_subtractor, ROI, etc.
+Uses an in-memory dict keyed by session UUID, each holding its own billing
+state, bg_subtractor, ROI, etc.
 """
 
 from __future__ import annotations

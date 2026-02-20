@@ -7,25 +7,31 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from backend import config
+# MySQL-only policy: DATABASE_URL must be explicitly configured.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is required. "
+        "Example: mysql+pymysql://ebrcs_app:ebrcs_pass@127.0.0.1:3307/item_db"
+    )
 
-# Default to local SQLite. Set DATABASE_URL to switch to MySQL in production.
-DEFAULT_SQLITE_URL = f"sqlite:///{config.DATA_DIR}/ebrcs.db"
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_SQLITE_URL).strip()
-
-# SQLAlchemy expects driver-qualified MySQL URL.
-# Supports legacy mysql:// style in .env by normalizing to mysql+pymysql://.
+# SQLAlchemy expects driver-qualified URL for PyMySQL.
+# Support legacy mysql:// style by normalizing to mysql+pymysql://.
 if DATABASE_URL.startswith("mysql://"):
     DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
+elif DATABASE_URL.startswith("mariadb://"):
+    DATABASE_URL = DATABASE_URL.replace("mariadb://", "mysql+pymysql://", 1)
+
+if not DATABASE_URL.startswith("mysql+pymysql://"):
+    raise RuntimeError(
+        "Unsupported DATABASE_URL backend. "
+        "Use mysql+pymysql://<USER>:<PASSWORD>@<HOST>:<PORT>/<DB_NAME>"
+    )
 
 engine_kwargs: dict = {
     "echo": False,  # Set to True for SQL debugging
     "pool_pre_ping": True,  # Reconnect stale DB connections safely
 }
-
-if DATABASE_URL.startswith("sqlite"):
-    # SQLite needs single-thread check override in FastAPI context.
-    engine_kwargs["connect_args"] = {"check_same_thread": False}
 
 # Create engine
 engine = create_engine(DATABASE_URL, **engine_kwargs)

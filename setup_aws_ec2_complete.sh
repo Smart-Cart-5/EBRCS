@@ -76,8 +76,9 @@ if [ ! -f .env ]; then
     cat > .env <<EOF
 HF_TOKEN=your_huggingface_token_here
 HUGGINGFACE_HUB_TOKEN=your_huggingface_token_here
+DATABASE_URL=mysql+pymysql://<USER>:<PASSWORD>@<HOST>:3306/item_db
 EOF
-    echo "⚠️  .env 파일이 생성되었습니다. HF_TOKEN을 나중에 설정하세요!"
+    echo "⚠️  .env 파일이 생성되었습니다. HF_TOKEN, DATABASE_URL을 나중에 설정하세요!"
 fi
 
 # 13. data 폴더 확인 및 심볼릭 링크
@@ -93,8 +94,6 @@ echo "🔧 실행 스크립트 권한 설정 중..."
 chmod +x app/run_web.sh
 chmod +x app/run_web_production.sh
 chmod +x app/stop_web.sh
-chmod +x streamlit/run.sh 2>/dev/null || true
-chmod +x streamlit/run_mobile.sh 2>/dev/null || true
 
 # 15. Nginx 설치 및 설정
 echo "🌐 Nginx 설치 및 설정 중..."

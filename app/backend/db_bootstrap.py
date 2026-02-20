@@ -24,11 +24,21 @@ MYSQL_SCHEMA_STATEMENTS = (
         item_no VARCHAR(64) NOT NULL,
         barcd VARCHAR(64) NULL,
         product_name VARCHAR(255) NOT NULL,
+        maker_name VARCHAR(255) NULL,
+        capacity VARCHAR(64) NULL,
+        lcls_name VARCHAR(128) NULL,
+        mcls_name VARCHAR(128) NULL,
+        scls_name VARCHAR(128) NULL,
+        nutri_json LONGTEXT NULL,
+        meta_xml_path TEXT NULL,
+        match_key_type VARCHAR(32) NULL,
+        match_key_value VARCHAR(255) NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
         INDEX idx_products_item_no (item_no),
-        INDEX idx_products_name (product_name)
+        INDEX idx_products_name (product_name),
+        INDEX idx_products_barcd (barcd)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
     """
@@ -39,6 +49,10 @@ MYSQL_SCHEMA_STATEMENTS = (
         currency VARCHAR(8) NOT NULL DEFAULT 'KRW',
         source VARCHAR(128) NULL,
         checked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        match_key_type VARCHAR(32) NULL,
+        match_key_value VARCHAR(255) NULL,
+        mall_name VARCHAR(255) NULL,
+        product_title TEXT NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
         INDEX idx_product_prices_product_checked (product_id, checked_at),
@@ -49,42 +63,26 @@ MYSQL_SCHEMA_STATEMENTS = (
     """,
 )
 
-SQLITE_SCHEMA_STATEMENTS = (
-    """
-    CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_no TEXT NOT NULL,
-        barcd TEXT,
-        product_name TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_products_item_no
-    ON products (item_no)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_products_name
-    ON products (product_name)
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS product_prices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id INTEGER NOT NULL,
-        price INTEGER NOT NULL,
-        currency TEXT NOT NULL DEFAULT 'KRW',
-        source TEXT,
-        checked_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_product_prices_product_checked
-    ON product_prices (product_id, checked_at)
-    """,
-)
+# Backward-compatible columns for pre-existing DBs created with a minimal schema.
+MYSQL_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
+    "products": {
+        "maker_name": "VARCHAR(255) NULL",
+        "capacity": "VARCHAR(64) NULL",
+        "lcls_name": "VARCHAR(128) NULL",
+        "mcls_name": "VARCHAR(128) NULL",
+        "scls_name": "VARCHAR(128) NULL",
+        "nutri_json": "LONGTEXT NULL",
+        "meta_xml_path": "TEXT NULL",
+        "match_key_type": "VARCHAR(32) NULL",
+        "match_key_value": "VARCHAR(255) NULL",
+    },
+    "product_prices": {
+        "match_key_type": "VARCHAR(32) NULL",
+        "match_key_value": "VARCHAR(255) NULL",
+        "mall_name": "VARCHAR(255) NULL",
+        "product_title": "TEXT NULL",
+    },
+}
 
 
 def _load_env_file() -> None:
@@ -110,18 +108,19 @@ def _load_env_file() -> None:
 
 _load_env_file()
 
+# Import models first so Base.metadata includes users/purchase_history.
+from backend import models  # noqa: F401,E402
+
 # Import after .env load so DATABASE_URL is read correctly.
 from backend.database import Base, engine  # noqa: E402
 
 
 def _catalog_schema_statements(dialect: str) -> tuple[str, ...]:
-    if dialect == "sqlite":
-        return SQLITE_SCHEMA_STATEMENTS
     if dialect in {"mysql", "mariadb"}:
         return MYSQL_SCHEMA_STATEMENTS
     raise RuntimeError(
         f"Unsupported DB backend for bootstrap: {dialect}. "
-        "Use sqlite or mysql/mariadb."
+        "Use mysql/mariadb."
     )
 
 
@@ -135,6 +134,42 @@ def _missing_tables(found_tables: list[str]) -> list[str]:
     return [name for name in REQUIRED_TABLES if name not in found]
 
 
+def _ensure_compat_columns() -> None:
+    """Add seed-compatible columns for DBs bootstrapped with older minimal schema."""
+    compat_map = MYSQL_COMPAT_COLUMNS
+
+    with engine.begin() as conn:
+        current_db = conn.execute(text("SELECT DATABASE()")).scalar()
+        if not current_db:
+            return
+
+        rows = conn.execute(
+            text(
+                """
+                SELECT table_name, column_name
+                FROM information_schema.columns
+                WHERE table_schema = :schema_name
+                  AND table_name IN ('products', 'product_prices')
+                """
+            ),
+            {"schema_name": current_db},
+        ).all()
+        existing_map: dict[str, set[str]] = {}
+        for table_name, column_name in rows:
+            existing_map.setdefault(str(table_name), set()).add(str(column_name))
+
+        for table, columns in compat_map.items():
+            existing_cols = existing_map.get(table, set())
+            for column, ddl in columns.items():
+                if column in existing_cols:
+                    continue
+                conn.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{column}` {ddl}"))
+
+        # Older runs may have created products.nutri_json as JSON type; seed contains
+        # non-JSON payloads for some rows, so keep this column as LONGTEXT.
+        conn.execute(text("ALTER TABLE `products` MODIFY COLUMN `nutri_json` LONGTEXT NULL"))
+
+
 def bootstrap_database() -> dict[str, object]:
     """Create required tables without touching existing data."""
     Base.metadata.create_all(bind=engine)
@@ -143,10 +178,10 @@ def bootstrap_database() -> dict[str, object]:
     statements = _catalog_schema_statements(dialect)
 
     with engine.begin() as conn:
-        if dialect == "sqlite":
-            conn.execute(text("PRAGMA foreign_keys = ON"))
         for stmt in statements:
             conn.execute(text(stmt))
+
+    _ensure_compat_columns()
 
     tables = _inspect_tables()
     return {
