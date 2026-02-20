@@ -356,6 +356,26 @@ cd app
 - [ ] 검증: `cd app && ./setup_db.sh --check`
 - [ ] 실행: `cd app && ./run_web.sh`
 
+팀원 퀵스타트 (`price_seed_latest.sql.gz`만 전달받은 경우):
+
+```bash
+# 0) seed 파일 위치
+#    db/seeds/price_seed_latest.sql.gz
+
+# 1) 로컬 DB 실행 (Docker)
+./db/start_local_mysql.sh
+
+# 2) .env DATABASE_URL 설정
+# DATABASE_URL=mysql+pymysql://ebrcs_app:ebrcs_pass@127.0.0.1:3307/item_db
+
+# 3) 스키마 준비 + 시드 임포트
+cd app && ./setup_venv.sh && ./setup_db.sh && cd ..
+./db/import_price_seed.sh --seed ./db/seeds/price_seed_latest.sql.gz
+
+# 4) 실행
+cd app && ./run_web.sh
+```
+
 DB 타겟 선택:
 - EC2 공유 DB: EC2가 켜져 있어야 접속/가격계산 가능
 - 로컬 Docker MySQL: EC2 없이 독립 실행 가능
@@ -377,6 +397,7 @@ GitHub 반영 시:
 - 제외: `db/seeds/*.sql`, `db/seeds/*.sql.gz` (자동 ignore)
 
 자세한 절차는 `db/README.md` 참고.
+로컬 실행 파이프라인만 빠르게 보려면 `DB구축.md` 참고.
 
 ### 3️⃣ 관리자 계정 생성
 

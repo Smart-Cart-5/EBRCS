@@ -111,6 +111,8 @@ def _load_env_file() -> None:
 _load_env_file()
 
 # Import after .env load so DATABASE_URL is read correctly.
+# Ensure SQLAlchemy model metadata is registered before create_all().
+from backend import models  # noqa: F401,E402
 from backend.database import Base, engine  # noqa: E402
 
 

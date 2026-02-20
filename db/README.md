@@ -15,6 +15,19 @@
 - [ ] 선택한 DB에 `./db/import_price_seed.sh --seed <file>` 실행
 - [ ] `cd app && ./setup_db.sh --check`로 필수 테이블 확인 후 실행
 
+## 빠른 실행 (시드 파일만 받은 팀원)
+
+시드 파일을 아래 경로에 놓고 시작:
+- `db/seeds/price_seed_latest.sql.gz`
+
+```bash
+./db/start_local_mysql.sh
+# .env: DATABASE_URL=mysql+pymysql://ebrcs_app:ebrcs_pass@127.0.0.1:3307/item_db
+cd app && ./setup_venv.sh && ./setup_db.sh && cd ..
+./db/import_price_seed.sh --seed ./db/seeds/price_seed_latest.sql.gz
+cd app && ./run_web.sh
+```
+
 ## 1) 시드 내보내기 (운영 DB/EC2)
 
 ```bash
