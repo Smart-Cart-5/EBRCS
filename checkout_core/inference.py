@@ -210,7 +210,11 @@ class UltimateFusionModel(nn.Module):
 
 
 @st.cache_resource(show_spinner=False)
-def load_models(adapter_dir: str = "data"):
+def load_models(
+    adapter_dir: str = "data",
+    adapter_model_path: str | None = None,
+    use_adapter: bool = True,
+):
     device = _resolve_device()
     token = get_hf_token()
     use_amp = _env_flag("EMBEDDING_USE_AMP", True) and device.type == "cuda"
@@ -226,6 +230,17 @@ def load_models(adapter_dir: str = "data"):
                 logger.warning("Failed to set torch CPU threads: %s", exc)
 
     mode = _detect_data_mode(adapter_dir)
+
+    resolved_adapter_path = str(
+        adapter_model_path or os.path.join(adapter_dir, "adapter_model.safetensors")
+    )
+    adapter_exists = os.path.exists(resolved_adapter_path)
+    logger.info(
+        "Adapter runtime config: use_adapter=%s path=%s exists=%s",
+        use_adapter,
+        resolved_adapter_path,
+        adapter_exists,
+    )
 
     if mode == "fusion":
         logger.info("Loading UltimateFusionModel (DINOv3-Base timm + CLIP-Base)")
@@ -244,15 +259,14 @@ def load_models(adapter_dir: str = "data"):
         fusion_model = UltimateFusionModel(num_products, num_majors)
 
         # Load trained weights from safetensors
-        adapter_path = os.path.join(adapter_dir, "adapter_model.safetensors")
         weights_loaded = False
         weights_error = None
 
-        if os.path.exists(adapter_path):
+        if use_adapter and adapter_exists:
             try:
                 from safetensors.torch import load_file
 
-                state_dict = load_file(adapter_path)
+                state_dict = load_file(resolved_adapter_path)
 
                 # Direct load: safetensors keys match model keys exactly
                 # (dino.*, clip.*, bottleneck.*, product_head.*, major_head.*)
@@ -275,6 +289,22 @@ def load_models(adapter_dir: str = "data"):
             except Exception as exc:
                 weights_error = str(exc)
                 logger.warning("Failed to load fusion weights: %s", exc)
+        elif use_adapter and not adapter_exists:
+            logger.warning(
+                "Adapter requested but not found at %s; continuing without adapter.",
+                resolved_adapter_path,
+            )
+        else:
+            logger.info("Adapter disabled by USE_ADAPTER=false; using base fusion model.")
+
+        logger.info(
+            "Adapter status: enabled=%s found=%s loaded=%s applied=%s error=%s",
+            use_adapter,
+            adapter_exists,
+            weights_loaded,
+            weights_loaded,
+            weights_error or "",
+        )
 
         fusion_model.to(device).eval()
 
@@ -298,6 +328,12 @@ def load_models(adapter_dir: str = "data"):
             "clip_dim": 512,
             "lora_loaded": weights_loaded,
             "lora_error": weights_error,
+            "adapter_enabled": use_adapter,
+            "adapter_path": resolved_adapter_path,
+            "adapter_exists": adapter_exists,
+            "adapter_loaded": weights_loaded,
+            "adapter_applied": weights_loaded,
+            "adapter_error": weights_error,
             "product_map": cfg.get("product_id_to_name", {}),
         }
 
@@ -319,13 +355,29 @@ def load_models(adapter_dir: str = "data"):
 
         lora_loaded = False
         lora_error = None
-        adapter_path = os.path.join(adapter_dir, "adapter_model.safetensors")
-        if os.path.exists(adapter_path):
+        if use_adapter and adapter_exists:
             try:
                 dino_model = PeftModel.from_pretrained(dino_model, adapter_dir)
                 lora_loaded = True
             except Exception as exc:
                 lora_error = str(exc)
+                logger.warning("Failed to load LoRA adapter from %s: %s", resolved_adapter_path, exc)
+        elif use_adapter and not adapter_exists:
+            logger.warning(
+                "Adapter requested but not found at %s; continuing without adapter.",
+                resolved_adapter_path,
+            )
+        else:
+            logger.info("Adapter disabled by USE_ADAPTER=false; using base ensemble model.")
+
+        logger.info(
+            "Adapter status: enabled=%s found=%s loaded=%s applied=%s error=%s",
+            use_adapter,
+            adapter_exists,
+            lora_loaded,
+            lora_loaded,
+            lora_error or "",
+        )
 
         dino_model.to(device).eval()
 
@@ -352,6 +404,12 @@ def load_models(adapter_dir: str = "data"):
             "clip_dim": int(clip_dim),
             "lora_loaded": lora_loaded,
             "lora_error": lora_error,
+            "adapter_enabled": use_adapter,
+            "adapter_path": resolved_adapter_path,
+            "adapter_exists": adapter_exists,
+            "adapter_loaded": lora_loaded,
+            "adapter_applied": lora_loaded,
+            "adapter_error": lora_error,
         }
 
 

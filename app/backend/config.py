@@ -8,20 +8,38 @@ from pathlib import Path
 # Project root (parent of backend/)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Data directory (data2 = UltimateFusion model, data = original ensemble model)
-DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT.parent / "data2")))
+# Data directory (data = UltimateFusion model, data = original ensemble model)
+DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT.parent / "data")))
 
 # File paths
 EMBEDDINGS_PATH = str(DATA_DIR / "embeddings.npy")
 LABELS_PATH = str(DATA_DIR / "labels.npy")
 FAISS_INDEX_PATH = str(DATA_DIR / "faiss_index.bin")
+# Adapter (optional). If present, it should be loaded by the embedding runtime.
 ADAPTER_DIR = str(DATA_DIR)
+ADAPTER_MODEL_PATH = os.getenv(
+    "ADAPTER_MODEL_PATH", str(DATA_DIR / "adapter_model.safetensors")
+)
+USE_ADAPTER = os.getenv("USE_ADAPTER", "true").lower() == "true"
 
 # YOLO model (optional: if not found, falls back to background subtraction)
 _DEFAULT_YOLO_PATH = str(PROJECT_ROOT.parent / "smartcart_hand_yolo11_best_arg_best.pt")
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", _DEFAULT_YOLO_PATH)
 YOLO_CONF_THRESHOLD = float(os.getenv("YOLO_CONF_THRESHOLD", "0.5"))
 USE_YOLO = os.getenv("USE_YOLO", "true").lower() == "true"
+
+# Cart ROI segmentation (Roboflow semantic segmentation)
+# Guardrail flag for external API calls. User start mode remains primary.
+CART_ROI_ENABLED = os.getenv("CART_ROI_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+CART_ROI_EVERY_N_FRAMES = int(os.getenv("CART_ROI_EVERY_N_FRAMES", "10"))
+CART_ROI_DEBUG = os.getenv("CART_ROI_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "").strip()
+CART_ROI_DEBUG_DIR = os.getenv("CART_ROI_DEBUG_DIR", str(PROJECT_ROOT / "debug_cart_roi"))
+CART_ROI_CLASS_NAME = os.getenv("CART_ROI_CLASS_NAME", "cartline").strip()
+CART_ROI_CLASS_ALIASES = os.getenv(
+    "CART_ROI_CLASS_ALIASES",
+    "cartline,cart,shopping_cart,trolley",
+).strip()
 
 # Server
 CORS_ORIGINS: list[str] = os.getenv(
@@ -38,7 +56,10 @@ DETECT_EVERY_N_FRAMES = int(os.getenv("DETECT_EVERY_N_FRAMES", "6"))
 SEARCH_EVERY_N_FRAMES = int(os.getenv("SEARCH_EVERY_N_FRAMES", "10"))
 MIN_BOX_AREA_RATIO = float(os.getenv("MIN_BOX_AREA_RATIO", "0.05"))
 STABLE_FRAMES_FOR_SEARCH = int(os.getenv("STABLE_FRAMES_FOR_SEARCH", "5"))
-SEARCH_COOLDOWN_MS = int(os.getenv("SEARCH_COOLDOWN_MS", "600"))
+SEARCH_COOLDOWN_SEC = float(os.getenv("SEARCH_COOLDOWN_SEC", "1.0"))
+SEARCH_COOLDOWN_MS = int(
+    float(os.getenv("SEARCH_COOLDOWN_MS", str(int(SEARCH_COOLDOWN_SEC * 1000.0))))
+)
 SEARCH_COOLDOWN_MS_UNSTABLE = int(os.getenv("SEARCH_COOLDOWN_MS_UNSTABLE", "250"))
 SEARCH_COOLDOWN_MS_PRECONFIRM = int(os.getenv("SEARCH_COOLDOWN_MS_PRECONFIRM", "50"))
 SEARCH_POST_CONFIRM_WINDOW_MS = int(os.getenv("SEARCH_POST_CONFIRM_WINDOW_MS", "2500"))
@@ -54,7 +75,9 @@ MIN_SEARCH_AREA_RATIO = float(os.getenv("MIN_SEARCH_AREA_RATIO", "0.12"))
 MIN_CROP_SIZE = int(os.getenv("MIN_CROP_SIZE", "224"))
 SEARCH_CROP_MIN_SIDE = int(os.getenv("SEARCH_CROP_MIN_SIDE", "320"))
 SEARCH_CROP_PAD_RATIO = float(os.getenv("SEARCH_CROP_PAD_RATIO", "0.20"))
-SEARCH_CROP_MIN_SIDE_AFTER_EXPAND = int(os.getenv("SEARCH_CROP_MIN_SIDE_AFTER_EXPAND", "240"))
+SEARCH_CROP_MIN_SIDE_AFTER_EXPAND = int(
+    os.getenv("SEARCH_CROP_MIN_SIDE_AFTER_EXPAND", "240")
+)
 SEARCH_CROP_ASPECT_MIN = float(os.getenv("SEARCH_CROP_ASPECT_MIN", "0.5"))
 SEARCH_CROP_ASPECT_MAX = float(os.getenv("SEARCH_CROP_ASPECT_MAX", "2.0"))
 SEARCH_CROP_EDGE_PAD_RATIO = float(os.getenv("SEARCH_CROP_EDGE_PAD_RATIO", "0.02"))
@@ -72,7 +95,9 @@ MATCH_THRESHOLD = 0.62
 COUNT_COOLDOWN_SECONDS = 3.0  # 중복 방지: 동일 상품 3초 내 재카운트 방지
 ROI_CLEAR_FRAMES = 8
 STREAM_TARGET_WIDTH = 960  # Restored for better quality
-STREAM_SEND_IMAGES = os.getenv("STREAM_SEND_IMAGES", "false").lower() == "true"  # Send images in WebSocket responses (default: false, JSON only)
+STREAM_SEND_IMAGES = (
+    os.getenv("STREAM_SEND_IMAGES", "false").lower() == "true"
+)  # Send images in WebSocket responses (default: false, JSON only)
 CHECKOUT_QUEUE_MAXSIZE = int(os.getenv("CHECKOUT_QUEUE_MAXSIZE", "1"))
 FAISS_TOP_K = int(os.getenv("FAISS_TOP_K", "3"))
 VOTE_WINDOW_SIZE = int(os.getenv("VOTE_WINDOW_SIZE", "5"))
@@ -101,28 +126,44 @@ ENABLE_PROFILING = os.getenv("ENABLE_PROFILING", "false").lower() == "true"
 PROFILE_EVERY_N_FRAMES = int(os.getenv("PROFILE_EVERY_N_FRAMES", "30"))
 SEARCH_DEBUG_LOG = os.getenv("SEARCH_DEBUG_LOG", "false").lower() == "true"
 SEARCH_DEBUG_SAVE_CROP = os.getenv("SEARCH_DEBUG_SAVE_CROP", "false").lower() == "true"
-SEARCH_DEBUG_CROP_DIR = os.getenv("SEARCH_DEBUG_CROP_DIR", str(PROJECT_ROOT / "debug_crops"))
+SEARCH_DEBUG_CROP_DIR = os.getenv(
+    "SEARCH_DEBUG_CROP_DIR", str(PROJECT_ROOT / "debug_crops")
+)
 SEARCH_DEBUG_LOG_INTERVAL_MS = int(os.getenv("SEARCH_DEBUG_LOG_INTERVAL_MS", "5000"))
 SEARCH_DEBUG_SAVE_INTERVAL_MS = int(os.getenv("SEARCH_DEBUG_SAVE_INTERVAL_MS", "1000"))
 SEARCH_DEBUG_DB_NORM_SAMPLE = int(os.getenv("SEARCH_DEBUG_DB_NORM_SAMPLE", "2048"))
-SEARCH_DEBUG_SAVE_SEARCH_CROP = os.getenv("SEARCH_DEBUG_SAVE_SEARCH_CROP", "false").lower() == "true"
-SEARCH_DEBUG_SAVE_LOW_SCORE_THRESHOLD = float(os.getenv("SEARCH_DEBUG_SAVE_LOW_SCORE_THRESHOLD", "0.35"))
+SEARCH_DEBUG_SAVE_SEARCH_CROP = (
+    os.getenv("SEARCH_DEBUG_SAVE_SEARCH_CROP", "false").lower() == "true"
+)
+SEARCH_DEBUG_SAVE_LOW_SCORE_THRESHOLD = float(
+    os.getenv("SEARCH_DEBUG_SAVE_LOW_SCORE_THRESHOLD", "0.35")
+)
 SEARCH_DEBUG_SAVE_FRAME_IDS = os.getenv("SEARCH_DEBUG_SAVE_FRAME_IDS", "")
 UNKNOWN_SCORE_THRESHOLD = float(os.getenv("UNKNOWN_SCORE_THRESHOLD", "0.45"))
 UNKNOWN_GAP_THRESHOLD = float(os.getenv("UNKNOWN_GAP_THRESHOLD", "0.02"))
 STABLE_RESULT_FRAMES = int(os.getenv("STABLE_RESULT_FRAMES", "3"))
 HIGH_CONFIDENCE_THRESHOLD = float(os.getenv("HIGH_CONFIDENCE_THRESHOLD", "0.65"))
-HIGH_CONFIDENCE_THRESHOLD_OCCLUDED = float(os.getenv("HIGH_CONFIDENCE_THRESHOLD_OCCLUDED", "0.78"))
+HIGH_CONFIDENCE_THRESHOLD_OCCLUDED = float(
+    os.getenv("HIGH_CONFIDENCE_THRESHOLD_OCCLUDED", "0.78")
+)
 OCR_AMBIGUOUS_GAP_THRESHOLD = float(os.getenv("OCR_AMBIGUOUS_GAP_THRESHOLD", "0.02"))
-OCR_AMBIGUOUS_SCORE_THRESHOLD = float(os.getenv("OCR_AMBIGUOUS_SCORE_THRESHOLD", "0.50"))
+OCR_AMBIGUOUS_SCORE_THRESHOLD = float(
+    os.getenv("OCR_AMBIGUOUS_SCORE_THRESHOLD", "0.50")
+)
 OCR_RERANK_LAMBDA = float(os.getenv("OCR_RERANK_LAMBDA", "0.10"))
 OCR_RERANK_LAMBDA_OCCLUDED = float(os.getenv("OCR_RERANK_LAMBDA_OCCLUDED", "0.05"))
 OCR_LABEL_TOP_RATIO = float(os.getenv("OCR_LABEL_TOP_RATIO", "0.45"))
 OCR_MIN_TEXT_LENGTH = int(os.getenv("OCR_MIN_TEXT_LENGTH", "2"))
 OCR_MIN_CONFIDENCE = float(os.getenv("OCR_MIN_CONFIDENCE", "40.0"))
 OCR_SKIP_HAND_IOU_THRESHOLD = float(os.getenv("OCR_SKIP_HAND_IOU_THRESHOLD", "0.6"))
-OCR_USE_ADAPTIVE_THRESHOLD = os.getenv("OCR_USE_ADAPTIVE_THRESHOLD", "false").lower() == "true"
+OCR_USE_ADAPTIVE_THRESHOLD = (
+    os.getenv("OCR_USE_ADAPTIVE_THRESHOLD", "false").lower() == "true"
+)
 OCR_DEBUG_LOG = os.getenv("OCR_DEBUG_LOG", "true").lower() == "true"
-EMBEDDING_SELF_TEST_ENABLE = os.getenv("EMBEDDING_SELF_TEST_ENABLE", "true").lower() == "true"
+OCR_ENABLED = os.getenv("OCR_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
+OCR_COOLDOWN_SEC = float(os.getenv("OCR_COOLDOWN_SEC", "10"))
+EMBEDDING_SELF_TEST_ENABLE = (
+    os.getenv("EMBEDDING_SELF_TEST_ENABLE", "true").lower() == "true"
+)
 EMBEDDING_SELF_TEST_IMAGE_PATH = os.getenv("EMBEDDING_SELF_TEST_IMAGE_PATH", "")
 EMBEDDING_SELF_TEST_MIN_RAW = float(os.getenv("EMBEDDING_SELF_TEST_MIN_RAW", "0.75"))

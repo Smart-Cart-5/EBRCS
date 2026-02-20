@@ -124,7 +124,11 @@ async def lifespan(app: FastAPI):
     )
 
     logger.info("Loading AI models from %s ...", config.ADAPTER_DIR)
-    bundle = load_models(adapter_dir=config.ADAPTER_DIR)
+    bundle = load_models(
+        adapter_dir=config.ADAPTER_DIR,
+        adapter_model_path=config.ADAPTER_MODEL_PATH,
+        use_adapter=config.USE_ADAPTER,
+    )
     logger.info(
         "Embedding runtime: requested_device=%s resolved_device=%s torch.cuda.is_available=%s torch.version.cuda=%s cuda_device=%s use_amp=%s amp_dtype=%s torch_num_threads=%s",
         os.getenv("EMBEDDING_DEVICE", "auto"),
@@ -148,6 +152,25 @@ async def lifespan(app: FastAPI):
         bundle.get("mode", "unknown"),
         bundle.get("lora_loaded", False),
     )
+    logger.info(
+        "Adapter startup: enabled=%s path=%s found=%s loaded=%s applied=%s",
+        bundle.get("adapter_enabled", False),
+        bundle.get("adapter_path", ""),
+        bundle.get("adapter_exists", False),
+        bundle.get("adapter_loaded", False),
+        bundle.get("adapter_applied", False),
+    )
+    if bundle.get("adapter_enabled", False) and not bundle.get("adapter_exists", False):
+        logger.warning(
+            "Adapter enabled but adapter file is missing at %s. Runtime will continue with base model.",
+            bundle.get("adapter_path", ""),
+        )
+    if bundle.get("adapter_enabled", False) and bundle.get("adapter_exists", False) and not bundle.get("adapter_loaded", False):
+        logger.warning(
+            "Adapter file found but not loaded from %s. Runtime will continue with base model. error=%s",
+            bundle.get("adapter_path", ""),
+            bundle.get("adapter_error", ""),
+        )
 
     emb_mtime = os.path.getmtime(config.EMBEDDINGS_PATH)
     lbl_mtime = os.path.getmtime(config.LABELS_PATH)
@@ -163,6 +186,22 @@ async def lifespan(app: FastAPI):
 
     bundle["db_mode"] = db_mode
     bundle["db_dim"] = db_dim
+    runtime_mode = str(bundle.get("mode", "unknown"))
+    mismatch_likely = (
+        (runtime_mode == "fusion" and db_mode != "fusion")
+        or (runtime_mode == "ensemble" and db_mode == "fusion")
+    )
+    if mismatch_likely:
+        logger.warning(
+            "Embedding runtime/DB mismatch likely: runtime_mode=%s db_mode=%s db_dim=%s. "
+            "Current files may have been generated with different embedding settings. "
+            "Regenerate %s and %s (and keep labels.npy aligned) for consistent search results.",
+            runtime_mode,
+            db_mode,
+            db_dim,
+            config.EMBEDDINGS_PATH,
+            config.FAISS_INDEX_PATH,
+        )
 
     logger.info("Embedding DB loaded: %d entries", len(labels))
 
@@ -195,14 +234,62 @@ async def lifespan(app: FastAPI):
                 config.YOLO_MODEL_PATH,
             )
 
+    # Load cart ROI segmenter (optional, Roboflow semantic segmentation)
+    cart_roi_segmenter = None
+    cart_roi_available = False
+    cart_roi_unavailable_reason = None
+    guard_enabled = bool(getattr(config, "CART_ROI_ENABLED", True))
+    api_key = str(getattr(config, "ROBOFLOW_API_KEY", "")).strip()
+    if not guard_enabled:
+        cart_roi_unavailable_reason = "server_disabled"
+        logger.warning("Cart ROI external API calls disabled by CART_ROI_ENABLED=0")
+    elif not api_key:
+        cart_roi_unavailable_reason = "missing_api_key"
+        logger.warning("ROBOFLOW_API_KEY missing; auto ROI will fallback to no_roi")
+    else:
+        try:
+            from backend.roi import RoboflowCartSegmenter
+
+            cart_roi_segmenter = RoboflowCartSegmenter(
+                api_key=config.ROBOFLOW_API_KEY,
+                endpoint="smartcart-fd4z1",
+                version=4,
+                every_n_frames=config.CART_ROI_EVERY_N_FRAMES,
+                debug=config.CART_ROI_DEBUG,
+                debug_dir=config.CART_ROI_DEBUG_DIR,
+                target_class_name=config.CART_ROI_CLASS_NAME,
+                class_aliases=config.CART_ROI_CLASS_ALIASES,
+            )
+            cart_roi_available = True
+            logger.info(
+                "Cart ROI segmenter available: endpoint=%s version=%s every_n_frames=%d debug=%s target_class=%s",
+                "smartcart-fd4z1",
+                4,
+                int(config.CART_ROI_EVERY_N_FRAMES),
+                bool(config.CART_ROI_DEBUG),
+                str(config.CART_ROI_CLASS_NAME),
+            )
+        except Exception as exc:
+            cart_roi_unavailable_reason = f"init_error:{type(exc).__name__}"
+            logger.warning("Failed to initialize cart ROI segmenter; auto ROI will fallback: %s", exc)
+
     # Populate shared state
     app_state.model_bundle = bundle
     app_state.weighted_db = weighted_db
     app_state.labels = labels
     app_state.faiss_index = faiss_index
     app_state.yolo_detector = yolo_detector
+    app_state.cart_roi_segmenter = cart_roi_segmenter
+    app_state.cart_roi_available = bool(cart_roi_available)
+    app_state.cart_roi_unavailable_reason = cart_roi_unavailable_reason
     app_state.session_manager._ttl = config.SESSION_TTL_SECONDS
     app_state.session_manager._max_sessions = config.MAX_SESSIONS
+    logger.info(
+        "Runtime perf knobs: OCR_ENABLED=%s OCR_COOLDOWN_SEC=%.1f SEARCH_COOLDOWN_SEC=%.2f",
+        bool(getattr(config, "OCR_ENABLED", False)),
+        float(getattr(config, "OCR_COOLDOWN_SEC", 10.0)),
+        float(getattr(config, "SEARCH_COOLDOWN_SEC", float(getattr(config, "SEARCH_COOLDOWN_MS", 1000)) / 1000.0)),
+    )
 
     yield
 
@@ -231,6 +318,17 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     async def health():
+        active_phase = None
+        active_confirmed = False
+        try:
+            sessions = list(getattr(app_state.session_manager, "_sessions", {}).values())
+            if sessions:
+                s0 = sessions[0]
+                active_phase = str(s0.state.get("phase", ""))
+                active_confirmed = bool(s0.state.get("_cart_roi_confirmed", False))
+        except Exception:
+            active_phase = None
+            active_confirmed = False
         return {
             "status": "ok",
             "device": str(app_state.model_bundle.get("device", "unknown")),
@@ -240,6 +338,11 @@ def create_app() -> FastAPI:
             ),
             "active_sessions": app_state.session_manager.active_count,
             "yolo_loaded": app_state.yolo_detector is not None,
+            "cart_roi_enabled": app_state.cart_roi_segmenter is not None,
+            "cart_roi_available": bool(app_state.cart_roi_available),
+            "cart_roi_unavailable_reason": app_state.cart_roi_unavailable_reason,
+            "phase": active_phase,
+            "cart_roi_confirmed": active_confirmed,
         }
 
     # Serve frontend static files in production (Docker)

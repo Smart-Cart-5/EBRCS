@@ -1,22 +1,35 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
 import toast, { Toaster } from "react-hot-toast";
 import { useSessionStore, type TopKCandidate, type WsMessage } from "../stores/sessionStore";
-import { wsCheckoutUrl, uploadVideo, videoStatusUrl, setROI, setWarp, clearWarp, setWarpEnabled } from "../api/client";
+import {
+  wsCheckoutUrl,
+  uploadVideo,
+  videoStatusUrl,
+  setWarp,
+  clearWarp,
+  setWarpEnabled,
+  confirmROI,
+  retryROI,
+  getSessionState,
+  getHealth,
+  checkoutStart,
+} from "../api/client";
 import BillingPanel from "../components/BillingPanel";
 import StatusMetrics from "../components/StatusMetrics";
 import ProductDrawer from "../components/ProductDrawer";
 
 type Mode = "camera" | "upload";
 
-const DEFAULT_SEND_FPS = 8;
-const MIN_SEND_FPS = 5;
-const MAX_SEND_FPS = 12;
+const DEFAULT_SEND_FPS = 12;
+const MIN_SEND_FPS = 8;
+const MAX_SEND_FPS = 15;
 const DEFAULT_CAPTURE_WIDTH = 640;
 const DEFAULT_JPEG_QUALITY = 0.65;
 const DEFAULT_BUFFERED_AMOUNT_LIMIT = 512 * 1024;
+const ROI_GUIDE_IMAGE_URL = "/roi_guides/cart_reference.jpg";
 
 function getSendFps(): number {
-  const raw = Number(import.meta.env.VITE_WS_SEND_FPS);
+  const raw = Number(import.meta.env.VITE_SEND_FPS ?? import.meta.env.VITE_WS_SEND_FPS);
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_SEND_FPS;
   return Math.max(MIN_SEND_FPS, Math.min(MAX_SEND_FPS, Math.floor(raw)));
 }
@@ -42,6 +55,14 @@ export default function CheckoutPage() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [setupMode, setSetupMode] = useState(false);
   const [calibrationPoints, setCalibrationPoints] = useState<number[][]>([]);
+  const [confirmingRoi, setConfirmingRoi] = useState(false);
+  const [retryingRoi, setRetryingRoi] = useState(false);
+  const [showRoiModePrompt, setShowRoiModePrompt] = useState(false);
+  const [settingRoiMode, setSettingRoiMode] = useState(false);
+  const [availabilityLoading, setAvailabilityLoading] = useState(false);
+  const [startModalAvailable, setStartModalAvailable] = useState<boolean | null>(null);
+  const [startModalUnavailableReason, setStartModalUnavailableReason] = useState<string | null>(null);
+  const [roiCalibStartMs, setRoiCalibStartMs] = useState<number | null>(null);
   const [debugPanelOpen, setDebugPanelOpen] = useState(false);
   const [debugView, setDebugView] = useState<{
     sessionId: string | null;
@@ -61,6 +82,7 @@ export default function CheckoutPage() {
     sessionId,
     createSession,
     updateFromWsMessage,
+    setPhaseState,
     setBilling,
     billingItems,
     itemScores,
@@ -73,6 +95,16 @@ export default function CheckoutPage() {
     detectionBoxes,
     warpEnabled,
     warpPoints,
+    phase,
+    message,
+    cartRoiPendingPolygon,
+    cartRoiPendingRatio,
+    confirmEnabled,
+    retryEnabled,
+    cartRoiAutoEnabled,
+    checkoutStartMode,
+    cartRoiAvailable,
+    cartRoiUnavailableReason,
   } = useSessionStore();
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -88,27 +120,45 @@ export default function CheckoutPage() {
   const debugThrottleLastMsRef = useRef<number>(0);
   const debugThrottleTimerRef = useRef<number | null>(null);
   const pendingDebugViewRef = useRef<typeof debugView | null>(null);
+  const roiFeedbackTimerRef = useRef<number | null>(null);
+  const phaseRef = useRef<string>("IDLE");
+  const confirmEnabledRef = useRef<boolean>(false);
   const isDebugMode = (() => {
     if (typeof window === "undefined") return false;
     const params = new URLSearchParams(window.location.search);
     return params.get("debug") === "1";
   })();
+  const isCalibrating = phase === "ROI_CALIBRATING";
+  const isRunning = phase === "CHECKOUT_RUNNING";
 
-  // Ensure session exists and setup virtual ROI for entry-event mode
+  useEffect(() => {
+    phaseRef.current = phase;
+    confirmEnabledRef.current = confirmEnabled;
+  }, [phase, confirmEnabled]);
+
+  useEffect(() => {
+    if (isCalibrating && connected) {
+      const now = Date.now();
+      setRoiCalibStartMs(now);
+      toast("자동 ROI 분석 중입니다. 잠시 후 ROI 확인 버튼이 활성화됩니다.", {
+        icon: "🧭",
+        duration: 2500,
+      });
+      const t = window.setTimeout(() => {
+        toast("ROI 미리보기를 확인하고 OK를 눌러 진행하세요.", {
+          icon: "✅",
+          duration: 2500,
+        });
+      }, 3000);
+      return () => window.clearTimeout(t);
+    }
+    setRoiCalibStartMs(null);
+  }, [isCalibrating, connected]);
+
+  // Ensure session exists
   useEffect(() => {
     if (!sessionId) {
       createSession();
-    } else {
-      // Setup full-screen virtual ROI to enable entry-event mode
-      // This prevents counting the same object multiple times
-      setROI(sessionId, [
-        [0, 0],    // Top-left
-        [1, 0],    // Top-right
-        [1, 1],    // Bottom-right
-        [0, 1],    // Bottom-left
-      ]).catch((err) => {
-        console.warn("Failed to set virtual ROI:", err);
-      });
     }
   }, [sessionId, createSession]);
 
@@ -151,6 +201,10 @@ export default function CheckoutPage() {
       if (debugThrottleTimerRef.current !== null) {
         window.clearTimeout(debugThrottleTimerRef.current);
         debugThrottleTimerRef.current = null;
+      }
+      if (roiFeedbackTimerRef.current !== null) {
+        window.clearTimeout(roiFeedbackTimerRef.current);
+        roiFeedbackTimerRef.current = null;
       }
     };
   }, []);
@@ -197,6 +251,32 @@ export default function CheckoutPage() {
     await setWarpEnabled(sessionId, !warpEnabled);
   }, [sessionId, warpEnabled]);
 
+  const handleConfirmRoi = useCallback(async () => {
+    if (!sessionId || confirmingRoi) return;
+    try {
+      setConfirmingRoi(true);
+      await confirmROI(sessionId);
+      toast.success("ROI 확인 요청을 전송했습니다.");
+    } catch (error) {
+      toast.error(`ROI 확인 실패: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setConfirmingRoi(false);
+    }
+  }, [sessionId, confirmingRoi]);
+
+  const handleRetryRoi = useCallback(async () => {
+    if (!sessionId || retryingRoi) return;
+    try {
+      setRetryingRoi(true);
+      await retryROI(sessionId);
+      toast("ROI 재시도 요청됨", { icon: "🔄" });
+    } catch (error) {
+      toast.error(`ROI 재시도 실패: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setRetryingRoi(false);
+    }
+  }, [sessionId, retryingRoi]);
+
   const startCamera = useCallback(async () => {
     if (!sessionId) return;
 
@@ -224,6 +304,11 @@ export default function CheckoutPage() {
         ws.onopen = () => {
           clearTimeout(timeout);
           console.log("✅ WebSocket connected");
+          getSessionState(sessionId)
+            .then((s) => setPhaseState(s.phase, s.cart_roi_confirmed))
+            .catch(() => {
+              // Recovery endpoint is best-effort; WS payload will eventually sync state.
+            });
           resolve();
         };
         ws.onerror = (err) => {
@@ -241,8 +326,11 @@ export default function CheckoutPage() {
       ws.onmessage = (e) => {
         const data: WsMessage = JSON.parse(e.data);
         console.log("📥 Received state from backend", {
+          type: data.type,
+          phase: data.phase,
           has_frame: !!data.frame,
           has_roi: !!data.roi_polygon,
+          has_pending_roi: !!data.cart_roi_pending_polygon,
           total_count: data.total_count,
           last_label: data.last_label,
         });
@@ -386,9 +474,14 @@ export default function CheckoutPage() {
         const status = state.lastStatus;
         const activeWarpPoints = state.warpPoints;
         const activeWarpEnabled = state.warpEnabled;
+        const activePhase = state.phase;
+        const activePendingRoi = state.cartRoiPendingPolygon;
+        const activeConfirmedRoi = state.roiPolygon;
+        const activeRunning = activePhase === "CHECKOUT_RUNNING";
+        const activeCalibrating = activePhase === "ROI_CALIBRATING";
 
         // Draw YOLO detection bounding boxes
-        if (boxes && boxes.length > 0) {
+        if (activeRunning && boxes && boxes.length > 0) {
           boxes.forEach(detection => {
             const [x1, y1, x2, y2] = detection.box;
             const x = x1 * displayCanvas.width;
@@ -463,12 +556,12 @@ export default function CheckoutPage() {
         }
 
         // Draw ROI polygon overlay
-        if (roi && roi.length > 0) {
+        if (activeRunning && activeConfirmedRoi && activeConfirmedRoi.length > 0) {
           displayCtx.strokeStyle = 'rgb(0, 181, 255)';
           displayCtx.lineWidth = 2;
           displayCtx.beginPath();
 
-          roi.forEach((point, i) => {
+          activeConfirmedRoi.forEach((point, i) => {
             const x = point[0] * displayCanvas.width;
             const y = point[1] * displayCanvas.height;
             if (i === 0) {
@@ -482,8 +575,23 @@ export default function CheckoutPage() {
           displayCtx.stroke();
         }
 
+        // Draw pending ROI preview polygon during calibration.
+        if (activeCalibrating && activePendingRoi && activePendingRoi.length > 0) {
+          displayCtx.strokeStyle = "rgb(250, 204, 21)";
+          displayCtx.lineWidth = 3;
+          displayCtx.beginPath();
+          activePendingRoi.forEach((point, i) => {
+            const x = point[0] * displayCanvas.width;
+            const y = point[1] * displayCanvas.height;
+            if (i === 0) displayCtx.moveTo(x, y);
+            else displayCtx.lineTo(x, y);
+          });
+          displayCtx.closePath();
+          displayCtx.stroke();
+        }
+
         // Draw status text overlay (top-left)
-        if (label) {
+        if (activeRunning && label) {
           const text = `${label} (${score.toFixed(3)})`;
           displayCtx.font = 'bold 20px sans-serif';
 
@@ -497,7 +605,7 @@ export default function CheckoutPage() {
         }
 
         // Draw status indicator (bottom-left)
-        if (status) {
+        if (activeRunning && status) {
           displayCtx.font = '14px sans-serif';
           displayCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
           displayCtx.fillRect(10, displayCanvas.height - 30, 150, 20);
@@ -606,7 +714,76 @@ export default function CheckoutPage() {
       alert(`Failed to start camera: ${error instanceof Error ? error.message : String(error)}`);
       stopCamera();
     }
-  }, [sessionId, updateFromWsMessage]);
+  }, [sessionId, updateFromWsMessage, setPhaseState]);
+
+  const handleStartCameraClick = useCallback(() => {
+    if (!sessionId || isLoading) return;
+    setShowRoiModePrompt(true);
+    setAvailabilityLoading(true);
+    getHealth()
+      .then((h) => {
+        const obj = h as Record<string, unknown>;
+        setStartModalAvailable(Boolean(obj.cart_roi_available));
+        setStartModalUnavailableReason((obj.cart_roi_unavailable_reason as string | null) ?? null);
+      })
+      .catch(() => {
+        setStartModalAvailable(null);
+        setStartModalUnavailableReason("health_unreachable");
+      })
+      .finally(() => setAvailabilityLoading(false));
+  }, [sessionId, isLoading]);
+
+  const handleSelectRoiMode = useCallback(
+    async (enabled: boolean) => {
+      if (!sessionId || settingRoiMode) return;
+      try {
+        setSettingRoiMode(true);
+        if (enabled) {
+          toast("자동 ROI를 시작합니다. ROI 미리보기 확인 후 OK를 눌러주세요.", {
+            icon: "🧭",
+            duration: 2500,
+          });
+          if (roiFeedbackTimerRef.current !== null) {
+            window.clearTimeout(roiFeedbackTimerRef.current);
+            roiFeedbackTimerRef.current = null;
+          }
+          roiFeedbackTimerRef.current = window.setTimeout(() => {
+            const currentPhase = phaseRef.current;
+            if (currentPhase === "ROI_CALIBRATING") {
+              const ready = confirmEnabledRef.current;
+              toast(
+                ready
+                  ? "ROI 미리보기가 준비되었습니다. OK를 눌러 진행하세요."
+                  : "ROI를 분석 중입니다. 잠시 후 OK 버튼이 활성화됩니다.",
+                { icon: ready ? "✅" : "⏳", duration: 3000 },
+              );
+            } else if (currentPhase === "CHECKOUT_RUNNING") {
+              toast("자동 ROI를 건너뛰고 바로 체크아웃이 시작되었습니다.", {
+                icon: "ℹ️",
+                duration: 2500,
+              });
+            } else {
+              toast.error("자동 ROI 안내가 지연 중입니다. 잠시 후 다시 확인해 주세요.");
+            }
+          }, 3000);
+        }
+        const res = await checkoutStart(sessionId, enabled ? "auto_roi" : "no_roi");
+        setPhaseState(res.phase, false);
+        if (res.message) {
+          toast(res.message, { icon: res.effective_mode === "no_roi" ? "ℹ️" : "✅" });
+        }
+        setShowRoiModePrompt(false);
+        if (!connected) {
+          await startCamera();
+        }
+      } catch (error) {
+        toast.error(`ROI 모드 설정 실패: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        setSettingRoiMode(false);
+      }
+    },
+    [sessionId, settingRoiMode, setPhaseState, startCamera, connected],
+  );
 
   const stopCamera = useCallback(() => {
     wsRef.current?.close();
@@ -618,6 +795,7 @@ export default function CheckoutPage() {
     setConnected(false);
     setIsLoading(false);
     setLoadingMessage("");
+    setShowRoiModePrompt(false);
   }, []);
 
   // --- Upload mode ---
@@ -767,8 +945,64 @@ export default function CheckoutPage() {
                 {/* Live Badge */}
                 <div className="absolute top-3 left-3 md:top-4 md:left-4 bg-[var(--color-success)] text-white px-2 py-1 md:px-3 md:py-1 rounded-full text-xs md:text-sm font-semibold flex items-center gap-1.5 md:gap-2">
                   <span className="w-1.5 h-1.5 md:w-2 md:h-2 bg-white rounded-full animate-pulse" />
-                  Live
+                  {isCalibrating ? "ROI Calibrating" : isRunning ? "Checkout Running" : "Live"}
                 </div>
+                {isCalibrating && (
+                  <>
+                    <div className="absolute inset-0 z-10 pointer-events-none">
+                      <img
+                        src={ROI_GUIDE_IMAGE_URL}
+                        alt="Cart reference guide"
+                        className="w-full h-full object-contain opacity-30"
+                      />
+                      <div className="absolute inset-[14%] border-2 border-cyan-300/80 rounded-xl">
+                        <div className="absolute -top-1 -left-1 w-6 h-6 border-l-4 border-t-4 border-cyan-300 rounded-tl"></div>
+                        <div className="absolute -top-1 -right-1 w-6 h-6 border-r-4 border-t-4 border-cyan-300 rounded-tr"></div>
+                        <div className="absolute -bottom-1 -left-1 w-6 h-6 border-l-4 border-b-4 border-cyan-300 rounded-bl"></div>
+                        <div className="absolute -bottom-1 -right-1 w-6 h-6 border-r-4 border-b-4 border-cyan-300 rounded-br"></div>
+                      </div>
+                    </div>
+                    <div className="absolute inset-x-3 top-16 md:top-20 z-20 bg-black/70 backdrop-blur-sm rounded-xl p-3 text-white border border-yellow-400/40">
+                    <div className="font-semibold text-sm md:text-base">ROI 캘리브레이션 진행 중</div>
+                    <div className="text-xs md:text-sm text-white/90 mt-1">
+                      1) 핸드폰을 거치대에 고정해 주세요.
+                    </div>
+                    <div className="text-xs md:text-sm text-white/90 mt-1">
+                      2) 화면의 가이드 카트와 실제 카트가 겹치도록 각도를 맞춘 뒤 [확인]을 눌러주세요.
+                    </div>
+                    <div className="text-xs text-white/80 mt-1">
+                      {message ?? ""}
+                    </div>
+                    <div className="text-xs text-white/80 mt-1">
+                      preview_ready: {String(confirmEnabled)} | ratio: {cartRoiPendingRatio.toFixed(4)} | points: {cartRoiPendingPolygon?.length ?? 0}
+                      {roiCalibStartMs ? ` | elapsed: ${Math.max(0, Math.floor((Date.now() - roiCalibStartMs) / 1000))}s` : ""}
+                    </div>
+                    <div className="mt-3 flex gap-2">
+                      <button
+                        onClick={handleConfirmRoi}
+                        disabled={!confirmEnabled || confirmingRoi || retryingRoi}
+                        className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-semibold"
+                      >
+                        {confirmingRoi ? "확인 중..." : "OK"}
+                      </button>
+                      <button
+                        onClick={handleRetryRoi}
+                        disabled={!retryEnabled || confirmingRoi || retryingRoi}
+                        className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-semibold text-black"
+                      >
+                        {retryingRoi ? "재시도 중..." : "Retry"}
+                      </button>
+                      <button
+                        onClick={() => void handleSelectRoiMode(false)}
+                        disabled={settingRoiMode || confirmingRoi || retryingRoi}
+                        className="px-4 py-2 rounded-lg bg-slate-600 hover:bg-slate-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-semibold"
+                      >
+                        {settingRoiMode ? "전환 중..." : "자동 ROI 없이 시작"}
+                      </button>
+                    </div>
+                  </div>
+                  </>
+                )}
                 {/* Stop Button */}
                 <button
                   onClick={stopCamera}
@@ -791,8 +1025,8 @@ export default function CheckoutPage() {
                   </div>
                 )}
                 <button
-                  onClick={startCamera}
-                  disabled={isLoading}
+                  onClick={handleStartCameraClick}
+                  disabled={isLoading || !sessionId}
                   className="px-5 py-2.5 md:px-6 md:py-3 bg-[var(--color-success)] hover:bg-[var(--color-success-hover)] text-white rounded-lg md:rounded-xl text-sm md:text-base font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-lg"
                 >
                   {isLoading ? "준비 중..." : "카메라 시작"}
@@ -826,34 +1060,91 @@ export default function CheckoutPage() {
               />
             </label>
           )}
+
+          {showRoiModePrompt && !connected && (
+            <div className="absolute inset-0 z-40 bg-black/70 backdrop-blur-[1px] flex items-center justify-center p-4">
+              <div className="w-full max-w-md rounded-2xl bg-slate-900 border border-white/20 p-5 text-white">
+                <div className="text-lg font-semibold">자동 ROI 사용 여부 선택</div>
+                <div className="text-sm text-white/80 mt-2">
+                  카메라 시작 전에 자동 ROI 캘리브레이션을 사용할지 선택하세요.
+                </div>
+                <div className="text-xs text-white/60 mt-1">
+                  현재 선택: {cartRoiAutoEnabled === null ? "미설정(기본값)" : cartRoiAutoEnabled ? "자동 ROI 사용" : "ROI 없이 진행"}
+                </div>
+                <div className="text-xs text-white/60 mt-1">
+                  자동 ROI 가능 여부:{" "}
+                  {availabilityLoading ? "확인 중..." : String(startModalAvailable ?? cartRoiAvailable)}{" "}
+                  {(startModalUnavailableReason ?? cartRoiUnavailableReason)
+                    ? `(${startModalUnavailableReason ?? cartRoiUnavailableReason})`
+                    : ""}
+                </div>
+                <div className="mt-4 grid grid-cols-1 gap-2">
+                  <button
+                    onClick={() => void handleSelectRoiMode(true)}
+                    disabled={settingRoiMode || availabilityLoading || (startModalAvailable === false)}
+                    title={
+                      startModalAvailable === false
+                        ? `자동 ROI 사용 불가: ${startModalUnavailableReason ?? cartRoiUnavailableReason ?? "unavailable"}`
+                        : ""
+                    }
+                    className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-semibold"
+                  >
+                    {settingRoiMode ? "설정 중..." : "자동 ROI 사용 (추천)"}
+                  </button>
+                  <button
+                    onClick={() => void handleSelectRoiMode(false)}
+                    disabled={settingRoiMode}
+                    className="px-4 py-2 rounded-lg bg-slate-600 hover:bg-slate-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-semibold"
+                  >
+                    ROI 없이 바로 시작
+                  </button>
+                </div>
+                <button
+                  onClick={() => setShowRoiModePrompt(false)}
+                  disabled={settingRoiMode}
+                  className="mt-3 text-xs text-white/70 hover:text-white disabled:opacity-50"
+                >
+                  닫기
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
       {/* Status + Product List - Desktop Only */}
       <div className="hidden lg:flex w-full lg:w-[420px] flex-col gap-3 md:gap-4">
         {/* Status Metrics */}
-        <StatusMetrics
-          lastLabel={lastLabel}
-          lastScore={lastScore}
-          lastStatus={lastStatus}
-          fps={undefined}
-        />
+        <div className={isRunning ? "" : "opacity-50 pointer-events-none"}>
+          <StatusMetrics
+            lastLabel={lastLabel}
+            lastScore={lastScore}
+            lastStatus={isRunning ? lastStatus : "대기"}
+            fps={undefined}
+          />
+        </div>
 
         {/* Product List */}
-        <div className="flex-1 min-h-0">
+        <div className={`flex-1 min-h-0 ${isRunning ? "" : "opacity-50 pointer-events-none"}`}>
           <BillingPanel
             billingItems={billingItems}
             itemScores={itemScores}
             totalCount={totalCount}
           />
         </div>
+        {!isRunning && (
+          <div className="rounded-xl bg-amber-500/20 border border-amber-400/40 text-amber-100 text-sm p-3">
+            {isCalibrating ? "ROI 캘리브레이션 완료 전까지 상품 추론/리스트 갱신이 정지됩니다." : "체크아웃 시작 대기 중입니다."}
+          </div>
+        )}
       </div>
     </div>
 
     {/* FAB (Floating Action Button) - Mobile Only */}
     <button
       onClick={() => setDrawerOpen(true)}
-      className="lg:hidden fixed bottom-20 right-4 w-16 h-16 bg-[var(--color-primary)] text-white rounded-full shadow-lg flex items-center justify-center z-30 active:scale-95 transition-transform"
+      disabled={!isRunning}
+      className="lg:hidden fixed bottom-20 right-4 w-16 h-16 bg-[var(--color-primary)] text-white rounded-full shadow-lg flex items-center justify-center z-30 active:scale-95 transition-transform disabled:opacity-40 disabled:cursor-not-allowed"
     >
       <div className="relative">
         <span className="text-2xl">🛒</span>

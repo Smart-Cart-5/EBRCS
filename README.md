@@ -129,6 +129,20 @@ EBRCS_streaming/
 
 자세한 구조는 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) 참고
 
+## 🧭 ROI 캘리브레이션 플로우 (웹앱)
+
+ROI 캘리브레이션 기반 체크아웃 플로우와 WS payload 규격(좌표계 포함)은 아래 문서를 참고하세요.
+
+- [docs/ROI_CALIBRATION_FLOW.md](docs/ROI_CALIBRATION_FLOW.md)
+- 자동 ROI 가이드 참조 이미지(프론트 고정 경로):
+  - `app/frontend/public/roi_guides/cart_reference.jpg`
+  - 런타임 URL: `/roi_guides/cart_reference.jpg`
+  - 교체 방법: 같은 파일명으로 이미지를 덮어쓰기하면 즉시 반영됩니다.
+- 자동 ROI 세그멘테이션 클래스 설정:
+  - 기본 타깃 클래스: `cartline`
+  - 환경변수: `CART_ROI_CLASS_NAME` (default `cartline`)
+  - 환경변수: `CART_ROI_CLASS_ALIASES` (default `cartline,cart,shopping_cart,trolley`)
+
 ---
 
 ## 🚀 시작하기

@@ -32,6 +32,12 @@ export interface ROIResponse {
   num_vertices: number;
 }
 
+export interface ROICalibrationResponse {
+  phase: string;
+  confirmed: boolean;
+  has_pending_mask: boolean;
+}
+
 export function setROI(
   sessionId: string,
   points: number[][],
@@ -45,6 +51,66 @@ export function setROI(
 
 export function clearROI(sessionId: string): Promise<void> {
   return request(`/sessions/${sessionId}/roi`, { method: "DELETE" });
+}
+
+export function confirmROI(sessionId: string): Promise<ROICalibrationResponse> {
+  return request(`/sessions/${sessionId}/roi/confirm`, { method: "POST" });
+}
+
+export function retryROI(sessionId: string): Promise<ROICalibrationResponse> {
+  return request(`/sessions/${sessionId}/roi/retry`, { method: "POST" });
+}
+
+export interface SessionStateResponse {
+  session_id: string;
+  phase: string;
+  cart_roi_confirmed: boolean;
+  cart_roi_preview_ready: boolean;
+  cart_roi_pending_polygon: number[][] | null;
+  cart_roi_pending_ratio: number;
+  cart_roi_auto_enabled: boolean | null;
+  checkout_start_mode: string | null;
+  cart_roi_available: boolean;
+  cart_roi_unavailable_reason: string | null;
+  last_roi_error: string | null;
+  cart_roi_invalid_reason: string | null;
+}
+
+export function getSessionState(sessionId: string): Promise<SessionStateResponse> {
+  return request(`/sessions/${sessionId}/state`);
+}
+
+export interface ROIModeResponse {
+  session_id: string;
+  cart_roi_auto_enabled: boolean;
+  phase: string;
+}
+
+export function setROIMode(sessionId: string, enabled: boolean): Promise<ROIModeResponse> {
+  return request(`/sessions/${sessionId}/roi/mode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export interface CheckoutStartResponse {
+  session_id: string;
+  requested_mode: "auto_roi" | "no_roi";
+  effective_mode: "auto_roi" | "no_roi";
+  phase: string;
+  message: string | null;
+}
+
+export function checkoutStart(
+  sessionId: string,
+  mode: "auto_roi" | "no_roi",
+): Promise<CheckoutStartResponse> {
+  return request(`/sessions/${sessionId}/checkout/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
 }
 
 export interface WarpResponse {

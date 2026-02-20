@@ -30,6 +30,9 @@ class AppState:
     labels: np.ndarray | None = None
     faiss_index: faiss.IndexFlatIP | None = None
     yolo_detector: Any | None = None  # Optional YOLO detector for object detection
+    cart_roi_segmenter: Any | None = None  # Optional cart ROI segmenter (Roboflow)
+    cart_roi_available: bool = False
+    cart_roi_unavailable_reason: str | None = None
 
     # RWLock: allows multiple readers OR single writer
     index_rwlock: RWLock = field(default_factory=RWLock)

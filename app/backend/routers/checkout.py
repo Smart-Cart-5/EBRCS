@@ -22,7 +22,11 @@ from starlette.websockets import WebSocketState
 from backend import config
 from backend.dependencies import app_state
 from backend.roi_warp import warp_frame
-from backend.services.session_manager import CheckoutSession
+from backend.services.session_manager import (
+    CheckoutSession,
+    PHASE_CHECKOUT_RUNNING,
+    PHASE_ROI_CALIBRATING,
+)
 from backend.utils.profiler import FrameProfiler, ProfileCollector
 
 logger = logging.getLogger("backend.checkout")
@@ -56,6 +60,156 @@ def _resize_frame(frame: np.ndarray, target_width: int = 960) -> np.ndarray:
     return cv2.resize(frame, (target_width, new_h), interpolation=cv2.INTER_AREA)
 
 
+def _mask_to_polygon_norm(mask01: np.ndarray) -> list[list[float]] | None:
+    if mask01 is None or mask01.ndim != 2:
+        return None
+    h, w = mask01.shape[:2]
+    if h <= 1 or w <= 1:
+        return None
+    bin255 = (mask01.astype(np.uint8) * 255).astype(np.uint8)
+    contours, _ = cv2.findContours(bin255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) <= 8.0:
+        return None
+    eps = 0.01 * cv2.arcLength(largest, True)
+    approx = cv2.approxPolyDP(largest, eps, True)
+    pts = approx.reshape(-1, 2)
+    if len(pts) < 3:
+        pts = largest.reshape(-1, 2)
+    poly: list[list[float]] = []
+    for x, y in pts:
+        xn = float(np.clip(float(x) / float(max(1, w - 1)), 0.0, 1.0))
+        yn = float(np.clip(float(y) / float(max(1, h - 1)), 0.0, 1.0))
+        poly.append([xn, yn])
+    return poly if len(poly) >= 3 else None
+
+
+def _build_state_snapshot(
+    *,
+    session: CheckoutSession,
+    session_id: str | None,
+    roi_polygon_normalized: Any,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    phase = str(session.state.get("phase", ""))
+    pending_ready = isinstance(session.state.get("_cart_roi_mask_pending"), np.ndarray)
+    message = None
+    user_message = session.state.get("_checkout_user_message")
+    if isinstance(user_message, str) and user_message.strip():
+        message = user_message.strip()
+    if phase == PHASE_ROI_CALIBRATING:
+        message = message or "ROI preview ready. Press OK to confirm or Retry."
+    confirm_enabled = bool(phase == PHASE_ROI_CALIBRATING and pending_ready)
+    retry_enabled = bool(phase == PHASE_ROI_CALIBRATING)
+    auto_mode = session.state.get("_cart_roi_auto_enabled")
+    checkout_start_mode = session.state.get("_checkout_start_mode")
+    state_snapshot = {
+        "type": "checkout_state",
+        "session_id": session_id,
+        "billing_items": dict(session.state["billing_items"]),
+        "item_scores": {k: round(v, 4) for k, v in session.state["item_scores"].items()},
+        "last_label": session.state["last_label"],
+        "last_score": round(session.state["last_score"], 4),
+        "last_status": session.state["last_status"],
+        "total_count": sum(session.state["billing_items"].values()),
+        "roi_polygon": roi_polygon_normalized,
+        "detection_boxes": session.state.get("detection_boxes", []),
+        "topk_candidates": session.state.get("topk_candidates", []),
+        "confidence": round(float(session.state.get("confidence", 0.0)), 4),
+        "best_pair": session.state.get("best_pair"),
+        "event_state": session.state.get("event_state"),
+        "occluded_by_hand": bool(session.state.get("occluded_by_hand", False)),
+        "overlap_hand_iou_max": round(float(session.state.get("overlap_hand_iou_max", 0.0)), 4),
+        "search_crop_min_side_before": session.state.get("search_crop_min_side_before"),
+        "search_crop_min_side_after": session.state.get("search_crop_min_side_after"),
+        "search_crop_padding_ratio": round(float(session.state.get("search_crop_padding_ratio", 0.0)), 4),
+        "ocr_used": bool(session.state.get("ocr_used", False)),
+        "ocr_attempted": bool(session.state.get("ocr_attempted", False)),
+        "ocr_error": session.state.get("ocr_error"),
+        "ocr_skip_reason": session.state.get("ocr_skip_reason"),
+        "ocr_text": str(session.state.get("ocr_text", "")),
+        "ocr_matched_keywords": session.state.get("ocr_matched_keywords", {}),
+        "ocr_text_score": round(float(session.state.get("ocr_text_score", 0.0)), 4),
+        "ocr_ms": round(float(session.state.get("ocr_ms", 0.0)), 2),
+        "ocr_ambiguous": bool(session.state.get("ocr_ambiguous", False)),
+        "ocr_chosen_slice": session.state.get("ocr_chosen_slice"),
+        "ocr_chosen_psm": session.state.get("ocr_chosen_psm"),
+        "ocr_chosen_thresh": session.state.get("ocr_chosen_thresh"),
+        "ocr_chosen_conf_cut": session.state.get("ocr_chosen_conf_cut"),
+        "ocr_chosen_lang": session.state.get("ocr_chosen_lang"),
+        "ocr_token_count": int(session.state.get("ocr_token_count", 0)),
+        "ocr_korean_char_count": int(session.state.get("ocr_korean_char_count", 0)),
+        "ocr_avg_conf": round(float(session.state.get("ocr_avg_conf", 0.0)), 3),
+        "ocr_reranked_topk": session.state.get("ocr_reranked_topk", []),
+        "did_search": bool(session.state.get("did_search", False)),
+        "skip_reason": str(session.state.get("skip_reason", "unknown")),
+        "result_label": session.state.get("result_label", session.state.get("last_label", "-")),
+        "is_unknown": bool(session.state.get("is_unknown", False)),
+        "match_score_raw": (
+            round(float(session.state["match_score_raw"]), 6)
+            if session.state.get("match_score_raw") is not None
+            else None
+        ),
+        "match_top2_raw": (
+            round(float(session.state["match_top2_raw"]), 6)
+            if session.state.get("match_top2_raw") is not None
+            else None
+        ),
+        "match_score_percent": (
+            round(float(session.state["match_score_percent"]), 3)
+            if session.state.get("match_score_percent") is not None
+            else None
+        ),
+        "match_gap": (
+            round(float(session.state["match_gap"]), 6)
+            if session.state.get("match_gap") is not None
+            else None
+        ),
+        "match_gap_reason": session.state.get("match_gap_reason"),
+        "gap_reason": session.state.get("match_gap_reason"),
+        "unknown_reason": session.state.get("unknown_reason"),
+        "last_result_name": session.state.get("last_result_name"),
+        "last_result_score": (
+            round(float(session.state["last_result_score"]), 4)
+            if session.state.get("last_result_score") is not None
+            else None
+        ),
+        "last_result_topk": session.state.get("last_result_topk", []),
+        "last_result_confidence": (
+            round(float(session.state["last_result_confidence"]), 4)
+            if session.state.get("last_result_confidence") is not None
+            else None
+        ),
+        "last_result_age_ms": (
+            max(0, int(time.time() * 1000) - int(session.state["last_result_at_ms"]))
+            if session.state.get("last_result_at_ms") is not None
+            else None
+        ),
+        "warp_enabled": bool(getattr(session, "warp_enabled", False)),
+        "warp_points": getattr(session, "warp_points_norm", None),
+        "phase": phase,
+        "message": message,
+        "cart_roi_confirmed": bool(session.state.get("_cart_roi_confirmed", False)),
+        "cart_roi_preview_ready": pending_ready,
+        "cart_roi_pending_polygon": session.state.get("_cart_roi_pending_polygon"),
+        "cart_roi_pending_ratio": round(float(session.state.get("_cart_roi_pending_ratio", 0.0)), 4),
+        "confirm_enabled": confirm_enabled,
+        "retry_enabled": retry_enabled,
+        "cart_roi_polygon_confirmed": roi_polygon_normalized,
+        "cart_roi_auto_enabled": auto_mode,
+        "checkout_start_mode": checkout_start_mode,
+        "cart_roi_available": bool(getattr(app_state, "cart_roi_available", False)),
+        "cart_roi_unavailable_reason": getattr(app_state, "cart_roi_unavailable_reason", None),
+        "last_roi_error": session.state.get("_cart_roi_last_error"),
+        "cart_roi_invalid_reason": session.state.get("_cart_roi_invalid_reason"),
+    }
+    if extra:
+        state_snapshot.update(extra)
+    return state_snapshot
+
+
 def _process_frame_sync(
     session: CheckoutSession,
     frame: np.ndarray,
@@ -65,6 +219,7 @@ def _process_frame_sync(
     faiss_index: Any,
     labels: np.ndarray,
     yolo_detector: Any = None,
+    cart_roi_segmenter: Any = None,
     ws_profiler: FrameProfiler | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Run one frame through the checkout pipeline (sync, for thread pool execution).
@@ -115,7 +270,155 @@ def _process_frame_sync(
     session.frame_count += 1
 
     # Get ROI polygon coordinates (normalized 0-1)
-    roi_polygon_normalized = session.roi_polygon if hasattr(session, 'roi_polygon') else None
+    roi_polygon_normalized = getattr(session, "roi_poly_norm", None)
+
+    auto_mode = session.state.get("_cart_roi_auto_enabled")
+    if isinstance(auto_mode, bool):
+        requires_calibration = bool(auto_mode and bool(getattr(app_state, "cart_roi_available", False)))
+    else:
+        requires_calibration = bool(getattr(app_state, "cart_roi_available", False))
+    prev_phase = str(session.state.get("phase", ""))
+    phase = session.start_checkout(require_roi_calibration=requires_calibration)
+    if phase != prev_phase:
+        logger.info(
+            "Session phase changed: session=%s frame_id=%s phase=%s confirmed=%s",
+            session_id,
+            frame_id,
+            phase,
+            bool(session.state.get("_cart_roi_confirmed", False)),
+        )
+    if phase == PHASE_ROI_CALIBRATING:
+        pending_mask = None
+        segmenter_error: str | None = None
+        if cart_roi_segmenter is not None:
+            try:
+                if ws_profiler is not None:
+                    with ws_profiler.measure("cart_roi_calibration"):
+                        pending_mask = cart_roi_segmenter.get_or_update_mask(
+                            frame_bgr=frame,
+                            frame_count=session.frame_count,
+                            frame_id=frame_id,
+                            session_id=session_id,
+                            state=session.state,
+                            mask_key="_cart_roi_mask_pending",
+                            last_update_key="_cart_roi_pending_last_update_frame",
+                        )
+                else:
+                    pending_mask = cart_roi_segmenter.get_or_update_mask(
+                        frame_bgr=frame,
+                        frame_count=session.frame_count,
+                        frame_id=frame_id,
+                        session_id=session_id,
+                        state=session.state,
+                            mask_key="_cart_roi_mask_pending",
+                            last_update_key="_cart_roi_pending_last_update_frame",
+                        )
+            except Exception:
+                segmenter_error = "segmenter_exception"
+                session.state["_cart_roi_last_error"] = segmenter_error
+                logger.exception("Cart ROI calibration update failed: session=%s frame_id=%s", session_id, frame_id)
+        else:
+            session.state["_cart_roi_last_error"] = "segmenter_unavailable"
+
+        display_frame = frame.copy()
+        pending_polygon = None
+        ratio = 0.0
+        preview_updated = False
+        preview_skip_reason: str | None = None
+        if isinstance(pending_mask, np.ndarray):
+            pending_polygon = _mask_to_polygon_norm(pending_mask)
+            ratio = float(np.count_nonzero(pending_mask)) / float(max(1, pending_mask.size))
+            now_ms = int(time.time() * 1000)
+            last_preview_ms = int(session.state.get("_cart_roi_preview_last_sent_ms", 0))
+            # Limit preview payload updates to ~4 FPS in calibration mode.
+            if now_ms - last_preview_ms >= 250:
+                session.state["_cart_roi_preview_last_sent_ms"] = now_ms
+                session.state["_cart_roi_pending_ratio"] = ratio
+                session.state["_cart_roi_pending_polygon"] = pending_polygon
+                preview_updated = True
+            else:
+                preview_skip_reason = "preview_rate_limited"
+            current_poly = session.state.get("_cart_roi_pending_polygon")
+            if isinstance(current_poly, list) and len(current_poly) >= 3:
+                h, w = pending_mask.shape[:2]
+                pts = np.array(
+                    [[int(round(p[0] * max(1, w - 1))), int(round(p[1] * max(1, h - 1)))] for p in current_poly],
+                    dtype=np.int32,
+                )
+                if len(pts) >= 3:
+                    cv2.polylines(display_frame, [pts], True, (0, 255, 255), 2)
+            display_frame[pending_mask > 0] = (
+                0.65 * display_frame[pending_mask > 0] + 0.35 * np.array([0, 255, 0])
+            ).astype(np.uint8)
+        else:
+            session.state["_cart_roi_pending_polygon"] = None
+            session.state["_cart_roi_pending_ratio"] = 0.0
+
+        confirm_enabled = bool(isinstance(pending_mask, np.ndarray))
+        invalid_reason: str | None = None
+        if not isinstance(pending_mask, np.ndarray):
+            invalid_reason = str(session.state.get("_cart_roi_last_error") or segmenter_error or "pending_mask_none")
+        elif pending_polygon is None or len(pending_polygon) < 3:
+            invalid_reason = "polygon_invalid"
+        elif ratio <= 0.0:
+            invalid_reason = "ratio_zero"
+        session.state["_cart_roi_invalid_reason"] = invalid_reason
+
+        now_ms = int(time.time() * 1000)
+        last_calib_log_ms = int(session.state.get("_cart_roi_calib_log_last_ms", 0))
+        if now_ms - last_calib_log_ms >= 1000:
+            session.state["_cart_roi_calib_log_last_ms"] = now_ms
+            seg_meta = session.state.get("_cart_roi_last_segmenter")
+            if not isinstance(seg_meta, dict):
+                seg_meta = {}
+            seg_status = str(seg_meta.get("status", "none"))
+            seg_skip_reason = str(seg_meta.get("skip_reason", "none"))
+            logger.info(
+                (
+                    "ROI_CALIBRATING debug: session=%s phase=%s frame_count=%s frame_id=%s "
+                    "segmenter=%s skip_reason=%s rf_ok=%s rf_latency_ms=%s "
+                    "preview_updated=%s preview_skip_reason=%s "
+                    "mask_shape=%s frame_shape=%s class_has_target=%s matched_class=%s class_map_values=%s target_id=%s "
+                    "ratio=%.4f polygon_points=%s confirm_enabled=%s invalid_reason=%s last_roi_error=%s"
+                ),
+                session_id,
+                phase,
+                int(session.frame_count),
+                frame_id,
+                seg_status,
+                seg_skip_reason,
+                bool(seg_meta.get("roboflow_response_ok", False)),
+                seg_meta.get("roboflow_latency_ms"),
+                preview_updated,
+                preview_skip_reason,
+                seg_meta.get("decoded_mask_shape"),
+                [int(frame.shape[0]), int(frame.shape[1])],
+                bool(seg_meta.get("class_map_has_target", False)),
+                seg_meta.get("matched_class_name"),
+                seg_meta.get("class_map_values_sample"),
+                seg_meta.get("target_id"),
+                float(ratio),
+                (len(pending_polygon) if isinstance(pending_polygon, list) else 0),
+                confirm_enabled,
+                invalid_reason,
+                session.state.get("_cart_roi_last_error"),
+            )
+
+        session.state["skip_reason"] = "roi_calibrating"
+        state_snapshot = _build_state_snapshot(
+            session=session,
+            session_id=session_id,
+            roi_polygon_normalized=roi_polygon_normalized,
+            extra={
+                "phase": PHASE_ROI_CALIBRATING,
+                "cart_roi_preview_ready": bool(isinstance(pending_mask, np.ndarray)),
+                "message": "ROI preview ready. Press OK to confirm or Retry.",
+            },
+        )
+        return display_frame, state_snapshot
+
+    if phase != PHASE_CHECKOUT_RUNNING:
+        session.force_checkout_running()
 
     # ROI polygon is computed on the same frame that YOLO sees:
     # - warp_applied=True: ROI is in warped-frame coordinates
@@ -169,92 +472,15 @@ def _process_frame_sync(
         warp_on=warp_applied,
         frame_profiler_override=ws_profiler,
         yolo_detector=yolo_detector,
+        cart_roi_segmenter=cart_roi_segmenter,
     )
 
-    state_snapshot = {
-        "billing_items": dict(session.state["billing_items"]),
-        "item_scores": {k: round(v, 4) for k, v in session.state["item_scores"].items()},
-        "last_label": session.state["last_label"],
-        "last_score": round(session.state["last_score"], 4),
-        "last_status": session.state["last_status"],
-        "total_count": sum(session.state["billing_items"].values()),
-        "roi_polygon": roi_polygon_normalized,  # Normalized coordinates for frontend
-        "detection_boxes": session.state.get("detection_boxes", []),  # YOLO detections
-        "topk_candidates": session.state.get("topk_candidates", []),
-        "confidence": round(float(session.state.get("confidence", 0.0)), 4),
-        "best_pair": session.state.get("best_pair"),
-        "event_state": session.state.get("event_state"),
-        "occluded_by_hand": bool(session.state.get("occluded_by_hand", False)),
-        "overlap_hand_iou_max": round(float(session.state.get("overlap_hand_iou_max", 0.0)), 4),
-        "search_crop_min_side_before": session.state.get("search_crop_min_side_before"),
-        "search_crop_min_side_after": session.state.get("search_crop_min_side_after"),
-        "search_crop_padding_ratio": round(float(session.state.get("search_crop_padding_ratio", 0.0)), 4),
-        "ocr_used": bool(session.state.get("ocr_used", False)),
-        "ocr_attempted": bool(session.state.get("ocr_attempted", False)),
-        "ocr_error": session.state.get("ocr_error"),
-        "ocr_skip_reason": session.state.get("ocr_skip_reason"),
-        "ocr_text": str(session.state.get("ocr_text", "")),
-        "ocr_matched_keywords": session.state.get("ocr_matched_keywords", {}),
-        "ocr_text_score": round(float(session.state.get("ocr_text_score", 0.0)), 4),
-        "ocr_ambiguous": bool(session.state.get("ocr_ambiguous", False)),
-        "ocr_chosen_slice": session.state.get("ocr_chosen_slice"),
-        "ocr_chosen_psm": session.state.get("ocr_chosen_psm"),
-        "ocr_chosen_thresh": session.state.get("ocr_chosen_thresh"),
-        "ocr_chosen_conf_cut": session.state.get("ocr_chosen_conf_cut"),
-        "ocr_chosen_lang": session.state.get("ocr_chosen_lang"),
-        "ocr_token_count": int(session.state.get("ocr_token_count", 0)),
-        "ocr_korean_char_count": int(session.state.get("ocr_korean_char_count", 0)),
-        "ocr_avg_conf": round(float(session.state.get("ocr_avg_conf", 0.0)), 3),
-        "ocr_reranked_topk": session.state.get("ocr_reranked_topk", []),
-        "did_search": bool(session.state.get("did_search", False)),
-        "skip_reason": str(session.state.get("skip_reason", "unknown")),
-        "result_label": session.state.get("result_label", session.state.get("last_label", "-")),
-        "is_unknown": bool(session.state.get("is_unknown", False)),
-        "match_score_raw": (
-            round(float(session.state["match_score_raw"]), 6)
-            if session.state.get("match_score_raw") is not None
-            else None
-        ),
-        "match_top2_raw": (
-            round(float(session.state["match_top2_raw"]), 6)
-            if session.state.get("match_top2_raw") is not None
-            else None
-        ),
-        # Similarity*100 scale for UI convenience (not model accuracy percentage).
-        "match_score_percent": (
-            round(float(session.state["match_score_percent"]), 3)
-            if session.state.get("match_score_percent") is not None
-            else None
-        ),
-        "match_gap": (
-            round(float(session.state["match_gap"]), 6)
-            if session.state.get("match_gap") is not None
-            else None
-        ),
-        "match_gap_reason": session.state.get("match_gap_reason"),
-        "gap_reason": session.state.get("match_gap_reason"),
-        "unknown_reason": session.state.get("unknown_reason"),
-        "last_result_name": session.state.get("last_result_name"),
-        "last_result_score": (
-            round(float(session.state["last_result_score"]), 4)
-            if session.state.get("last_result_score") is not None
-            else None
-        ),
-        "last_result_topk": session.state.get("last_result_topk", []),
-        "last_result_confidence": (
-            round(float(session.state["last_result_confidence"]), 4)
-            if session.state.get("last_result_confidence") is not None
-            else None
-        ),
-        "last_result_age_ms": (
-            max(0, int(time.time() * 1000) - int(session.state["last_result_at_ms"]))
-            if session.state.get("last_result_at_ms") is not None
-            else None
-        ),
-        "warp_enabled": bool(getattr(session, "warp_enabled", False)),
-        "warp_points": getattr(session, "warp_points_norm", None),
-    }
-
+    state_snapshot = _build_state_snapshot(
+        session=session,
+        session_id=session_id,
+        roi_polygon_normalized=roi_polygon_normalized,
+        extra={"phase": PHASE_CHECKOUT_RUNNING},
+    )
     return display_frame, state_snapshot
 
 
@@ -279,6 +505,7 @@ async def _process_frame(
         faiss_index = app_state.faiss_index
         labels = app_state.labels
         yolo_detector = app_state.yolo_detector
+        cart_roi_segmenter = app_state.cart_roi_segmenter
 
         # Run CPU/GPU-intensive work in thread pool
         return await loop.run_in_executor(
@@ -292,6 +519,7 @@ async def _process_frame(
             faiss_index,
             labels,
             yolo_detector,
+            cart_roi_segmenter,
             ws_profiler,
         )
 
@@ -319,7 +547,8 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
 
     # Latest-frame-only queue for minimum latency
     # Small queue + drop old frames = always process most recent frame
-    frame_queue_maxsize = max(1, int(config.CHECKOUT_QUEUE_MAXSIZE))
+    # Hard latest-frame-only behavior for low latency.
+    frame_queue_maxsize = 1
     frame_queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue(maxsize=frame_queue_maxsize)
     dropped_frames_total = 0
     recv_frame_seq = 0
@@ -353,7 +582,17 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
 
     async def process_loop():
         nonlocal dropped_frames_total
-        frame_times = []
+        interval_started = time.time()
+        interval_frames = 0
+        interval_dropped_start = dropped_frames_total
+        perf_acc = {
+            "yolo_ms": 0.0,
+            "embed_ms": 0.0,
+            "faiss_ms": 0.0,
+            "ocr_ms": 0.0,
+            "ws_ms": 0.0,
+            "total_ms": 0.0,
+        }
         ws_profiler_collector = ProfileCollector(
             kind="ws",
             enable=config.ENABLE_PROFILING,
@@ -424,18 +663,50 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
                     ws_frame_profiler.finish()
                     continue
 
-                # Log performance every 30 frames
+                # 1-second performance summary for fast bottleneck diagnosis.
                 frame_time = (time.time() - start_time) * 1000
-                frame_times.append(frame_time)
+                breakdown = dict(getattr(ws_frame_profiler, "breakdown_ms", {}) or {})
+                interval_frames += 1
+                perf_acc["yolo_ms"] += float(breakdown.get("yolo_infer", 0.0))
+                perf_acc["embed_ms"] += float(breakdown.get("embed", 0.0))
+                perf_acc["faiss_ms"] += float(breakdown.get("faiss", 0.0))
+                perf_acc["ocr_ms"] += float(breakdown.get("ocr", state_snapshot.get("ocr_ms", 0.0)))
+                perf_acc["ws_ms"] += float(breakdown.get("serialize_send", 0.0))
+                perf_acc["total_ms"] += float(frame_time)
                 ws_frame_profiler.finish()
-                if len(frame_times) >= 30:
-                    avg_time = sum(frame_times) / len(frame_times)
-                    fps = 1000 / avg_time if avg_time > 0 else 0
+                now = time.time()
+                elapsed = now - interval_started
+                if elapsed >= 1.0:
+                    avg_total = perf_acc["total_ms"] / max(1, interval_frames)
+                    fps = interval_frames / max(elapsed, 1e-6)
+                    dropped_interval = int(dropped_frames_total - interval_dropped_start)
+                    queue_depth = int(frame_queue.qsize())
                     logger.info(
-                        "Checkout performance: avg=%.1fms, fps=%.1f, dropped=%d",
-                        avg_time, fps, dropped_frames_total
+                        (
+                            "Checkout performance(%.1fs): session=%s fps=%.1f avg_ms=%.1f "
+                            "yolo_ms=%.1f embed_ms=%.1f faiss_ms=%.1f ocr_ms=%.1f ws_ms=%.1f total_ms=%.1f "
+                            "dropped=%d dropped_interval=%d queue_depth=%d ocr_attempted=%s"
+                        ),
+                        elapsed,
+                        session_id,
+                        fps,
+                        avg_total,
+                        perf_acc["yolo_ms"] / max(1, interval_frames),
+                        perf_acc["embed_ms"] / max(1, interval_frames),
+                        perf_acc["faiss_ms"] / max(1, interval_frames),
+                        perf_acc["ocr_ms"] / max(1, interval_frames),
+                        perf_acc["ws_ms"] / max(1, interval_frames),
+                        perf_acc["total_ms"] / max(1, interval_frames),
+                        int(dropped_frames_total),
+                        dropped_interval,
+                        queue_depth,
+                        bool(state_snapshot.get("ocr_attempted", False)),
                     )
-                    frame_times = []
+                    interval_started = now
+                    interval_frames = 0
+                    interval_dropped_start = dropped_frames_total
+                    for key in perf_acc:
+                        perf_acc[key] = 0.0
         except WebSocketDisconnect:
             pass
         except Exception:
@@ -502,6 +773,7 @@ async def _process_video_background(
     """Background task: process video frame-by-frame and update task status."""
     loop = asyncio.get_event_loop()
     task_status = _video_tasks[task_id]
+    session.force_checkout_running()
 
     try:
         cap = cv2.VideoCapture(video_path)

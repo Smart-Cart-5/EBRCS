@@ -4,6 +4,7 @@ from collections.abc import MutableMapping
 import logging
 import os
 import re
+import threading
 import time
 from typing import Any
 
@@ -31,6 +32,7 @@ except Exception:  # pragma: no cover - optional in non-backend contexts
 logger = logging.getLogger("checkout_core.frame_processor")
 _FRAME_PROFILER = None
 _OCR_LANG_CACHE: str | None = None
+_OCR_INFLIGHT_LOCK = threading.Lock()
 
 try:
     pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -375,6 +377,7 @@ def _apply_ocr_rerank_if_ambiguous(
     state: MutableMapping[str, Any],
     frame_id: int | None,
     session_id: str | None,
+    frame_profiler=None,
 ) -> list[dict[str, float]]:
     state["ocr_used"] = False
     state["ocr_attempted"] = False
@@ -393,6 +396,7 @@ def _apply_ocr_rerank_if_ambiguous(
     state["ocr_korean_char_count"] = 0
     state["ocr_avg_conf"] = 0.0
     state["ocr_reranked_topk"] = []
+    state["ocr_ms"] = 0.0
     state["ocr_chosen_slice"] = None
     state["ocr_chosen_psm"] = None
     state["ocr_chosen_thresh"] = None
@@ -421,9 +425,13 @@ def _apply_ocr_rerank_if_ambiguous(
     gap_th = float(getattr(backend_config, "OCR_AMBIGUOUS_GAP_THRESHOLD", 0.02))
     score_th = float(getattr(backend_config, "OCR_AMBIGUOUS_SCORE_THRESHOLD", 0.50))
     cup_like = _is_cup_category_label(top1_label) or (top2 is not None and _is_cup_category_label(str(top2.get("label", ""))))
-    ambiguous = bool((top2 is not None and gap is not None and gap < gap_th) or (top1_raw < score_th and cup_like))
+    ambiguous = bool(top2 is not None and gap is not None and gap < gap_th and cup_like and top1_raw < score_th)
     state["ocr_ambiguous"] = ambiguous
     crop_min_side_after = int(state.get("search_crop_min_side_after") or min(crop.shape[:2])) if crop is not None else 0
+    ocr_enabled = bool(getattr(backend_config, "OCR_ENABLED", False))
+    if not ocr_enabled:
+        state["ocr_skip_reason"] = "disabled"
+        return topk_candidates
     if not ambiguous:
         if bool(getattr(backend_config, "OCR_DEBUG_LOG", True)):
             logger.info(
@@ -458,6 +466,12 @@ def _apply_ocr_rerank_if_ambiguous(
         return topk_candidates
 
     occluded = bool(state.get("occluded_by_hand", False))
+    now_ms = int(time.time() * 1000)
+    cooldown_ms = max(0, int(float(getattr(backend_config, "OCR_COOLDOWN_SEC", 10.0)) * 1000.0))
+    last_ocr_ms = int(state.get("_ocr_last_run_ms", 0))
+    if cooldown_ms > 0 and (now_ms - last_ocr_ms) < cooldown_ms:
+        state["ocr_skip_reason"] = "cooldown"
+        return topk_candidates
     if crop_min_side_after < 240:
         state["ocr_skip_reason"] = "crop_too_small"
         if bool(getattr(backend_config, "OCR_DEBUG_LOG", True)):
@@ -493,11 +507,23 @@ def _apply_ocr_rerank_if_ambiguous(
             )
         return topk_candidates
 
-    ocr_result = run_ocr_hybrid(
-        crop,
-        frame_id=frame_id,
-        session_id=session_id,
-    )
+    if not _OCR_INFLIGHT_LOCK.acquire(blocking=False):
+        state["ocr_skip_reason"] = "in_flight"
+        return topk_candidates
+    ocr_started = time.perf_counter()
+    try:
+        ocr_result = run_ocr_hybrid(
+            crop,
+            frame_id=frame_id,
+            session_id=session_id,
+        )
+    finally:
+        _OCR_INFLIGHT_LOCK.release()
+    ocr_ms = (time.perf_counter() - ocr_started) * 1000.0
+    state["ocr_ms"] = float(ocr_ms)
+    state["_ocr_last_run_ms"] = now_ms
+    if frame_profiler is not None:
+        frame_profiler.add_ms("ocr", float(ocr_ms))
     state["ocr_attempted"] = bool(ocr_result.get("ocr_attempted", False))
     state["ocr_error"] = ocr_result.get("ocr_error")
     state["ocr_chosen_slice"] = ocr_result.get("chosen_slice")
@@ -860,6 +886,7 @@ def _match_with_voting(
             state=state,
             frame_id=frame_id,
             session_id=session_id,
+            frame_profiler=frame_profiler,
         )
         confidence = _compute_confidence(topk_candidates)
         state["topk_candidates"] = topk_candidates
@@ -973,6 +1000,7 @@ def _classify_snapshots_with_votes(
                 state=state,
                 frame_id=frame_id,
                 session_id=session_id,
+                frame_profiler=frame_profiler,
             )
         confidence = _compute_confidence(topk_candidates)
         if not topk_candidates:
@@ -1374,6 +1402,7 @@ def process_checkout_frame(
     warp_on: bool = False,
     frame_profiler_override=None,
     yolo_detector=None,
+    cart_roi_segmenter=None,
 ) -> np.ndarray:
     """Process a single frame and update checkout state in-place.
 
@@ -1397,6 +1426,9 @@ def process_checkout_frame(
     state["ocr_attempted"] = False
     state["ocr_error"] = None
     state["ocr_skip_reason"] = None
+    state["ocr_ms"] = 0.0
+    state["search_fast_path"] = False
+    state["search_fast_path_reason"] = None
     state["ocr_text"] = ""
     state["ocr_matched_keywords"] = {}
     state["ocr_text_score"] = 0.0
@@ -1468,11 +1500,16 @@ def process_checkout_frame(
             "too_wide": 0,
             "edge_touch": 0,
             "roi_out": 0,
+            "cart_roi_out": 0,
             "hand_conf_low": 0,
         }
         roi_eval_debug: list[dict[str, float | bool]] = []
         filtered_hands: list[dict[str, Any]] = []
         filtered_products: list[dict[str, Any]] = []
+        cart_roi_mask: np.ndarray | None = None
+        mask_candidate = state.get("_cart_roi_mask")
+        if isinstance(mask_candidate, np.ndarray) and mask_candidate.shape[:2] == frame.shape[:2]:
+            cart_roi_mask = mask_candidate
 
         for det in detections:
             cls = det.get("class")
@@ -1480,6 +1517,16 @@ def process_checkout_frame(
             box = det.get("box")
             if not isinstance(box, list) or len(box) != 4:
                 continue
+            x1, y1, x2, y2 = [float(v) for v in box]
+
+            if cart_roi_mask is not None:
+                cx_px = int(((x1 + x2) * 0.5) * frame_w)
+                cy_px = int(((y1 + y2) * 0.5) * frame_h)
+                cx_px = max(0, min(cx_px, frame_w - 1))
+                cy_px = max(0, min(cy_px, frame_h - 1))
+                if int(cart_roi_mask[cy_px, cx_px]) <= 0:
+                    reject_stats["cart_roi_out"] += 1
+                    continue
 
             if cls == "hand":
                 if conf < float(hand_conf_min):
@@ -1494,7 +1541,6 @@ def process_checkout_frame(
                 reject_stats["conf_low"] += 1
                 continue
 
-            x1, y1, x2, y2 = [float(v) for v in box]
             bw_px = max(0.0, (x2 - x1) * frame_w)
             bh_px = max(0.0, (y2 - y1) * frame_h)
             bbox_area_px = bw_px * bh_px
@@ -1886,7 +1932,11 @@ def process_checkout_frame(
             strong_cooldown_ms = max(0, int(search_cooldown_ms))
             confirmed_recently = last_confirmed_ms > 0 and (now_ms - last_confirmed_ms) <= post_confirm_window_ms
             cooldown_ms = strong_cooldown_ms if confirmed_recently else preconfirm_cooldown_ms
-            if now_ms - last_search_ms < cooldown_ms:
+            event_state = str(state.get("event_state", "IDLE"))
+            fast_path_event = event_state in {"GRASP", "PLACE_CHECK", "PICK_CHECK", "REMOVE_CHECK"}
+            fast_path_new_track = not (contiguous and iou_ok)
+            use_fast_path = bool(fast_path_event or fast_path_new_track)
+            if now_ms - last_search_ms < cooldown_ms and not use_fast_path:
                 state["skip_reason"] = "cooldown"
                 state["last_status"] = "쿨다운"
                 if bool(getattr(backend_config, "SEARCH_DEBUG_LOG", False)):
@@ -1903,6 +1953,9 @@ def process_checkout_frame(
                         confirmed_recently,
                         int(cooldown_ms),
                     )
+            elif use_fast_path:
+                state["search_fast_path"] = True
+                state["search_fast_path_reason"] = "event_candidate" if fast_path_event else "new_track"
             elif faiss_index is None or faiss_index.ntotal <= 0:
                 state["skip_reason"] = "faiss_unavailable"
                 state["last_status"] = "검색 불가"

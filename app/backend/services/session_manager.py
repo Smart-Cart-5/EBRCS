@@ -14,6 +14,10 @@ from typing import Any
 import cv2
 import numpy as np
 
+PHASE_IDLE = "IDLE"
+PHASE_ROI_CALIBRATING = "ROI_CALIBRATING"
+PHASE_CHECKOUT_RUNNING = "CHECKOUT_RUNNING"
+
 
 @dataclass
 class CheckoutSession:
@@ -77,6 +81,23 @@ class CheckoutSession:
         "last_status": "대기",
         "roi_occupied": False,
         "roi_empty_frames": 0,
+        "phase": PHASE_IDLE,
+        "_checkout_started": False,
+        "_cart_roi_confirmed": False,
+        "_cart_roi_mask": None,
+        "_cart_roi_last_update_frame": -1,
+        "_cart_roi_mask_pending": None,
+        "_cart_roi_pending_last_update_frame": -1,
+        "_cart_roi_pending_polygon": None,
+        "_cart_roi_pending_ratio": 0.0,
+        "_cart_roi_preview_last_sent_ms": 0,
+        "_cart_roi_auto_enabled": None,
+        "_checkout_start_mode": None,
+        "_checkout_user_message": None,
+        "_cart_roi_last_segmenter": None,
+        "_cart_roi_last_error": None,
+        "_cart_roi_invalid_reason": None,
+        "_cart_roi_calib_log_last_ms": 0,
     })
 
     # OpenCV background subtractor -- per-session, not serializable
@@ -160,10 +181,141 @@ class CheckoutSession:
         self.state["last_status"] = "대기"
         self.state["roi_occupied"] = False
         self.state["roi_empty_frames"] = 0
+        self.state["phase"] = PHASE_IDLE
+        self.state["_checkout_started"] = False
+        self.state["_cart_roi_confirmed"] = False
+        self.state["_cart_roi_mask"] = None
+        self.state["_cart_roi_last_update_frame"] = -1
+        self.state["_cart_roi_mask_pending"] = None
+        self.state["_cart_roi_pending_last_update_frame"] = -1
+        self.state["_cart_roi_pending_polygon"] = None
+        self.state["_cart_roi_pending_ratio"] = 0.0
+        self.state["_cart_roi_preview_last_sent_ms"] = 0
+        self.state["_cart_roi_auto_enabled"] = None
+        self.state["_checkout_start_mode"] = None
+        self.state["_checkout_user_message"] = None
+        self.state["_cart_roi_last_segmenter"] = None
+        self.state["_cart_roi_last_error"] = None
+        self.state["_cart_roi_invalid_reason"] = None
+        self.state["_cart_roi_calib_log_last_ms"] = 0
+        self.state.pop("_cart_roi_last_debug_save_ms", None)
         self.state.pop("_event_engine", None)
         self.state.pop("_snapshot_buffer", None)
         self.frame_count = 0
         self.bg_subtractor = cv2.createBackgroundSubtractorKNN(history=300)
+
+    def start_checkout(self, *, require_roi_calibration: bool) -> str:
+        if not bool(self.state.get("_checkout_started", False)):
+            self.state["_checkout_started"] = True
+            self.state["_cart_roi_confirmed"] = False
+            self.state["_cart_roi_mask_pending"] = None
+            self.state["_cart_roi_pending_last_update_frame"] = -1
+            self.state["_cart_roi_pending_polygon"] = None
+            self.state["_cart_roi_pending_ratio"] = 0.0
+            self.state["_cart_roi_preview_last_sent_ms"] = 0
+            self.state["phase"] = (
+                PHASE_ROI_CALIBRATING if require_roi_calibration else PHASE_CHECKOUT_RUNNING
+            )
+        return str(self.state.get("phase", PHASE_IDLE))
+
+    def confirm_pending_cart_roi(self) -> bool:
+        pending = self.state.get("_cart_roi_mask_pending")
+        if not isinstance(pending, np.ndarray):
+            return False
+        self.state["_cart_roi_mask"] = pending
+        self.state["_cart_roi_confirmed"] = True
+        self.state["phase"] = PHASE_CHECKOUT_RUNNING
+        self.state["_cart_roi_mask_pending"] = None
+        self.state["_cart_roi_pending_last_update_frame"] = -1
+        pending_polygon = self.state.get("_cart_roi_pending_polygon")
+        if isinstance(pending_polygon, list) and len(pending_polygon) >= 3:
+            self.roi_poly_norm = pending_polygon
+        self.state["_cart_roi_pending_polygon"] = None
+        self.state["_cart_roi_pending_ratio"] = 0.0
+        self.state["_cart_roi_preview_last_sent_ms"] = 0
+        return True
+
+    def retry_cart_roi(self) -> None:
+        self.state["_cart_roi_mask_pending"] = None
+        self.state["_cart_roi_pending_last_update_frame"] = -1
+        self.state["_cart_roi_pending_polygon"] = None
+        self.state["_cart_roi_pending_ratio"] = 0.0
+        self.state["_cart_roi_preview_last_sent_ms"] = 0
+        self.state["_cart_roi_confirmed"] = False
+        self.state["phase"] = PHASE_ROI_CALIBRATING
+
+    def force_checkout_running(self) -> None:
+        self.state["_checkout_started"] = True
+        self.state["phase"] = PHASE_CHECKOUT_RUNNING
+
+    def set_cart_roi_auto_enabled(self, enabled: bool) -> None:
+        self.state["_cart_roi_auto_enabled"] = bool(enabled)
+        self.state["_checkout_start_mode"] = "auto_roi" if bool(enabled) else "no_roi"
+        self.state["_checkout_user_message"] = None
+        self.state["_cart_roi_last_segmenter"] = None
+        self.state["_cart_roi_last_error"] = None
+        self.state["_cart_roi_invalid_reason"] = None
+        self.state["_cart_roi_calib_log_last_ms"] = 0
+        self.state["_checkout_started"] = False
+        self.state["phase"] = PHASE_IDLE
+        self.state["_cart_roi_confirmed"] = False
+        self.state["_cart_roi_mask"] = None
+        self.state["_cart_roi_last_update_frame"] = -1
+        self.state["_cart_roi_mask_pending"] = None
+        self.state["_cart_roi_pending_last_update_frame"] = -1
+        self.state["_cart_roi_pending_polygon"] = None
+        self.state["_cart_roi_pending_ratio"] = 0.0
+        self.state["_cart_roi_preview_last_sent_ms"] = 0
+        if bool(enabled):
+            # Auto ROI mode starts from fresh calibration result.
+            self.roi_poly_norm = None
+        else:
+            # Legacy behavior: keep inference running with full-frame ROI.
+            self.roi_poly_norm = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+
+    def start_checkout_with_mode(self, mode: str) -> str:
+        start_mode = "auto_roi" if str(mode) == "auto_roi" else "no_roi"
+        if start_mode == "auto_roi":
+            self.state["_cart_roi_auto_enabled"] = True
+            self.state["_checkout_start_mode"] = "auto_roi"
+            self.state["_checkout_user_message"] = None
+            self.state["_cart_roi_last_segmenter"] = None
+            self.state["_cart_roi_last_error"] = None
+            self.state["_cart_roi_invalid_reason"] = None
+            self.state["_cart_roi_calib_log_last_ms"] = 0
+            self.state["_checkout_started"] = True
+            self.state["phase"] = PHASE_ROI_CALIBRATING
+            self.state["_cart_roi_confirmed"] = False
+            self.state["_cart_roi_mask"] = None
+            self.state["_cart_roi_last_update_frame"] = -1
+            self.state["_cart_roi_mask_pending"] = None
+            self.state["_cart_roi_pending_last_update_frame"] = -1
+            self.state["_cart_roi_pending_polygon"] = None
+            self.state["_cart_roi_pending_ratio"] = 0.0
+            self.state["_cart_roi_preview_last_sent_ms"] = 0
+            self.roi_poly_norm = None
+            return PHASE_ROI_CALIBRATING
+
+        # no_roi start: preserve legacy full-frame ROI and run immediately.
+        self.state["_cart_roi_auto_enabled"] = False
+        self.state["_checkout_start_mode"] = "no_roi"
+        self.state["_checkout_user_message"] = None
+        self.state["_cart_roi_last_segmenter"] = None
+        self.state["_cart_roi_last_error"] = None
+        self.state["_cart_roi_invalid_reason"] = None
+        self.state["_cart_roi_calib_log_last_ms"] = 0
+        self.state["_checkout_started"] = True
+        self.state["phase"] = PHASE_CHECKOUT_RUNNING
+        self.state["_cart_roi_confirmed"] = False
+        self.state["_cart_roi_mask"] = None
+        self.state["_cart_roi_last_update_frame"] = -1
+        self.state["_cart_roi_mask_pending"] = None
+        self.state["_cart_roi_pending_last_update_frame"] = -1
+        self.state["_cart_roi_pending_polygon"] = None
+        self.state["_cart_roi_pending_ratio"] = 0.0
+        self.state["_cart_roi_preview_last_sent_ms"] = 0
+        self.roi_poly_norm = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+        return PHASE_CHECKOUT_RUNNING
 
     def get_roi_polygon(self, frame_shape: tuple[int, ...]) -> np.ndarray | None:
         """Convert normalized ROI to pixel coordinates for the given frame."""
