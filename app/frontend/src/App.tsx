@@ -8,6 +8,7 @@ import LoginPage from "./pages/LoginPage";
 import SignupPage from "./pages/SignupPage";
 import MyPage from "./pages/MyPage";
 import AdminPurchasesPage from "./pages/AdminPurchasesPage";
+import ChatbotWidget from "./components/ChatbotWidget";
 import { useAuthStore } from "./stores/authStore";
 
 // User menu items
@@ -225,6 +226,9 @@ export default function App() {
           })}
         </div>
       </nav>
+
+      {/* Chatbot Widget */}
+      <ChatbotWidget />
     </div>
   );
 }

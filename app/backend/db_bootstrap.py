@@ -56,6 +56,15 @@ SQLITE_SCHEMA_STATEMENTS = (
         item_no TEXT NOT NULL,
         barcd TEXT,
         product_name TEXT NOT NULL,
+        company TEXT,
+        volume TEXT,
+        category_l TEXT,
+        category_m TEXT,
+        category_s TEXT,
+        nutrition_info TEXT,
+        src_meta_xml TEXT,
+        dedup_key_type TEXT,
+        dedup_key TEXT,
         created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
         updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
     )
@@ -69,6 +78,14 @@ SQLITE_SCHEMA_STATEMENTS = (
     ON products (product_name)
     """,
     """
+    CREATE INDEX IF NOT EXISTS idx_products_category
+    ON products (category_l, category_m, category_s)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_products_company
+    ON products (company)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS product_prices (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         product_id INTEGER NOT NULL,
@@ -76,6 +93,10 @@ SQLITE_SCHEMA_STATEMENTS = (
         currency TEXT NOT NULL DEFAULT 'KRW',
         source TEXT,
         checked_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+        query_type TEXT,
+        query_value TEXT,
+        mall_name TEXT,
+        match_title TEXT,
         created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
         FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
     )

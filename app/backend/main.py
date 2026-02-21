@@ -21,7 +21,7 @@ import backend.st_shim  # noqa: F401
 from backend import config
 from backend.database import Base, engine
 from backend.dependencies import app_state
-from backend.routers import auth, billing, checkout, products, purchases, sessions
+from backend.routers import auth, billing, chatbot, checkout, products, purchases, sessions
 
 logger = logging.getLogger("backend")
 
@@ -98,6 +98,7 @@ def create_app() -> FastAPI:
     app.include_router(products.router, prefix="/api")
     app.include_router(purchases.router, prefix="/api")
     app.include_router(checkout.router, prefix="/api")
+    app.include_router(chatbot.router, prefix="/api")
 
     @app.get("/api/health")
     async def health():
