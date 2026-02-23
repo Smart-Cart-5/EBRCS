@@ -17,20 +17,25 @@
     └── ...
 """
 
+#!/usr/bin/env python3
 import os
-from pathlib import Path
-
-import cv2
-import numpy as np
-from tqdm import tqdm
-
-# Streamlit shim 먼저 import
 import sys
-sys.path.insert(0, str(Path(__file__).parent))
+import cv2  # 추가됨
+import numpy as np  # 추가됨
+from pathlib import Path
+from tqdm import tqdm  # 추가됨
+
+# 현재 파일 위치 기준 경로 계산
+current_file_path = Path(__file__).resolve()
+project_root = current_file_path.parent
+app_dir = project_root / "app"
+
+# 탐색 경로 추가
+sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(app_dir))
+
 import backend.st_shim  # noqa: F401
-
 from checkout_core.inference import load_models, extract_dino_embedding, extract_clip_embedding
-
 
 def generate_embeddings_db(
     images_dir: str = "product_images",
@@ -136,4 +141,14 @@ def generate_embeddings_db(
 
 
 if __name__ == "__main__":
-    generate_embeddings_db()
+    # 1. 실제 사진들이 들어있는 폴더의 '진짜' 경로로 수정합니다.
+    # 만약 프로젝트 최상단에 있다면 아래 경로가 맞을 확률이 높습니다.
+    real_images_path = r"D:\JQ\git\EBRCS\product_retrieval_embedding" 
+    
+    # 2. 결과물이 저장될 위치 (서버가 에러를 냈던 그 경로)
+    real_output_path = r"D:\JQ\git\EBRCS\app\data"
+    
+    generate_embeddings_db(
+        images_dir=real_images_path, 
+        output_dir=real_output_path
+    )

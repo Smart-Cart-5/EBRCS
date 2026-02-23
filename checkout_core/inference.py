@@ -88,7 +88,8 @@ def load_models(adapter_dir: str = "data"):
 
     dino_model.to(device).eval()
 
-    clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME, token=token)
+    # use_safetensors=True 옵션을 추가하여 보안 체크를 우회합니다.
+    clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME, token=token, use_safetensors=True)
     clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME, token=token)
     clip_model.to(device).eval()
 

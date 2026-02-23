@@ -43,28 +43,15 @@ def _process_frame_sync(
     faiss_index: Any,
     labels: np.ndarray,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Run one frame through the checkout pipeline (sync, for thread pool execution).
-
-    IMPORTANT: This function expects FAISS index snapshot to be passed in,
-    ensuring consistency during the entire frame processing.
-    """
+    """Run one frame through the checkout pipeline (sync, for thread pool execution)."""
     from checkout_core.frame_processor import process_checkout_frame
 
     frame = _resize_frame(frame, config.STREAM_TARGET_WIDTH)
     session.frame_count += 1
 
-    # Get ROI polygon coordinates (normalized 0-1)
     roi_polygon_normalized = session.roi_poly_norm or None
-
-    # Always run bg subtraction + centroid tracking on every frame.
-    # FAISS inference is gated inside process_checkout_frame by allow_inference
-    # (frame_count % DETECT_EVERY_N_FRAMES). Running every frame ensures
-    # centroid_history accumulates at full receive rate (~12 FPS) instead of
-    # only on inference frames (~4 FPS), enabling reliable direction detection
-    # even for fast swipes under 1 second.
     roi_poly = session.get_roi_polygon(frame.shape)
 
-    # Log tracking status on first inference frame
     use_tracking = config.USE_DEEPSORT and session.tracker is not None
     if session.frame_count == config.DETECT_EVERY_N_FRAMES:
         logger.info(
@@ -88,10 +75,10 @@ def _process_frame_sync(
         roi_poly=roi_poly,
         roi_clear_frames=config.ROI_CLEAR_FRAMES,
         roi_entry_mode=roi_poly is not None,
-        tracker=session.tracker,  # DeepSORT tracker (Phase 3)
-        use_tracking=use_tracking,  # Enable tracking
-        ignore_labels=config.IGNORE_LABELS,  # 후처리 필터링
-        add_direction=config.ADD_DIRECTION,  # 방향 기반 ADD/REMOVE
+        tracker=session.tracker,
+        use_tracking=use_tracking,
+        ignore_labels=config.IGNORE_LABELS,
+        add_direction=config.ADD_DIRECTION,
         direction_min_movement=config.DIRECTION_MIN_MOVEMENT,
         direction_history_frames=config.DIRECTION_HISTORY_FRAMES,
         direction_min_history_points=config.DIRECTION_MIN_HISTORY_POINTS,
@@ -129,21 +116,14 @@ def _process_frame_sync(
 
 
 async def _process_frame(session: CheckoutSession, frame: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
-    """Async wrapper: acquires reader lock and delegates to sync processing.
-
-    Uses RWLock reader lock to allow multiple concurrent inference requests
-    while blocking during product updates (writer lock).
-    """
+    """Async wrapper: acquires reader lock and delegates to sync processing."""
     loop = asyncio.get_event_loop()
 
-    # Acquire reader lock: allows concurrent reads, blocks if writer is active
     async with app_state.index_rwlock.reader_lock:
-        # Snapshot shared state under lock for consistency
         model_bundle = app_state.model_bundle
         faiss_index = app_state.faiss_index
         labels = app_state.labels
 
-        # Run CPU/GPU-intensive work in thread pool
         return await loop.run_in_executor(
             None, _process_frame_sync, session, frame, model_bundle, faiss_index, labels
         )
@@ -153,15 +133,8 @@ async def _process_frame(session: CheckoutSession, frame: np.ndarray) -> tuple[n
 # WebSocket: live camera checkout
 # ---------------------------------------------------------------------------
 
-
 @router.websocket("/ws/checkout/{session_id}")
 async def checkout_ws(websocket: WebSocket, session_id: str):
-    """WebSocket endpoint for real-time camera checkout.
-
-    Protocol:
-    - Client sends: binary JPEG frame data
-    - Server responds: JSON { frame: base64_jpeg, ...state }
-    """
     session = app_state.session_manager.get(session_id)
     if session is None:
         await websocket.close(code=4004, reason="Session not found")
@@ -170,15 +143,12 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
     await websocket.accept()
     logger.info("WebSocket connected: session=%s", session_id)
 
-    # Latest-frame-only queue for minimum latency
-    # Small queue + drop old frames = always process most recent frame
     frame_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=2)
 
     async def receive_loop():
         try:
             while True:
                 data = await websocket.receive_bytes()
-                # Drop old frame if queue is full
                 if frame_queue.full():
                     try:
                         frame_queue.get_nowait()
@@ -195,7 +165,6 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
             while True:
                 start_time = time.time()
 
-                # Always get the latest frame, discard old ones for minimum latency
                 data = None
                 dropped_frames = 0
                 while True:
@@ -205,22 +174,19 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
                             dropped_frames += 1
                     except asyncio.QueueEmpty:
                         if data is None:
-                            data = await frame_queue.get()  # Wait for first frame
+                            data = await frame_queue.get()
                         break
 
                 if data == b"":
                     break  # Disconnected
 
-                # Decode JPEG
                 np_arr = np.frombuffer(data, np.uint8)
                 frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 if frame is None:
                     continue
 
-                # Run inference with reader lock
                 display_frame, state_snapshot = await _process_frame(session, frame)
 
-                # Conditionally encode and send image based on config
                 if config.STREAM_SEND_IMAGES:
                     _, jpeg_buf = cv2.imencode(
                         ".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
@@ -228,12 +194,23 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
                     frame_b64 = base64.b64encode(jpeg_buf.tobytes()).decode("ascii")
                     response = {"frame": frame_b64, **state_snapshot}
                 else:
-                    # JSON-only mode: no image, just state and ROI
                     response = state_snapshot
 
-                await websocket.send_text(json.dumps(response))
+                # =========================================================
+                # 🚨 [수정됨] 닫힌 웹소켓에 데이터를 보내려다 발생하는 충돌 방지
+                # =========================================================
+                try:
+                    await websocket.send_text(json.dumps(response))
+                except RuntimeError as e:
+                    if "Unexpected ASGI message" in str(e):
+                        logger.info("클라이언트(브라우저) 연결이 이미 끊어졌습니다. 전송을 중단합니다.")
+                        break  # 안전하게 루프 종료
+                    raise e
+                except WebSocketDisconnect:
+                    logger.info("WebSocketDisconnect 감지됨.")
+                    break
+                # =========================================================
 
-                # Log performance every 30 frames
                 frame_time = (time.time() - start_time) * 1000
                 frame_times.append(frame_time)
                 if len(frame_times) >= 30:
@@ -244,12 +221,9 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
                         avg_time, fps, dropped_frames
                     )
                     frame_times = []
-        except WebSocketDisconnect:
-            pass
         except Exception:
             logger.exception("Error in checkout WebSocket process loop")
 
-    # Run receive and process concurrently
     receive_task = asyncio.create_task(receive_loop())
     process_task = asyncio.create_task(process_loop())
 
@@ -267,18 +241,14 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
 # Video upload + SSE progress
 # ---------------------------------------------------------------------------
 
-# In-memory task status storage
 _video_tasks: dict[str, dict[str, Any]] = {}
-
 
 @router.post("/sessions/{session_id}/video-upload")
 async def upload_video(session_id: str, file: UploadFile):
-    """Upload a video file for offline inference. Returns a task_id for SSE tracking."""
     session = app_state.session_manager.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Save uploaded file to temp location
     suffix = os.path.splitext(file.filename or "video.mp4")[1]
     fd, temp_path = tempfile.mkstemp(suffix=suffix, prefix="checkout_video_")
     try:
@@ -297,8 +267,6 @@ async def upload_video(session_id: str, file: UploadFile):
     }
 
     session.video_task_id = task_id
-
-    # Launch background processing
     asyncio.create_task(_process_video_background(session, temp_path, task_id))
 
     return {"task_id": task_id}
@@ -307,7 +275,6 @@ async def upload_video(session_id: str, file: UploadFile):
 async def _process_video_background(
     session: CheckoutSession, video_path: str, task_id: str
 ):
-    """Background task: process video frame-by-frame and update task status."""
     loop = asyncio.get_event_loop()
     task_status = _video_tasks[task_id]
 
@@ -328,14 +295,11 @@ async def _process_video_background(
                 break
 
             frame_idx += 1
-
-            # Run inference with reader lock
             await _process_frame(session, frame)
 
             task_status["current_frame"] = frame_idx
             task_status["progress"] = round(frame_idx / max(total_frames, 1), 4)
 
-            # Yield control to event loop periodically
             if frame_idx % 5 == 0:
                 await asyncio.sleep(0)
 
@@ -348,7 +312,6 @@ async def _process_video_background(
         task_status["error"] = str(e)
         task_status["done"] = True
     finally:
-        # Cleanup temp file
         try:
             os.unlink(video_path)
         except OSError:
@@ -357,7 +320,6 @@ async def _process_video_background(
 
 @router.get("/sessions/{session_id}/video-status")
 async def video_status_sse(session_id: str, task_id: str):
-    """SSE endpoint streaming video inference progress."""
     session = app_state.session_manager.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -379,7 +341,6 @@ async def video_status_sse(session_id: str, task_id: str):
             yield f"data: {json.dumps(payload)}\n\n"
 
             if status["done"]:
-                # Cleanup task status after final send
                 _video_tasks.pop(task_id, None)
                 break
 

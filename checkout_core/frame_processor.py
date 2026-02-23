@@ -5,7 +5,6 @@ import time
 from collections import Counter
 from collections.abc import MutableMapping
 from typing import Any
-
 import cv2
 import numpy as np
 
@@ -19,23 +18,36 @@ try:
 except ImportError:
     ObjectTracker = None
 
-
+# ==========================================================
+# 🚀 [NEW] EasyOCR 엔진 초기화 (PaddleOCR 완전 대체)
+# ==========================================================
+try:
+    import easyocr
+    ocr_engine = easyocr.Reader(['ko', 'en'], gpu=True)
+    logger.info("✅ [System] EasyOCR 엔진 로드 성공 (GPU 가속 모드)")
+    
+    # 🚨 [추가된 코드] 모델 워밍업: 첫 추론의 엄청난 딜레이를 방지하기 위해 가짜 이미지를 한 번 태웁니다.
+    #logger.info("⚙️ EasyOCR 워밍업(준비 운동) 시작... 잠시만 기다려주세요.")
+    #dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
+    #_ = ocr_engine.readtext(dummy_img)
+    #logger.info("✅ EasyOCR 워밍업 완료! 이제 실시간 추론 준비가 끝났습니다.")
+    
+#except ImportError:
+    #ocr_engine = None
+    #logger.error("❌ [System] EasyOCR 모듈이 없습니다. 터미널에서 'pip install easyocr'을 실행하세요.")
+except Exception as e:
+    ocr_engine = None
+    logger.error(f"❌ [System] EasyOCR 초기화 중 에러 발생: {e}")
+# ==========================================================
 def _calculate_movement_direction(
     centroid_history: list[tuple[float, float]],
     add_direction: str = "down",  # "down" = y 증가(위→아래 진입) = 담기
     min_movement: float = 0.05,
     min_history_points: int = 6,
 ) -> str:
-    """Y축 기준으로만 방향을 판정하여 'add', 'remove', 'unknown'을 반환.
-
-    카메라 좌표계: y=0이 화면 상단, y가 증가할수록 아래
-    - add_direction="down": y 증가(위→아래 이동, 카트에 넣는 모션) → "add"
-    - 반대(아래→위, 카트에서 꺼내는 모션) → "remove"
-    - 이동량 < min_movement 또는 히스토리 부족 → "unknown" (카운트 보류)
-    """
+    """Y축 기준으로만 방향을 판정하여 'add', 'remove', 'unknown'을 반환."""
     min_history_points = max(2, int(min_history_points))
     if len(centroid_history) < min_history_points:
-        # 히스토리가 너무 짧으면 방향 판정 불가 → 보류
         return "unknown"
 
     n = max(2, len(centroid_history) // 4)
@@ -47,8 +59,6 @@ def _calculate_movement_direction(
     if abs(dy) < min_movement:
         return "unknown"
 
-    # add_direction="down": dy > 0 = 아래로 이동 = 담기
-    # add_direction="up":   dy < 0 = 위로 이동 = 담기
     if add_direction == "down":
         return "add" if dy > 0 else "remove"
     else:  # "up"
@@ -76,8 +86,6 @@ def _vertical_sign_consistency_ratio(
     if not deltas:
         return 0.0
 
-    # add_direction="down": add => dy>0, remove => dy<0
-    # add_direction="up":   add => dy<0, remove => dy>0
     if add_direction == "down":
         expected_positive = action == "add"
     else:
@@ -102,7 +110,6 @@ def _release_counted_track(
         counted_tracks.pop(track_id, None)
         return
 
-    # Track ID 매칭 실패 시에도 같은 상품으로 등록된 Track 1개를 해제
     for existing_track_id, existing_product in list(counted_tracks.items()):
         if existing_product == product_name:
             counted_tracks.pop(existing_track_id, None)
@@ -188,7 +195,6 @@ def _update_track_lifecycle(
             ts["last_match_frame"] = -1
 
         if missing > ttl:
-            # stale track id lock도 함께 제거
             counted_tracks.pop(key, None)
             try:
                 counted_tracks.pop(int(key), None)
@@ -196,6 +202,65 @@ def _update_track_lifecycle(
                 pass
             track_states.pop(key, None)
 
+
+# ==========================================================
+# 🔍 [NEW] EasyOCR 정밀 분류기
+# ==========================================================
+def _refine_label_with_ocr(crop_img: np.ndarray, base_label: str) -> str:
+    """
+    GPU 가속을 활용해 고해상도로 분석하고, 미세한 단서라도 잡으면 라벨을 강제 보정합니다.
+    """
+    # 분석 대상 (컵반 시리즈를 확실히 포함)
+    target_keywords = ["컵밥", "컵반", "사발", "범벅", "라면", "국밥", "찌개", "짬뽕"]
+    is_target = any(k in base_label for k in target_keywords)
+
+    if ocr_engine is None or not is_target:
+        return base_label
+
+    try:
+        # 1. [GPU 자원 활용] 이미지 2배 확대 (작은 글자 인식률 향상)
+        # GPU가 있으므로 이 정도 연산은 순식간입니다.
+        upscaled = cv2.resize(crop_img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        safe_img = np.ascontiguousarray(upscaled)
+
+        # 2. EasyOCR 정밀 추론
+        # paragraph=True로 설정하여 흩어진 단어들을 문맥으로 묶습니다.
+        results = ocr_engine.readtext(safe_img, detail=1, paragraph=False)
+        
+        if not results:
+            return base_label
+
+        # 3. [디버깅 강화] 읽은 모든 텍스트를 일단 터미널에 찍습니다.
+        # 이를 통해 모델이 "황태"를 "항태"나 "화태"로 오독하는지 확인 가능합니다.
+        detected_info = []
+        full_text_raw = ""
+        for (bbox, text, prob) in results:
+            full_text_raw += text
+            detected_info.append(f"[{text}({prob:.2f})]")
+        
+        logger.info(f"🔍 [OCR 탐지 결과]: {detected_info}")
+        
+        full_text = full_text_raw.replace(" ", "")
+
+        # 4. [강력한 보정 로직] '황태'라는 단어가 포함되거나, 
+        # 혹은 유사한 획 패턴이 보이면 황태국밥으로 강제 확정합니다.
+        if any(k in full_text for k in ["황태", "황", "태국"]):
+            return "황태국밥 컵반"
+        elif any(k in full_text for k in ["참치", "마요"]):
+            return "참치마요 컵반"
+        elif any(k in full_text for k in ["스팸"]):
+            return "스팸마요 컵반"
+        elif any(k in full_text for k in ["순두부", "순두"]):
+            return "순두부찌개 컵반"
+        elif any(k in full_text for k in ["닭곰", "곰탕"]):
+            return "닭곰탕 컵반"
+        elif any(k in full_text for k in ["미역"]):
+            return "미역국밥 컵반"
+            
+    except Exception as e:
+        logger.error(f"OCR 정밀 보정 중 에러: {e}")
+        
+    return base_label
 
 def process_checkout_frame(
     *,
@@ -237,20 +302,13 @@ def process_checkout_frame(
     label_stale_frames: int = 4,
     warmup_frames: int = 24,
 ) -> np.ndarray:
-    """Process a single frame and update checkout state in-place.
-
-    기존 인식 로직(배경차분 → 가장 큰 contour → 임베딩 → FAISS)을 그대로 유지.
-    DeepSORT가 활성화되면 백그라운드에서 모든 bbox를 트래킹하고,
-    가장 큰 contour에 매칭된 Track ID로 중복 카운트를 방지합니다.
-    """
+    """Process a single frame and update checkout state in-place."""
     display_frame = frame.copy()
 
-    # 카운트 이벤트 초기화 (매 프레임 리셋)
     state["count_event"] = None
     state["current_track_id"] = None
     counting_enabled = frame_count > max(0, int(warmup_frames))
 
-    # Warm-up 중에는 잔상 학습만 수행하고 카운트 상태는 초기화해 오검출을 억제
     if not counting_enabled:
         state["centroid_history"] = []
         state["direction_committed"] = False
@@ -273,7 +331,7 @@ def process_checkout_frame(
     contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates = [cnt for cnt in contours if cv2.contourArea(cnt) > min_area]
 
-    # ── 2. DeepSORT 업데이트 (빈 detection 포함) ──
+    # ── 2. DeepSORT 업데이트 ──
     tracks: list[dict[str, Any]] = []
     if use_tracking and tracker is not None:
         all_bboxes = []
@@ -344,7 +402,6 @@ def process_checkout_frame(
                     entry_event = not bool(state.get("roi_occupied", False))
                     state["roi_occupied"] = True
                     if entry_event and track_state is not None:
-                        # 새 진입에서는 이 트랙의 이전 궤적/라벨을 리셋
                         track_state["centroid_history"] = []
                         track_state["direction_committed"] = False
                         track_state["stable_label"] = ""
@@ -363,7 +420,6 @@ def process_checkout_frame(
                 state["last_matched_label"] = ""
                 state["last_match_frame"] = -1
 
-            # 트랙 기반 centroid 누적 (track_id 없는 경우 NO-OP)
             if track_state is not None:
                 frame_h, frame_w = frame.shape[:2]
                 ncx = (x + w / 2) / frame_w
@@ -386,7 +442,6 @@ def process_checkout_frame(
                     cv2.polylines(display_frame, [roi_poly], True, (0, 181, 255), 2)
                 return display_frame
 
-            # 추론 주기
             burst_infer = (
                 track_state is not None
                 and int(track_state.get("age", 0)) <= max(0, int(infer_burst_track_age))
@@ -417,7 +472,6 @@ def process_checkout_frame(
                 if best_score > match_threshold and best_idx < len(labels):
                     name = str(labels[best_idx])
 
-                    # 무시 라벨 필터링: 2순위로 fallback
                     if ignore_labels and name in ignore_labels:
                         distances2, indices2 = faiss_index.search(query, 2)
                         fallback_ok = False
@@ -436,13 +490,22 @@ def process_checkout_frame(
                             if roi_poly is not None:
                                 cv2.polylines(display_frame, [roi_poly], True, (0, 181, 255), 2)
                             return display_frame
+                            
+                    # =========================================================
+                    # 💡 EasyOCR을 통한 최종 정밀 보정
+                    # =========================================================
+                    refined_name = _refine_label_with_ocr(crop, name)
+
+                    if name != refined_name:
+                        logger.info(f"💡 OCR 보정 완료: {name} -> {refined_name}")
+                        name = refined_name 
+                    # =========================================================
 
                     state["last_label"] = name
                     state["last_score"] = best_score
                     state["last_status"] = "매칭됨"
                     state.setdefault("item_scores", {})[name] = best_score
 
-                    # Track 라벨 컨센서스 업데이트
                     if track_state is not None:
                         _update_track_label_consensus(
                             track_state,
@@ -470,7 +533,6 @@ def process_checkout_frame(
                     state["last_status"] = "매칭 실패"
 
             # ── 5. 트랙 기반 방향 판정/카운트 ──
-            # 불확실하면 NO-OP(카운트 안 함)
             if counting_enabled and track_state is not None and track_id is not None:
                 if not track_state.get("direction_committed", False):
                     _name = str(track_state.get("stable_label", "") or "")
@@ -488,7 +550,6 @@ def process_checkout_frame(
                         _required_ratio = max(0.0, min(1.0, float(direction_sign_consistency)))
                         _decision_mode = "none"
 
-                        # Normal path: 충분한 트랙 나이 + 기존 인라인 조건
                         if _normal_age_ok:
                             _action = _calculate_movement_direction(
                                 _hist,
@@ -502,7 +563,6 @@ def process_checkout_frame(
                                     0.0, min(1.0, float(direction_sign_consistency))
                                 )
 
-                        # Fast path: 아직 짧은 트랙에서도 강한 이동이면 조기 판정
                         if _action == "unknown":
                             _action = _calculate_movement_direction(
                                 _hist,
@@ -588,7 +648,6 @@ def process_checkout_frame(
                                     _required_ratio,
                                 )
     else:
-        # 탐지 없음: 불확실 카운트는 하지 않음 (NO-OP 정책)
         if roi_poly is not None and bool(state.get("roi_occupied", False)):
             prev_empty = int(state.get("roi_empty_frames", 0))
             state["roi_empty_frames"] = prev_empty + 1

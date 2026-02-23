@@ -1,10 +1,16 @@
-"""FastAPI application entry point.
+import sys
+import os
+from pathlib import Path
 
-Loads AI models once at startup via lifespan, registers routers,
-and configures CORS for the React frontend.
-"""
+# 1. 현재 파일(main.py)을 기준으로 프로젝트 루트와 app 폴더 경로 계산
+current_dir = Path(__file__).resolve().parent  # backend 폴더
+app_dir = current_dir.parent                   # app 폴더
+root_dir = app_dir.parent                     # EBRCS 최상위 폴더
 
-from __future__ import annotations
+# 2. 파이썬이 어디서든 모듈을 찾을 수 있도록 탐색 경로에 강제 추가
+for p in [str(root_dir), str(app_dir), str(current_dir)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 import logging
 import os
