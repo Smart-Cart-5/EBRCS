@@ -35,7 +35,15 @@ export interface DashboardStats {
   total_purchases: number;
   total_customers: number;
   today_purchases: number;
+  total_revenue: number;
+  average_order_value: number;
+  today_revenue: number;
   total_products_sold: number;
+  daily_stats: Array<{
+    date: string;
+    purchase_count: number;
+    revenue: number;
+  }>;
   popular_products: PopularProduct[];
   recent_purchases: Purchase[];
 }
@@ -66,8 +74,15 @@ export function createPurchase(
   });
 }
 
-export function getDashboardStats(token: string): Promise<DashboardStats> {
-  return request("/purchases/dashboard", {
+export function deletePurchase(token: string, purchaseId: number): Promise<{ status: string; purchase_id: number }> {
+  return request(`/purchases/${purchaseId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getDashboardStats(token: string, days = 7): Promise<DashboardStats> {
+  return request(`/purchases/dashboard?days=${encodeURIComponent(days)}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
 }

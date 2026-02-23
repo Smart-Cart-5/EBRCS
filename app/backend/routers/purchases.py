@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 from typing import Annotated, List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -45,11 +45,21 @@ class PopularProduct(BaseModel):
     total_count: int
 
 
+class DailyStats(BaseModel):
+    date: str
+    purchase_count: int
+    revenue: int
+
+
 class DashboardStats(BaseModel):
     total_purchases: int
     total_customers: int
     today_purchases: int
+    total_revenue: int
+    average_order_value: int
+    today_revenue: int
     total_products_sold: int
+    daily_stats: List[DailyStats]
     popular_products: List[PopularProduct]
     recent_purchases: List[PurchaseResponse]
 
@@ -157,9 +167,41 @@ def create_purchase(
     }
 
 
+@router.delete("/{purchase_id}")
+def delete_purchase(
+    purchase_id: int,
+    current_user: Annotated[models.User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    """Delete a purchase record owned by current user (or admin)."""
+    purchase = (
+        db.query(models.PurchaseHistory)
+        .filter(models.PurchaseHistory.id == purchase_id)
+        .first()
+    )
+
+    if not purchase:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Purchase not found",
+        )
+
+    if purchase.user_id != current_user.id and current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to delete this purchase",
+        )
+
+    db.delete(purchase)
+    db.commit()
+
+    return {"status": "deleted", "purchase_id": purchase_id}
+
+
 @router.get("/dashboard", response_model=DashboardStats)
 def get_dashboard_stats(
     current_user: Annotated[models.User, Depends(get_current_user)],
+    days: int = Query(default=7, ge=7, le=90),
     db: Session = Depends(get_db),
 ):
     """Get dashboard statistics (admin only)."""
@@ -177,15 +219,38 @@ def get_dashboard_stats(
 
     # Today's purchases
     today = datetime.utcnow().date()
-    today_purchases = (
-        db.query(models.PurchaseHistory)
-        .filter(models.PurchaseHistory.timestamp >= today)
-        .count()
-    )
-
-    # Total products sold and popular products
     all_purchases = db.query(models.PurchaseHistory).all()
 
+    today_purchases = 0
+    today_revenue = 0
+    total_revenue = 0
+    for purchase in all_purchases:
+        amount = int(purchase.total_amount or 0)
+        total_revenue += amount
+        if purchase.timestamp.date() == today:
+            today_purchases += 1
+            today_revenue += amount
+
+    average_order_value = int(total_revenue / total_purchases) if total_purchases > 0 else 0
+
+    period_days = days if days in {7, 30, 90} else 7
+
+    # Daily trend (recent period days)
+    days_window = [today - timedelta(days=offset) for offset in range(period_days - 1, -1, -1)]
+    daily_map = {
+        day.isoformat(): {"date": day.isoformat(), "purchase_count": 0, "revenue": 0}
+        for day in days_window
+    }
+
+    for purchase in all_purchases:
+        day_key = purchase.timestamp.date().isoformat()
+        if day_key in daily_map:
+            daily_map[day_key]["purchase_count"] += 1
+            daily_map[day_key]["revenue"] += int(purchase.total_amount or 0)
+
+    daily_stats = [daily_map[day.isoformat()] for day in days_window]
+
+    # Total products sold and popular products
     product_counts = {}
     total_products_sold = 0
 
@@ -228,7 +293,11 @@ def get_dashboard_stats(
         "total_purchases": total_purchases,
         "total_customers": total_customers,
         "today_purchases": today_purchases,
+        "total_revenue": total_revenue,
+        "average_order_value": average_order_value,
+        "today_revenue": today_revenue,
         "total_products_sold": total_products_sold,
+        "daily_stats": daily_stats,
         "popular_products": popular_products,
         "recent_purchases": recent_purchases,
     }
