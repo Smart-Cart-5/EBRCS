@@ -37,33 +37,24 @@ declare global {
   }
 }
 
-const MOBILE_BREAKPOINT = 1024;
+const MOBILE_BREAKPOINT = 1024; // Tailwind `lg` breakpoint
 const MOBILE_FAB_SIZE = 64;
 const DESKTOP_FAB_SIZE = 48;
 const MOBILE_SIDE_OFFSET = 16;
-const MOBILE_BOTTOM_OFFSET = 80;
+const MOBILE_BOTTOM_OFFSET = 80; // same visual level as cart FAB (`bottom-20`)
 
-function isMobileWidth(): boolean {
-  return window.innerWidth < MOBILE_BREAKPOINT;
-}
+const isMobileWidth = (width: number) => width < MOBILE_BREAKPOINT;
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
+const getAnchoredMobilePos = () => ({
+  x: MOBILE_SIDE_OFFSET,
+  y: Math.max(8, window.innerHeight - MOBILE_BOTTOM_OFFSET - MOBILE_FAB_SIZE),
+});
 
-function getDefaultDesktopPos() {
-  return {
-    x: Math.max(8, window.innerWidth - DESKTOP_FAB_SIZE - 24),
-    y: 16,
-  };
-}
-
-function clampDesktopPos(pos: { x: number; y: number }) {
-  return {
-    x: clamp(pos.x, 0, Math.max(0, window.innerWidth - DESKTOP_FAB_SIZE)),
-    y: clamp(pos.y, 0, Math.max(0, window.innerHeight - DESKTOP_FAB_SIZE)),
-  };
-}
+const getDefaultDesktopPos = () => ({
+  x: Math.max(0, window.innerWidth - DESKTOP_FAB_SIZE - 16),
+  y: 16,
+});
 
 export default function ChatbotWidget() {
   const sessionId = useSessionStore((s) => s.sessionId);
@@ -77,7 +68,6 @@ export default function ChatbotWidget() {
   const [listening, setListening] = useState(false);
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [choices, setChoices] = useState<ChatbotChoice[]>([]);
-  const [isMobileView, setIsMobileView] = useState<boolean>(() => isMobileWidth());
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: "initial",
@@ -86,7 +76,11 @@ export default function ChatbotWidget() {
     },
   ]);
 
-  const [pos, setPos] = useState(() => getDefaultDesktopPos());
+  // --- Drag state ---
+  const [isMobileView, setIsMobileView] = useState(() => isMobileWidth(window.innerWidth));
+  const [pos, setPos] = useState(() =>
+    isMobileWidth(window.innerWidth) ? getAnchoredMobilePos() : getDefaultDesktopPos()
+  );
   const dragging = useRef(false);
   const dragOffset = useRef({ x: 0, y: 0 });
   const hasMoved = useRef(false);
@@ -95,7 +89,6 @@ export default function ChatbotWidget() {
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     if (isMobileView) return;
-
     dragging.current = true;
     hasMoved.current = false;
     dragOffset.current = { x: e.clientX - pos.x, y: e.clientY - pos.y };
@@ -103,11 +96,36 @@ export default function ChatbotWidget() {
   }, [isMobileView, pos]);
 
   useEffect(() => {
+    const syncViewport = () => {
+      const mobile = isMobileWidth(window.innerWidth);
+      setIsMobileView(mobile);
+      setPos((prev) => {
+        if (mobile) {
+          // Mobile: pin chatbot FAB at bottom-left of camera area.
+          return getAnchoredMobilePos();
+        }
+        // Desktop: keep draggable position, but clamp inside viewport.
+        return {
+          x: clamp(prev.x, 0, Math.max(0, window.innerWidth - DESKTOP_FAB_SIZE)),
+          y: clamp(prev.y, 0, Math.max(0, window.innerHeight - DESKTOP_FAB_SIZE)),
+        };
+      });
+    };
+
+    syncViewport();
+    window.addEventListener("resize", syncViewport);
+    return () => {
+      window.removeEventListener("resize", syncViewport);
+    };
+  }, []);
+
+  useEffect(() => {
     const onMove = (e: PointerEvent) => {
       if (!dragging.current || isMobileView) return;
       hasMoved.current = true;
-      const nx = clamp(e.clientX - dragOffset.current.x, 0, window.innerWidth - DESKTOP_FAB_SIZE);
-      const ny = clamp(e.clientY - dragOffset.current.y, 0, window.innerHeight - DESKTOP_FAB_SIZE);
+      const btnSize = DESKTOP_FAB_SIZE;
+      const nx = Math.max(0, Math.min(window.innerWidth - btnSize, e.clientX - dragOffset.current.x));
+      const ny = Math.max(0, Math.min(window.innerHeight - btnSize, e.clientY - dragOffset.current.y));
       setPos({ x: nx, y: ny });
     };
     const onUp = () => { dragging.current = false; };
@@ -118,21 +136,6 @@ export default function ChatbotWidget() {
       window.removeEventListener("pointerup", onUp);
     };
   }, [isMobileView]);
-
-  useEffect(() => {
-    const handleResize = () => {
-      const mobile = isMobileWidth();
-      setIsMobileView(mobile);
-      if (!mobile) {
-        setPos((prev) => clampDesktopPos(prev));
-      }
-    };
-
-    window.addEventListener("resize", handleResize);
-    return () => {
-      window.removeEventListener("resize", handleResize);
-    };
-  }, []);
 
   const hasCartItems = useMemo(() => Object.keys(billingItems).length > 0, [billingItems]);
 
@@ -244,49 +247,25 @@ export default function ChatbotWidget() {
     recognition.start();
   };
 
-  const fabStyle = useMemo(() => {
-    if (isMobileView) {
-      return {
-        left: `${MOBILE_SIDE_OFFSET}px`,
-        bottom: `calc(${MOBILE_BOTTOM_OFFSET}px + env(safe-area-inset-bottom, 0px))`,
-      };
-    }
-
-    return { left: pos.x, top: pos.y };
-  }, [isMobileView, pos.x, pos.y]);
-
-  const panelStyle = useMemo(() => {
-    if (isMobileView) {
-      return {
-        left: `${MOBILE_SIDE_OFFSET}px`,
-        right: `${MOBILE_SIDE_OFFSET}px`,
-        bottom: `calc(${MOBILE_BOTTOM_OFFSET + MOBILE_FAB_SIZE + 12}px + env(safe-area-inset-bottom, 0px))`,
-        maxHeight: "min(60vh, 30rem)",
-      };
-    }
-
-    const panelW = 360;
-    const panelH = 480;
-    const panelX = Math.min(pos.x, window.innerWidth - panelW - 8);
-    const panelY = pos.y + DESKTOP_FAB_SIZE + 8;
-    const flipUp = panelY + panelH > window.innerHeight;
-    const finalPanelY = flipUp ? Math.max(8, pos.y - panelH - 8) : panelY;
-    return {
-      left: Math.max(8, panelX),
-      top: finalPanelY,
-      width: "min(92vw, 360px)",
-    };
-  }, [isMobileView, pos.x, pos.y]);
+  // Compute panel position so it stays on screen
+  const panelW = 360;
+  const panelH = 480;
+  const fabSize = isMobileView ? MOBILE_FAB_SIZE : DESKTOP_FAB_SIZE;
+  const panelX = Math.min(pos.x, window.innerWidth - panelW - 8);
+  const panelY = pos.y + fabSize + 8;
+  const flipUp = panelY + panelH > window.innerHeight;
+  const finalPanelY = flipUp ? Math.max(8, pos.y - panelH - 8) : panelY;
 
   return (
     <>
+      {/* Desktop: draggable FAB / Mobile: anchored FAB */}
       <button
         type="button"
-        style={fabStyle}
-        className={`fixed z-30 rounded-full bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white shadow-lg flex items-center justify-center select-none touch-none ${
+        style={{ left: pos.x, top: pos.y }}
+        className={`fixed z-50 rounded-full bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white shadow-lg flex items-center justify-center select-none ${
           isMobileView
-            ? "w-16 h-16 text-2xl"
-            : "w-12 h-12 cursor-grab active:cursor-grabbing"
+            ? "w-16 h-16"
+            : "w-12 h-12 cursor-grab active:cursor-grabbing touch-none"
         }`}
         aria-label="챗봇 열기"
         onPointerDown={onPointerDown}
@@ -294,13 +273,16 @@ export default function ChatbotWidget() {
           if (!hasMoved.current) setOpen((v) => !v);
         }}
       >
-        {open ? "✕" : "💬"}
+        <span className={isMobileView ? "text-2xl" : "text-lg"}>
+          {open ? "✕" : "💬"}
+        </span>
       </button>
 
+      {/* Chat panel */}
       {open && (
         <div
-          style={panelStyle}
-          className="fixed z-30 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-2xl shadow-xl overflow-hidden"
+          style={{ left: Math.max(8, panelX), top: finalPanelY }}
+          className="fixed z-50 w-[min(92vw,360px)] bg-[var(--color-surface)] border border-[var(--color-border)] rounded-2xl shadow-xl overflow-hidden"
         >
           <div className="px-4 py-3 border-b border-[var(--color-border)] bg-[var(--color-primary-light)]">
             <p className="text-sm font-semibold text-[var(--color-text)]">스마트 챗봇</p>
