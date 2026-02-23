@@ -97,8 +97,8 @@ def create_app() -> FastAPI:
     app.include_router(billing.router, prefix="/api")
     app.include_router(products.router, prefix="/api")
     app.include_router(purchases.router, prefix="/api")
-    app.include_router(checkout.router, prefix="/api")
     app.include_router(chatbot.router, prefix="/api")
+    app.include_router(checkout.router, prefix="/api")
 
     @app.get("/api/health")
     async def health():

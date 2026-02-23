@@ -14,16 +14,15 @@ from typing import Annotated
 import cv2
 import faiss
 import numpy as np
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Depends
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from PIL import Image
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend import config
-from backend.dependencies import app_state
 from backend.database import get_db
+from backend.dependencies import app_state
 
 logger = logging.getLogger("backend.products")
 
@@ -54,6 +53,7 @@ def _build_raw_embedding(image_bgr: np.ndarray) -> np.ndarray:
     )
     return np.concatenate([dino_emb, clip_emb], axis=0)
 
+
 def _build_weighted(raw: np.ndarray, dino_dim: int, clip_dim: int) -> np.ndarray:
     """Apply DINO/CLIP weighting and L2-normalize."""
     weighted = raw.copy().astype(np.float32)
@@ -65,85 +65,25 @@ def _build_weighted(raw: np.ndarray, dino_dim: int, clip_dim: int) -> np.ndarray
     return weighted
 
 
-def _rebuild_index_from_raw(
-    raw_embeddings: np.ndarray | None,
-    labels: np.ndarray | None,
-    dino_dim: int,
-    clip_dim: int,
-) -> None:
-    """Rebuild FAISS index and in-memory cache from raw embeddings."""
-    if raw_embeddings is None or labels is None or len(labels) == 0:
-        app_state.faiss_index = None
-        app_state.weighted_db = None
-        app_state.labels = np.array([], dtype=np.str_)
-        if os.path.exists(config.FAISS_INDEX_PATH):
-            os.remove(config.FAISS_INDEX_PATH)
-        return
+def _recompute_weighted_db(embeddings: np.ndarray, dino_dim: int, clip_dim: int) -> np.ndarray:
+    if embeddings.size == 0:
+        return np.empty((0, dino_dim + clip_dim), dtype=np.float32)
 
-    weighted_db = np.stack(
-        [_build_weighted(r, dino_dim, clip_dim) for r in raw_embeddings], axis=0
-    ).astype(np.float32)
-    dim = weighted_db.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(weighted_db)
-    faiss.write_index(index, config.FAISS_INDEX_PATH)
-    app_state.faiss_index = index
-    app_state.weighted_db = weighted_db
-    app_state.labels = labels
+    dino = embeddings[:, :dino_dim].astype(np.float32)
+    clip = embeddings[:, dino_dim : dino_dim + clip_dim].astype(np.float32)
 
+    def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        return matrix / np.maximum(norms, 1e-12)
 
-def _remove_embeddings_for_item_no(item_no: str) -> int:
-    """Remove embeddings for a given item_no and rebuild index."""
-    if not os.path.exists(config.LABELS_PATH) or not os.path.exists(config.EMBEDDINGS_PATH):
-        return 0
+    dino = _normalize_rows(dino)
+    clip = _normalize_rows(clip)
+    weighted = np.concatenate([dino * DINO_WEIGHT, clip * CLIP_WEIGHT], axis=1).astype(
+        np.float32
+    )
+    weighted = _normalize_rows(weighted)
+    return weighted
 
-    labels = np.load(config.LABELS_PATH, allow_pickle=True).astype(str)
-    emb = np.load(config.EMBEDDINGS_PATH, allow_pickle=False)
-    mask = np.array([not str(lbl).startswith(f"{item_no}_") for lbl in labels])
-    removed = int(len(labels) - int(mask.sum()))
-    new_labels = labels[mask]
-    new_emb = emb[mask]
-
-    np.save(config.LABELS_PATH, new_labels)
-    np.save(config.EMBEDDINGS_PATH, new_emb)
-
-    bundle = app_state.model_bundle
-    _rebuild_index_from_raw(new_emb, new_labels, bundle["dino_dim"], bundle["clip_dim"])
-    return removed
-
-# 상품 삭제 엔드포인트
-@router.delete("/products/{item_no}")
-async def delete_product(item_no: str, db: Session = Depends(get_db)):
-    """Delete a product and its embeddings by item_no."""
-    item_no = item_no.strip()
-    if not item_no:
-        raise HTTPException(status_code=422, detail="item_no is required")
-
-    try:
-        db.execute(
-            text(
-                "DELETE FROM product_prices WHERE product_id IN "
-                "(SELECT id FROM products WHERE item_no = :item_no)"
-            ),
-            {"item_no": item_no},
-        )
-        result = db.execute(
-            text("DELETE FROM products WHERE item_no = :item_no"),
-            {"item_no": item_no},
-        )
-        db.commit()
-        deleted_rows = int(result.rowcount or 0)
-    except SQLAlchemyError as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail="Failed to delete product from DB") from exc
-
-    async with app_state.index_rwlock.writer_lock:
-        removed_embeddings = _remove_embeddings_for_item_no(item_no)
-    return {
-        "status": "deleted",
-        "deleted_rows": deleted_rows,
-        "removed_embeddings": removed_embeddings,
-    }
 
 @router.post("/products")
 async def add_product(
@@ -158,22 +98,15 @@ async def add_product(
 
     Generates embeddings, appends to DB files, and updates the FAISS index.
     """
-    item_no = item_no.strip()
-    name = name.strip()
-    barcd = barcd.strip() if isinstance(barcd, str) else None
-    if barcd == "":
-        barcd = None
-
-    if not item_no:
-        raise HTTPException(status_code=422, detail="item_no is required")
-    if not name:
+    if not item_no.strip():
+        raise HTTPException(status_code=422, detail="Item number is required")
+    if not name.strip():
         raise HTTPException(status_code=422, detail="Product name is required")
     if price <= 0:
-        raise HTTPException(status_code=422, detail="Price must be a positive integer")
+        raise HTTPException(status_code=422, detail="Price must be positive")
     if len(images) < MIN_IMAGES or len(images) > MAX_IMAGES:
         raise HTTPException(
-            status_code=422,
-            detail=f"Provide {MIN_IMAGES}-{MAX_IMAGES} images",
+            status_code=422, detail=f"Provide {MIN_IMAGES}-{MAX_IMAGES} images"
         )
 
     bundle = app_state.model_bundle
@@ -193,9 +126,11 @@ async def add_product(
         new_raw_list.append(raw_emb)
 
     new_raw = np.stack(new_raw_list, axis=0).astype(np.float32)
-    # 라벨을 'item_no_name' 형태로 저장
-    label_value = f"{item_no}_{name}"
-    new_labels = np.array([label_value] * len(new_raw_list), dtype=object)
+    clean_name = name.strip()
+    clean_item_no = item_no.strip()
+    clean_barcd = barcd.strip() if barcd and barcd.strip() else None
+    label = f"{clean_item_no}_{clean_name}"
+    new_labels = np.array([label] * len(new_raw_list), dtype=object)
 
     # Build weighted embeddings for new images BEFORE acquiring lock
     weighted_new = np.stack(
@@ -203,10 +138,53 @@ async def add_product(
         axis=0,
     ).astype(np.float32)
 
+    product_id: int | None = None
+    try:
+        existing = db.execute(
+            text(
+                """
+                SELECT id FROM products
+                WHERE item_no = :item_no
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ),
+            {"item_no": clean_item_no},
+        ).mappings().first()
+        if existing:
+            product_id = int(existing["id"])
+            db.execute(
+                text(
+                    """
+                    UPDATE products
+                    SET product_name = :name, barcd = :barcd, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = :id
+                    """
+                ),
+                {"name": clean_name, "barcd": clean_barcd, "id": product_id},
+            )
+        else:
+            result = db.execute(
+                text(
+                    """
+                    INSERT INTO products (item_no, barcd, product_name, created_at, updated_at)
+                    VALUES (:item_no, :barcd, :name, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """
+                ),
+                {"item_no": clean_item_no, "barcd": clean_barcd, "name": clean_name},
+            )
+            product_id = int(result.lastrowid or 0)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}") from exc
+
+    if not product_id:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to create product record")
+
     # Acquire writer lock: blocks all inference requests until update completes
     async with app_state.index_rwlock.writer_lock:
-        old_emb = None
-        old_lbl = None
+        # Load existing DB
         if os.path.exists(config.EMBEDDINGS_PATH) and os.path.exists(config.LABELS_PATH):
             old_emb = np.load(config.EMBEDDINGS_PATH, allow_pickle=False)
             old_lbl = np.load(config.LABELS_PATH, allow_pickle=True)
@@ -216,143 +194,269 @@ async def add_product(
             updated_emb = new_raw
             updated_lbl = new_labels
 
-        try:
-            np.save(config.EMBEDDINGS_PATH, updated_emb)
-            np.save(config.LABELS_PATH, updated_lbl)
+        # Save updated DB files
+        np.save(config.EMBEDDINGS_PATH, updated_emb)
+        np.save(config.LABELS_PATH, updated_lbl)
 
-            if app_state.faiss_index is None or app_state.faiss_index.ntotal == 0:
-                weighted_db = np.stack(
-                    [_build_weighted(r, dino_dim, clip_dim) for r in updated_emb],
-                    axis=0,
-                ).astype(np.float32)
-                dim = weighted_db.shape[1]
-                app_state.faiss_index = faiss.IndexFlatIP(dim)
-                app_state.faiss_index.add(weighted_db)
-                app_state.weighted_db = weighted_db
-            else:
-                app_state.faiss_index.add(weighted_new)
-                if app_state.weighted_db is None or len(app_state.weighted_db) == 0:
-                    app_state.weighted_db = weighted_new
-                else:
-                    app_state.weighted_db = np.vstack([app_state.weighted_db, weighted_new])
+        # --- INCREMENTAL UPDATE (핵심 개선!) ---
+        # Before: Rebuilt entire index O(n) - slow for large databases
+        # After: Add only new vectors O(k) where k = number of new products
+        if app_state.faiss_index is None or app_state.faiss_index.ntotal == 0:
+            # First product registration: create new index
+            dim = weighted_new.shape[1]
+            app_state.faiss_index = faiss.IndexFlatIP(dim)
 
-            faiss.write_index(app_state.faiss_index, config.FAISS_INDEX_PATH)
+        # Incremental add: only adds new weighted vectors (fast!)
+        app_state.faiss_index.add(weighted_new)
 
-            app_state.labels = updated_lbl
-        except Exception as exc:
-            logger.exception("Failed to update embedding DB: %s", exc)
-            raise HTTPException(status_code=500, detail="Failed to update embeddings") from exc
+        # Persist updated index to disk
+        faiss.write_index(app_state.faiss_index, config.FAISS_INDEX_PATH)
 
-        try:
-            existing = db.execute(
-                text(
-                    "SELECT id FROM products WHERE item_no = :item_no ORDER BY id DESC LIMIT 1"
-                ),
-                {"item_no": item_no},
-            ).mappings().first()
+        # Update in-memory weighted_db by appending new vectors
+        if app_state.weighted_db is None or len(app_state.weighted_db) == 0:
+            app_state.weighted_db = weighted_new
+        else:
+            app_state.weighted_db = np.vstack([app_state.weighted_db, weighted_new])
 
-            if existing:
-                product_id = int(existing["id"])
-                db.execute(
-                    text(
-                        "UPDATE products SET product_name = :name, barcd = :barcd, "
-                        "updated_at = CURRENT_TIMESTAMP WHERE id = :id"
-                    ),
-                    {"name": name, "barcd": barcd, "id": product_id},
-                )
-            else:
-                db.execute(
-                    text(
-                        "INSERT INTO products (item_no, barcd, product_name) "
-                        "VALUES (:item_no, :barcd, :name)"
-                    ),
-                    {"item_no": item_no, "barcd": barcd, "name": name},
-                )
-                created = db.execute(
-                    text(
-                        "SELECT id FROM products WHERE item_no = :item_no "
-                        "ORDER BY id DESC LIMIT 1"
-                    ),
-                    {"item_no": item_no},
-                ).mappings().first()
-                if not created:
-                    raise SQLAlchemyError("Failed to fetch inserted product id")
-                product_id = int(created["id"])
+        # Swap labels atomically
+        app_state.labels = updated_lbl
 
-            db.execute(
-                text("INSERT INTO product_prices (product_id, price) VALUES (:pid, :price)"),
-                {"pid": product_id, "price": int(price)},
-            )
-            db.commit()
-        except SQLAlchemyError as exc:
-            db.rollback()
-            # Restore embedding state on DB failure
-            if old_emb is None or old_lbl is None:
-                if os.path.exists(config.EMBEDDINGS_PATH):
-                    os.remove(config.EMBEDDINGS_PATH)
-                if os.path.exists(config.LABELS_PATH):
-                    os.remove(config.LABELS_PATH)
-                app_state.faiss_index = None
-                app_state.weighted_db = None
-                app_state.labels = np.array([], dtype=np.str_)
-                if os.path.exists(config.FAISS_INDEX_PATH):
-                    os.remove(config.FAISS_INDEX_PATH)
-            else:
-                np.save(config.EMBEDDINGS_PATH, old_emb)
-                np.save(config.LABELS_PATH, old_lbl)
-                _rebuild_index_from_raw(old_emb, old_lbl, dino_dim, clip_dim)
-            raise HTTPException(status_code=500, detail="Failed to write product to DB") from exc
+    try:
+        db.execute(
+            text(
+                """
+                INSERT INTO product_prices (product_id, price, currency, source, checked_at, created_at)
+                VALUES (:product_id, :price, 'KRW', 'admin_upload', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """
+            ),
+            {"product_id": product_id, "price": int(price)},
+        )
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}") from exc
 
     logger.info(
-        "Product '%s' added (%d images, total DB: %d)", name, len(images), len(updated_lbl)
+        "Product '%s' (%s) added (%d images, total DB: %d)",
+        clean_name,
+        clean_item_no,
+        len(images),
+        len(updated_lbl),
     )
 
-    return JSONResponse(
-        content={
-            "status": "added",
-            "item_no": item_no,
-            "product_name": name,
-            "label": label_value,
-            "price": int(price),
-            "images_count": len(images),
-            "total_products": len(set(updated_lbl)),
-            "total_embeddings": len(updated_lbl),
-        },
-        media_type="application/json; charset=utf-8"
-    )
+    return {
+        "status": "added",
+        "item_no": clean_item_no,
+        "product_name": clean_name,
+        "label": label,
+        "price": int(price),
+        "images_count": len(images),
+        "total_products": len(set(updated_lbl)),
+        "total_embeddings": len(updated_lbl),
+    }
 
 
 @router.get("/products")
-async def list_products():
+async def list_products(db: Session = Depends(get_db)):
     """List all registered products with their embedding counts."""
     labels = app_state.labels
-    if labels is None or len(labels) == 0:
-        return JSONResponse(
-            content={"products": [], "total_embeddings": 0},
-            media_type="application/json; charset=utf-8"
+    embedding_total = int(len(labels)) if labels is not None else 0
+    label_counts: dict[str, int] = {}
+    embed_products: dict[str, dict[str, object]] = {}
+    if labels is not None:
+        for lbl in labels:
+            label_str = str(lbl)
+            label_counts[label_str] = label_counts.get(label_str, 0) + 1
+
+        for label_str, count in label_counts.items():
+            item_no = None
+            name = label_str
+            if "_" in label_str:
+                prefix, suffix = label_str.split("_", 1)
+                if prefix.isdigit():
+                    item_no = prefix
+                    name = suffix or label_str
+
+            key = item_no if item_no else f"__name__:{name}"
+            if key in embed_products:
+                embed_products[key]["embedding_count"] = int(
+                    embed_products[key]["embedding_count"]
+                ) + int(count)
+            else:
+                embed_products[key] = {
+                    "item_no": item_no,
+                    "name": name,
+                    "embedding_count": int(count),
+                }
+
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT id, item_no, barcd, product_name
+                FROM products
+                ORDER BY id DESC
+                """
+            )
+        ).mappings().all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}") from exc
+
+    products = []
+    seen_item_nos: set[str] = set()
+    for row in rows:
+        item_no = str(row["item_no"])
+        if item_no in seen_item_nos:
+            continue
+        seen_item_nos.add(item_no)
+
+        name = str(row["product_name"])
+        embedding_key = item_no
+        embedding_count = 0
+        if embedding_key in embed_products:
+            embedding_count = int(embed_products[embedding_key]["embedding_count"])
+            embed_products.pop(embedding_key, None)
+        else:
+            label = f"{item_no}_{name}"
+            embedding_count = label_counts.get(label, 0)
+            if embedding_count == 0:
+                embedding_count = label_counts.get(name, 0)
+
+        price_row = db.execute(
+            text(
+                """
+                SELECT price
+                FROM product_prices
+                WHERE product_id = :pid
+                ORDER BY checked_at DESC, id DESC
+                LIMIT 1
+                """
+            ),
+            {"pid": row["id"]},
+        ).mappings().first()
+        price = int(price_row["price"]) if price_row else None
+
+        products.append(
+            {
+                "id": int(row["id"]),
+                "item_no": item_no,
+                "name": name,
+                "price": price,
+                "barcd": row.get("barcd"),
+                "label": f"{item_no}_{name}",
+                "embedding_count": int(embedding_count),
+            }
         )
 
-    product_counts: dict[str, dict[str, object]] = {}
-    for lbl in labels:
-        label = str(lbl)
-        # 'item_no_name'에서 name만 추출
-        if "_" in label:
-            item_no, name = label.split("_", 1)
-        else:
-            item_no, name = label, label
-        entry = product_counts.get(item_no)
-        if not entry:
-            entry = {"item_no": item_no, "name": name, "embedding_count": 0}
-            product_counts[item_no] = entry
-        entry["embedding_count"] = int(entry["embedding_count"]) + 1
+    # Add embedding-only products not present in DB
+    for key in sorted(embed_products.keys()):
+        entry = embed_products[key]
+        item_no = entry.get("item_no")
+        name = entry.get("name")
+        products.append(
+            {
+                "id": None,
+                "item_no": item_no or "",
+                "name": str(name),
+                "price": None,
+                "barcd": None,
+                "label": f"{item_no}_{name}" if item_no else str(name),
+                "embedding_count": int(entry.get("embedding_count") or 0),
+            }
+        )
 
-    products = [
-        entry for entry in sorted(product_counts.values(), key=lambda x: str(x["name"]))
-    ]
-    return JSONResponse(
-        content={
-            "products": products,
-            "total_embeddings": int(len(labels)),
-        },
-        media_type="application/json; charset=utf-8"
-    )
+    return {
+        "products": products,
+        "total_embeddings": embedding_total,
+    }
+
+
+@router.delete("/products/{item_no}")
+async def delete_product(item_no: str, db: Session = Depends(get_db)):
+    """Delete a product from catalog and embeddings by item_no."""
+    clean_item_no = (item_no or "").strip()
+    if not clean_item_no:
+        raise HTTPException(status_code=422, detail="Item number is required")
+
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT id, product_name
+                FROM products
+                WHERE item_no = :item_no
+                ORDER BY id DESC
+                """
+            ),
+            {"item_no": clean_item_no},
+        ).mappings().all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}") from exc
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    product_ids = [int(r["id"]) for r in rows]
+    product_names = {str(r["product_name"]) for r in rows if r.get("product_name")}
+
+    # Update embeddings + FAISS index
+    removed_embeddings = 0
+    async with app_state.index_rwlock.writer_lock:
+        if os.path.exists(config.EMBEDDINGS_PATH) and os.path.exists(config.LABELS_PATH):
+            embeddings = np.load(config.EMBEDDINGS_PATH).astype(np.float32)
+            labels = np.load(config.LABELS_PATH, allow_pickle=True)
+
+            if embeddings.shape[0] != len(labels):
+                raise HTTPException(
+                    status_code=500, detail="embeddings.npy and labels.npy mismatch"
+                )
+
+            keep_mask = []
+            for lbl in labels:
+                label_str = str(lbl)
+                should_remove = label_str.startswith(f"{clean_item_no}_")
+                if not should_remove and label_str in product_names:
+                    should_remove = True
+                keep_mask.append(not should_remove)
+
+            keep_mask = np.array(keep_mask, dtype=bool)
+            removed_embeddings = int((~keep_mask).sum())
+
+            updated_emb = embeddings[keep_mask]
+            updated_lbl = labels[keep_mask]
+
+            np.save(config.EMBEDDINGS_PATH, updated_emb)
+            np.save(config.LABELS_PATH, updated_lbl)
+
+            bundle = app_state.model_bundle
+            weighted_db = _recompute_weighted_db(
+                updated_emb, bundle["dino_dim"], bundle["clip_dim"]
+            )
+            app_state.weighted_db = weighted_db
+            app_state.labels = updated_lbl
+
+            from checkout_core.inference import build_or_load_index
+
+            app_state.faiss_index = build_or_load_index(weighted_db, config.FAISS_INDEX_PATH)
+
+    try:
+        for pid in product_ids:
+            db.execute(
+                text("DELETE FROM product_prices WHERE product_id = :pid"),
+                {"pid": pid},
+            )
+        db.execute(
+            text("DELETE FROM products WHERE item_no = :item_no"),
+            {"item_no": clean_item_no},
+        )
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}") from exc
+
+    return {
+        "status": "deleted",
+        "item_no": clean_item_no,
+        "removed_embeddings": removed_embeddings,
+        "removed_products": len(product_ids),
+    }

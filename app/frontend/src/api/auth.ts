@@ -1,18 +1,11 @@
-import { request } from "./base";
+﻿import { request } from "./base";
 
 export interface User {
   id: number;
   username: string;
-  name: string | null;
+  name?: string | null;
   role: string;
   is_active: boolean;
-}
-
-export interface SignupData {
-  username: string;
-  password: string;
-  name: string;
-  role?: string;
 }
 
 export interface LoginResponse {
@@ -21,26 +14,32 @@ export interface LoginResponse {
   user: User;
 }
 
-export function signup(data: SignupData): Promise<User> {
-  return request("/auth/signup", {
+export function signup(payload: {
+  username: string;
+  password: string;
+  name: string;
+  role?: string;
+}) {
+  return request<User>("/auth/signup", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
+    body: JSON.stringify(payload),
   });
 }
 
-export function login(username: string, password: string): Promise<LoginResponse> {
-  const formData = new FormData();
-  formData.append("username", username);
-  formData.append("password", password);
-  return request("/auth/login", {
+export function login(username: string, password: string) {
+  const form = new URLSearchParams();
+  form.append("username", username);
+  form.append("password", password);
+  return request<LoginResponse>("/auth/login", {
     method: "POST",
-    body: formData,
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: form.toString(),
   });
 }
 
-export function getMe(token: string): Promise<User> {
-  return request("/auth/me", {
-    headers: { Authorization: `Bearer ${token}` },
+export function getMe(token: string) {
+  return request<User>("/auth/me", {
+    method: "GET",
+    token,
   });
 }

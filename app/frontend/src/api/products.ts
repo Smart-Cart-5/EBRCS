@@ -1,4 +1,4 @@
-import { request } from "./base";
+﻿import { request } from "./base";
 
 export interface Product {
   id?: number;

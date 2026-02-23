@@ -1,4 +1,4 @@
-import { request } from "./base";
+﻿import { request } from "./base";
 
 export interface ChatbotQueryRequest {
   question: string;
@@ -25,11 +25,12 @@ export interface ChatbotQueryResponse {
     unpriced_items: string[];
   };
   cart_update?: {
-    action: "add" | "remove";
+    action: "add" | "remove" | "clear";
     item: string | null;
     quantity: number;
     new_quantity: number | null;
     billing_items: Record<string, number>;
+    removed_items?: Record<string, number>;
     error?: string;
     candidates?: Array<{
       item_no: string;

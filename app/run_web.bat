@@ -9,17 +9,17 @@ for %%I in ("%APP_DIR%..") do set PROJECT_ROOT=%%~fI
 REM Load .env if exists
 if exist "%PROJECT_ROOT%\.env" (
     echo Loading environment from %PROJECT_ROOT%\.env...
-    for /f "delims=" %%a in ('type "%PROJECT_ROOT%\.env" ^| findstr /v "^#"') do set %%a
+    for /f "delims=" %%a in ('type "%PROJECT_ROOT%\.env" ^| findstr /r "="') do set %%a
 )
 
 if exist "%APP_DIR%.env" (
     echo Loading environment from %APP_DIR%.env...
-    for /f "delims=" %%a in ('type "%APP_DIR%.env" ^| findstr /v "^#"') do set %%a
+    for /f "delims=" %%a in ('type "%APP_DIR%.env" ^| findstr /r "="') do set %%a
 )
 
 REM Activate backend virtual environment
 if not exist "%APP_DIR%backend\.venv\Scripts\activate.bat" (
-    echo ⚠️  Backend virtual environment not found. Run setup_venv.bat first.
+    echo Backend virtual environment not found. Run setup_venv.bat first.
     pause
     exit /b 1
 )
@@ -29,6 +29,10 @@ call "%APP_DIR%backend\.venv\Scripts\activate.bat"
 
 REM Fix OpenMP duplicate library issue
 set KMP_DUPLICATE_LIB_OK=TRUE
+
+REM Stop existing dev server windows to avoid duplicates
+taskkill /FI "WINDOWTITLE eq EBRCS Backend" /T /F >nul 2>&1
+taskkill /FI "WINDOWTITLE eq EBRCS Frontend" /T /F >nul 2>&1
 
 echo === EBRCS Web App (Local Dev) ===
 echo Backend : http://localhost:8000
@@ -47,6 +51,7 @@ REM Start frontend in new window
 start "EBRCS Frontend" cmd /k "cd /d %APP_DIR%frontend && npm run dev"
 
 echo.
-echo ✅ Backend and Frontend started in separate windows
+echo Backend and Frontend started in separate windows
 echo Close the terminal windows to stop the servers
 pause
+exit /b 0

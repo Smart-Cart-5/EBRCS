@@ -3,8 +3,9 @@
 from datetime import datetime, timedelta
 from typing import Annotated, List
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from backend import models
@@ -45,7 +46,7 @@ class PopularProduct(BaseModel):
     total_count: int
 
 
-class DailyStats(BaseModel):
+class DailyStat(BaseModel):
     date: str
     purchase_count: int
     revenue: int
@@ -55,13 +56,13 @@ class DashboardStats(BaseModel):
     total_purchases: int
     total_customers: int
     today_purchases: int
-    total_revenue: int
-    average_order_value: int
-    today_revenue: int
     total_products_sold: int
-    daily_stats: List[DailyStats]
     popular_products: List[PopularProduct]
     recent_purchases: List[PurchaseResponse]
+    daily_stats: List[DailyStat]
+    total_revenue: int
+    average_order_value: float
+    today_revenue: int
 
 
 @router.get("/my", response_model=List[PurchaseResponse])
@@ -167,42 +168,11 @@ def create_purchase(
     }
 
 
-@router.delete("/{purchase_id}")
-def delete_purchase(
-    purchase_id: int,
-    current_user: Annotated[models.User, Depends(get_current_user)],
-    db: Session = Depends(get_db),
-):
-    """Delete a purchase record owned by current user (or admin)."""
-    purchase = (
-        db.query(models.PurchaseHistory)
-        .filter(models.PurchaseHistory.id == purchase_id)
-        .first()
-    )
-
-    if not purchase:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Purchase not found",
-        )
-
-    if purchase.user_id != current_user.id and current_user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You do not have permission to delete this purchase",
-        )
-
-    db.delete(purchase)
-    db.commit()
-
-    return {"status": "deleted", "purchase_id": purchase_id}
-
-
 @router.get("/dashboard", response_model=DashboardStats)
 def get_dashboard_stats(
     current_user: Annotated[models.User, Depends(get_current_user)],
-    days: int = Query(default=7, ge=7, le=90),
     db: Session = Depends(get_db),
+    period_days: int = 7,
 ):
     """Get dashboard statistics (admin only)."""
     if current_user.role != "admin":
@@ -210,6 +180,12 @@ def get_dashboard_stats(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required",
         )
+
+    period_days = max(1, min(period_days, 365))
+    end_date = datetime.utcnow().date()
+    start_date = end_date - timedelta(days=period_days - 1)
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
 
     # Total purchases
     total_purchases = db.query(models.PurchaseHistory).count()
@@ -219,38 +195,30 @@ def get_dashboard_stats(
 
     # Today's purchases
     today = datetime.utcnow().date()
-    all_purchases = db.query(models.PurchaseHistory).all()
+    today_start = datetime.combine(today, datetime.min.time())
+    today_purchases = (
+        db.query(models.PurchaseHistory)
+        .filter(models.PurchaseHistory.timestamp >= today_start)
+        .count()
+    )
 
-    today_purchases = 0
-    today_revenue = 0
-    total_revenue = 0
-    for purchase in all_purchases:
-        amount = int(purchase.total_amount or 0)
-        total_revenue += amount
-        if purchase.timestamp.date() == today:
-            today_purchases += 1
-            today_revenue += amount
-
-    average_order_value = int(total_revenue / total_purchases) if total_purchases > 0 else 0
-
-    period_days = days if days in {7, 30, 90} else 7
-
-    # Daily trend (recent period days)
-    days_window = [today - timedelta(days=offset) for offset in range(period_days - 1, -1, -1)]
-    daily_map = {
-        day.isoformat(): {"date": day.isoformat(), "purchase_count": 0, "revenue": 0}
-        for day in days_window
-    }
-
-    for purchase in all_purchases:
-        day_key = purchase.timestamp.date().isoformat()
-        if day_key in daily_map:
-            daily_map[day_key]["purchase_count"] += 1
-            daily_map[day_key]["revenue"] += int(purchase.total_amount or 0)
-
-    daily_stats = [daily_map[day.isoformat()] for day in days_window]
+    total_revenue = (
+        db.query(func.coalesce(func.sum(models.PurchaseHistory.total_amount), 0)).scalar()
+        or 0
+    )
+    today_revenue = (
+        db.query(func.coalesce(func.sum(models.PurchaseHistory.total_amount), 0))
+        .filter(models.PurchaseHistory.timestamp >= today_start)
+        .scalar()
+        or 0
+    )
+    average_order_value = (
+        float(total_revenue) / float(total_purchases) if total_purchases > 0 else 0.0
+    )
 
     # Total products sold and popular products
+    all_purchases = db.query(models.PurchaseHistory).all()
+
     product_counts = {}
     total_products_sold = 0
 
@@ -289,15 +257,44 @@ def get_dashboard_stats(
         for p in recent_purchases_db
     ]
 
+    # Daily stats (period_days)
+    daily_map = {}
+    cursor = start_date
+    while cursor <= end_date:
+        daily_map[cursor] = {"purchase_count": 0, "revenue": 0}
+        cursor += timedelta(days=1)
+
+    range_purchases = (
+        db.query(models.PurchaseHistory)
+        .filter(models.PurchaseHistory.timestamp >= start_dt)
+        .filter(models.PurchaseHistory.timestamp < end_dt)
+        .all()
+    )
+
+    for purchase in range_purchases:
+        day = purchase.timestamp.date()
+        if day in daily_map:
+            daily_map[day]["purchase_count"] += 1
+            daily_map[day]["revenue"] += int(purchase.total_amount or 0)
+
+    daily_stats = [
+        {
+            "date": day.isoformat(),
+            "purchase_count": daily_map[day]["purchase_count"],
+            "revenue": daily_map[day]["revenue"],
+        }
+        for day in sorted(daily_map.keys())
+    ]
+
     return {
         "total_purchases": total_purchases,
         "total_customers": total_customers,
         "today_purchases": today_purchases,
-        "total_revenue": total_revenue,
-        "average_order_value": average_order_value,
-        "today_revenue": today_revenue,
         "total_products_sold": total_products_sold,
-        "daily_stats": daily_stats,
         "popular_products": popular_products,
         "recent_purchases": recent_purchases,
+        "daily_stats": daily_stats,
+        "total_revenue": int(total_revenue),
+        "average_order_value": average_order_value,
+        "today_revenue": int(today_revenue),
     }
