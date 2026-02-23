@@ -227,7 +227,6 @@ export default function App() {
         </div>
       </nav>
 
-      {/* Chatbot Widget */}
       <ChatbotWidget />
     </div>
   );
