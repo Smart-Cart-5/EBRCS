@@ -14,6 +14,9 @@
 - Python 3.11+
 - Node.js 20.19+
 
+로컬에 MySQL 서버/클라이언트를 직접 설치할 필요는 없습니다.
+이 문서의 Docker 기반 스크립트로 DB를 구성하고 시드를 import합니다.
+
 ## 1) 저장소 clone
 
 ```bash
@@ -90,4 +93,31 @@ MySQL 컨테이너 종료:
 
 ```bash
 ./db/stop_local_mysql.sh --purge
+```
+
+---
+
+## Windows PowerShell/CMD 실행 순서
+
+`main/EBRCS` 기준:
+
+```powershell
+cd .\db
+.\start_local_mysql.bat
+cd ..\app
+.\setup_venv.bat
+.\setup_db.bat
+cd ..\db
+.\import_price_seed.bat --seed .\seeds\price_seed_latest.sql
+cd ..\app
+.\run_web.bat
+```
+
+종료:
+
+```powershell
+cd .\app
+.\stop_web.sh
+cd ..\db
+.\stop_local_mysql.bat
 ```

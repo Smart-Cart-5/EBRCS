@@ -248,29 +248,54 @@ def _clean_keyword(text: str) -> str:
 
 
 
-def _get_hf_token() -> str | None:
-    """Resolve HF token from env first, then PROJECT_ROOT/.env fallback."""
-    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-    if token:
-        return token.strip()
-
-    env_path = Path(__file__).resolve().parents[3] / ".env"
-    if not env_path.is_file():
+def _read_hf_token_from_env_file(path: Path) -> str | None:
+    if not path.is_file():
         return None
 
-    for raw in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip("'").strip('"')
-        if key in {"HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"} and value:
-            return value
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            if key in {"HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"} and value:
+                return value
+    except OSError:
+        return None
 
     return None
 
 
+def _get_hf_token() -> str | None:
+    """Resolve HF token from env first, then common .env fallback files."""
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    if token:
+        return token.strip()
+
+    token_file = os.getenv("HF_TOKEN_FILE")
+    if token_file:
+        token_from_file = _read_hf_token_from_env_file(Path(token_file).expanduser())
+        if token_from_file:
+            return token_from_file
+
+    backend_dir = Path(__file__).resolve().parents[1]
+    app_dir = backend_dir.parent
+    project_root = app_dir.parent
+
+    env_candidates = [
+        project_root / ".env",
+        app_dir / ".env",
+        Path.cwd() / ".env",
+    ]
+
+    for env_path in env_candidates:
+        token_from_file = _read_hf_token_from_env_file(env_path)
+        if token_from_file:
+            return token_from_file
+
+    return None
 # ---------------------------------------------------------------------------
 # Request / Response schemas
 # ---------------------------------------------------------------------------

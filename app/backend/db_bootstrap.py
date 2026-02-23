@@ -24,6 +24,15 @@ MYSQL_SCHEMA_STATEMENTS = (
         item_no VARCHAR(64) NOT NULL,
         barcd VARCHAR(64) NULL,
         product_name VARCHAR(255) NOT NULL,
+        company VARCHAR(255) NULL,
+        volume VARCHAR(64) NULL,
+        category_l VARCHAR(128) NULL,
+        category_m VARCHAR(128) NULL,
+        category_s VARCHAR(128) NULL,
+        nutrition_info TEXT NULL,
+        src_meta_xml TEXT NULL,
+        dedup_key_type VARCHAR(32) NULL,
+        dedup_key VARCHAR(255) NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
@@ -39,6 +48,10 @@ MYSQL_SCHEMA_STATEMENTS = (
         currency VARCHAR(8) NOT NULL DEFAULT 'KRW',
         source VARCHAR(128) NULL,
         checked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        query_type VARCHAR(64) NULL,
+        query_value TEXT NULL,
+        mall_name VARCHAR(255) NULL,
+        match_title TEXT NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
         INDEX idx_product_prices_product_checked (product_id, checked_at),
@@ -48,6 +61,25 @@ MYSQL_SCHEMA_STATEMENTS = (
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
 )
+
+MYSQL_PRODUCT_OPTIONAL_COLUMNS: dict[str, str] = {
+    "company": "VARCHAR(255) NULL",
+    "volume": "VARCHAR(64) NULL",
+    "category_l": "VARCHAR(128) NULL",
+    "category_m": "VARCHAR(128) NULL",
+    "category_s": "VARCHAR(128) NULL",
+    "nutrition_info": "TEXT NULL",
+    "src_meta_xml": "TEXT NULL",
+    "dedup_key_type": "VARCHAR(32) NULL",
+    "dedup_key": "VARCHAR(255) NULL",
+}
+
+MYSQL_PRODUCT_PRICE_OPTIONAL_COLUMNS: dict[str, str] = {
+    "query_type": "VARCHAR(64) NULL",
+    "query_value": "TEXT NULL",
+    "mall_name": "VARCHAR(255) NULL",
+    "match_title": "TEXT NULL",
+}
 
 SQLITE_SCHEMA_STATEMENTS = (
     """
@@ -170,6 +202,37 @@ def bootstrap_database() -> dict[str, object]:
             conn.execute(text("PRAGMA foreign_keys = ON"))
         for stmt in statements:
             conn.execute(text(stmt))
+
+        if dialect in {"mysql", "mariadb"}:
+            existing_cols = {
+                str(row[0])
+                for row in conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() AND table_name = 'products'"
+                    )
+                ).fetchall()
+            }
+
+            for column_name, ddl in MYSQL_PRODUCT_OPTIONAL_COLUMNS.items():
+                if column_name in existing_cols:
+                    continue
+                conn.execute(text(f"ALTER TABLE products ADD COLUMN {column_name} {ddl}"))
+
+            existing_price_cols = {
+                str(row[0])
+                for row in conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = DATABASE() AND table_name = 'product_prices'"
+                    )
+                ).fetchall()
+            }
+
+            for column_name, ddl in MYSQL_PRODUCT_PRICE_OPTIONAL_COLUMNS.items():
+                if column_name in existing_price_cols:
+                    continue
+                conn.execute(text(f"ALTER TABLE product_prices ADD COLUMN {column_name} {ddl}"))
 
     tables = _inspect_tables()
     return {
