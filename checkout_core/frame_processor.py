@@ -1511,6 +1511,7 @@ def process_checkout_frame(
         if isinstance(mask_candidate, np.ndarray) and mask_candidate.shape[:2] == frame.shape[:2]:
             cart_roi_mask = mask_candidate
 
+        event_mode_for_roi_filter = bool(getattr(backend_config, "EVENT_MODE", False))
         for det in detections:
             cls = det.get("class")
             conf = float(det.get("confidence", 0.0))
@@ -1526,7 +1527,10 @@ def process_checkout_frame(
                 cy_px = max(0, min(cy_px, frame_h - 1))
                 if int(cart_roi_mask[cy_px, cx_px]) <= 0:
                     reject_stats["cart_roi_out"] += 1
-                    continue
+                    # Crossing 이벤트 모드에서는 outside 관측이 필수이므로
+                    # 상품은 cart ROI mask로 hard-drop 하지 않는다.
+                    if not (event_mode_for_roi_filter and cls == "product"):
+                        continue
 
             if cls == "hand":
                 if conf < float(hand_conf_min):
@@ -1584,7 +1588,10 @@ def process_checkout_frame(
                     )
                 if not passed_roi:
                     reject_stats["roi_out"] += 1
-                    continue
+                    # EVENT_MODE(crossing)에서는 outside->inside/inside->outside 전이를 보려면
+                    # ROI 밖 관측도 track 단위로 유지되어야 한다.
+                    if not event_mode_for_roi_filter:
+                        continue
 
             filtered_products.append(det)
 
@@ -1643,9 +1650,13 @@ def process_checkout_frame(
             event_engine = state.get("_event_engine")
             if event_engine is None:
                 event_engine = AddEventEngine(
-                    t_grasp_min_frames=getattr(backend_config, "T_GRASP_MIN_FRAMES", 4),
-                    t_place_stable_frames=getattr(backend_config, "T_PLACE_STABLE_FRAMES", 12),
-                    t_remove_confirm_frames=getattr(backend_config, "T_REMOVE_CONFIRM_FRAMES", 45),
+                    transition_confirm_frames=getattr(backend_config, "EVENT_TRANSITION_CONFIRM_FRAMES", 3),
+                    event_cooldown_sec=getattr(backend_config, "EVENT_COOLDOWN_SEC", 0.75),
+                    inside_mode=getattr(backend_config, "EVENT_INSIDE_MODE", "center"),
+                    inside_iou_threshold=getattr(backend_config, "EVENT_INSIDE_IOU_THRESHOLD", 0.15),
+                    inside_overlap_threshold=getattr(backend_config, "EVENT_INSIDE_OVERLAP_THRESHOLD", 0.2),
+                    track_ttl_frames=getattr(backend_config, "EVENT_TRACK_TTL_FRAMES", 45),
+                    allow_untracked_index_fallback=getattr(backend_config, "EVENT_ALLOW_INDEX_FALLBACK", False),
                     roi_hysteresis_inset_ratio=getattr(backend_config, "ROI_HYSTERESIS_INSET_RATIO", 0.05),
                     roi_hysteresis_outset_ratio=getattr(backend_config, "ROI_HYSTERESIS_OUTSET_RATIO", 0.05),
                 )
@@ -1661,11 +1672,14 @@ def process_checkout_frame(
                 products=all_products,
                 roi_poly=roi_poly,
                 frame_shape=frame.shape,
+                frame_id=frame_id,
+                session_id=session_id,
             )
             state["event_state"] = event_update.state
             state["last_status"] = event_update.status
+            state["last_event_payload"] = event_update.event_payload
 
-            if event_update.track_box is not None and event_update.state in (event_engine.GRASP, event_engine.PLACE_CHECK):
+            if event_update.track_box is not None and bool(event_update.curr_inside):
                 snapshot_buffer.add(frame, event_update.track_box)
             elif event_update.state == event_engine.IDLE:
                 snapshot_buffer.clear()

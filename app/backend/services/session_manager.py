@@ -38,6 +38,7 @@ class CheckoutSession:
         "confidence": 0.0,
         "best_pair": None,
         "event_state": "IDLE",
+        "last_event_payload": None,
         "occluded_by_hand": False,
         "overlap_hand_iou_max": 0.0,
         "search_crop_min_side_before": None,
@@ -138,6 +139,7 @@ class CheckoutSession:
         self.state["confidence"] = 0.0
         self.state["best_pair"] = None
         self.state["event_state"] = "IDLE"
+        self.state["last_event_payload"] = None
         self.state["occluded_by_hand"] = False
         self.state["overlap_hand_iou_max"] = 0.0
         self.state["search_crop_min_side_before"] = None

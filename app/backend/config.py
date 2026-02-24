@@ -106,11 +106,16 @@ ASSOCIATION_IOU_WEIGHT = float(os.getenv("ASSOCIATION_IOU_WEIGHT", "0.5"))
 ASSOCIATION_DIST_WEIGHT = float(os.getenv("ASSOCIATION_DIST_WEIGHT", "0.5"))
 ASSOCIATION_MAX_CENTER_DIST = float(os.getenv("ASSOCIATION_MAX_CENTER_DIST", "0.35"))
 ASSOCIATION_MIN_SCORE = float(os.getenv("ASSOCIATION_MIN_SCORE", "0.1"))
-EVENT_MODE = os.getenv("EVENT_MODE", "false").lower() == "true"
-T_GRASP_MIN_FRAMES = int(os.getenv("T_GRASP_MIN_FRAMES", "4"))
-T_PLACE_STABLE_FRAMES = int(os.getenv("T_PLACE_STABLE_FRAMES", "12"))
+EVENT_MODE = os.getenv("EVENT_MODE", "true").lower() == "true"
+# Crossing-based event engine options
+EVENT_INSIDE_MODE = os.getenv("EVENT_INSIDE_MODE", "center").strip().lower()
+EVENT_INSIDE_IOU_THRESHOLD = float(os.getenv("EVENT_INSIDE_IOU_THRESHOLD", "0.15"))
+EVENT_INSIDE_OVERLAP_THRESHOLD = float(os.getenv("EVENT_INSIDE_OVERLAP_THRESHOLD", "0.2"))
+EVENT_TRANSITION_CONFIRM_FRAMES = int(os.getenv("EVENT_TRANSITION_CONFIRM_FRAMES", "3"))
+EVENT_COOLDOWN_SEC = float(os.getenv("EVENT_COOLDOWN_SEC", "0.75"))
+EVENT_TRACK_TTL_FRAMES = int(os.getenv("EVENT_TRACK_TTL_FRAMES", "45"))
+EVENT_ALLOW_INDEX_FALLBACK = os.getenv("EVENT_ALLOW_INDEX_FALLBACK", "true").lower() == "true"
 SNAPSHOT_MAX_FRAMES = int(os.getenv("SNAPSHOT_MAX_FRAMES", "8"))
-T_REMOVE_CONFIRM_FRAMES = int(os.getenv("T_REMOVE_CONFIRM_FRAMES", "45"))
 ROI_HYSTERESIS_INSET_RATIO = float(os.getenv("ROI_HYSTERESIS_INSET_RATIO", "0.05"))
 ROI_HYSTERESIS_OUTSET_RATIO = float(os.getenv("ROI_HYSTERESIS_OUTSET_RATIO", "0.05"))
 WARP_MODE = os.getenv("WARP_MODE", "false").lower() == "true"
