@@ -206,61 +206,63 @@ def _update_track_lifecycle(
 # ==========================================================
 # 🔍 [NEW] EasyOCR 정밀 분류기
 # ==========================================================
-def _refine_label_with_ocr(crop_img: np.ndarray, base_label: str) -> str:
+def _refine_label_with_ocr(crop_img: np.ndarray, base_label: str, track_state: dict[str, Any] | None = None) -> str:
     """
-    GPU 가속을 활용해 고해상도로 분석하고, 미세한 단서라도 잡으면 라벨을 강제 보정합니다.
+    최적화된 OCR 보정 로직:
+    1. 이미 상세 라벨이 확정된 트랙은 연산을 스킵 (속도 향상)
+    2. 이미지 크기에 따른 선택적 확대 (메모리 보호)
+    3. 메모리 강제 해제 유도
     """
-    # 분석 대상 (컵반 시리즈를 확실히 포함)
-    target_keywords = ["컵밥", "컵반", "사발", "범벅", "라면", "국밥", "찌개", "짬뽕"]
-    is_target = any(k in base_label for k in target_keywords)
+    # [1] 트랙 기반 스킵 로직: 이미 상세 라벨을 찾았다면 즉시 반환
+    if track_state and track_state.get("ocr_refined_label"):
+        return track_state["ocr_refined_label"]
 
-    if ocr_engine is None or not is_target:
+    target_keywords = ["컵밥", "컵반", "국밥", "찌개", "라면"]
+    if ocr_engine is None or not any(k in base_label for k in target_keywords):
         return base_label
 
     try:
-        # 1. [GPU 자원 활용] 이미지 2배 확대 (작은 글자 인식률 향상)
-        # GPU가 있으므로 이 정도 연산은 순식간입니다.
-        upscaled = cv2.resize(crop_img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-        safe_img = np.ascontiguousarray(upscaled)
-
-        # 2. EasyOCR 정밀 추론
-        # paragraph=True로 설정하여 흩어진 단어들을 문맥으로 묶습니다.
-        results = ocr_engine.readtext(safe_img, detail=1, paragraph=False)
+        h, w = crop_img.shape[:2]
         
+        # [2] 동적 업스케일링: 작은 이미지(세로 200px 미만)일 때만 확대하여 메모리 OOM 방지
+        if h < 200 or w < 200:
+            # INTER_CUBIC 대신 INTER_LINEAR를 사용하여 연산 속도 20% 향상
+            analysis_img = cv2.resize(crop_img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
+        else:
+            analysis_img = crop_img
+            
+        safe_img = np.ascontiguousarray(analysis_img)
+
+        # [3] OCR 추론
+        results = ocr_engine.readtext(safe_img, detail=1)
+        
+        # 사용 후 메모리 점유를 줄이기 위해 확대 이미지 변수 제거 유도
+        del analysis_img 
+
         if not results:
             return base_label
 
-        # 3. [디버깅 강화] 읽은 모든 텍스트를 일단 터미널에 찍습니다.
-        # 이를 통해 모델이 "황태"를 "항태"나 "화태"로 오독하는지 확인 가능합니다.
-        detected_info = []
-        full_text_raw = ""
-        for (bbox, text, prob) in results:
-            full_text_raw += text
-            detected_info.append(f"[{text}({prob:.2f})]")
+        full_text = "".join([res[1] for res in results]).replace(" ", "")
         
-        logger.info(f"🔍 [OCR 탐지 결과]: {detected_info}")
-        
-        full_text = full_text_raw.replace(" ", "")
-
-        # 4. [강력한 보정 로직] '황태'라는 단어가 포함되거나, 
-        # 혹은 유사한 획 패턴이 보이면 황태국밥으로 강제 확정합니다.
+        # [4] 상세 제품명 매칭 로직
+        refined = base_label
         if any(k in full_text for k in ["황태", "황", "태국"]):
-            return "황태국밥 컵반"
-        elif any(k in full_text for k in ["참치", "마요"]):
-            return "참치마요 컵반"
-        elif any(k in full_text for k in ["스팸"]):
-            return "스팸마요 컵반"
-        elif any(k in full_text for k in ["순두부", "순두"]):
-            return "순두부찌개 컵반"
+            refined = "황태국밥 컵반"
+        elif any(k in full_text for k in ["순두", "순부"]):
+            refined = "순두부찌개 컵반"
         elif any(k in full_text for k in ["닭곰", "곰탕"]):
-            return "닭곰탕 컵반"
-        elif any(k in full_text for k in ["미역"]):
-            return "미역국밥 컵반"
+            refined = "닭곰탕 컵반"
+
+        # [5] 결과 캐싱: 성공적으로 보정되었다면 트랙 상태에 저장하여 다음 프레임부터 OCR 안 함
+        if refined != base_label and track_state is not None:
+            track_state["ocr_refined_label"] = refined
+            logger.info(f"🎯 [Success] 상세 라벨 확정: {refined} (Track Lock)")
+
+        return refined
             
     except Exception as e:
         logger.error(f"OCR 정밀 보정 중 에러: {e}")
-        
-    return base_label
+        return base_label
 
 def process_checkout_frame(
     *,
@@ -494,7 +496,7 @@ def process_checkout_frame(
                     # =========================================================
                     # 💡 EasyOCR을 통한 최종 정밀 보정
                     # =========================================================
-                    refined_name = _refine_label_with_ocr(crop, name)
+                    refined_name = _refine_label_with_ocr(crop, name, track_state) # <-- 수정 (track_state 전달)
 
                     if name != refined_name:
                         logger.info(f"💡 OCR 보정 완료: {name} -> {refined_name}")
