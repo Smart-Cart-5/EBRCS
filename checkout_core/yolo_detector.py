@@ -16,7 +16,14 @@ class YOLODetector:
     Detects both products and hands in the frame, returning normalized bounding boxes.
     """
 
-    def __init__(self, model_path: str, conf_threshold: float = 0.3, device: str = "cpu"):
+    def __init__(
+        self,
+        model_path: str,
+        conf_threshold: float = 0.3,
+        device: str = "cpu",
+        hand_aliases: list[str] | None = None,
+        product_aliases: list[str] | None = None,
+    ):
         """Initialize YOLO detector.
 
         Args:
@@ -34,14 +41,42 @@ class YOLODetector:
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
         self.device = device
+        self.hand_aliases = {str(x).strip().lower() for x in (hand_aliases or ["hand", "hands", "palm"])}
+        self.product_aliases = {
+            str(x).strip().lower() for x in (product_aliases or ["object", "product", "item", "goods"])
+        }
 
         # Move model to device
         self.model.to(device)
+        names_obj = getattr(self.model, "names", {})
+        if isinstance(names_obj, dict):
+            self.class_names = {int(k): str(v) for k, v in names_obj.items()}
+        elif isinstance(names_obj, list):
+            self.class_names = {idx: str(name) for idx, name in enumerate(names_obj)}
+        else:
+            self.class_names = {}
 
         logger.info(
-            "YOLO detector initialized: model=%s, conf=%.2f, device=%s",
-            model_path, conf_threshold, device
+            "YOLO detector initialized: model=%s, conf=%.2f, device=%s hand_aliases=%s product_aliases=%s class_names=%s",
+            model_path,
+            conf_threshold,
+            device,
+            sorted(self.hand_aliases),
+            sorted(self.product_aliases),
+            self.class_names,
         )
+
+    def _map_class(self, cls_id: int) -> tuple[str, str]:
+        raw_name = str(self.class_names.get(int(cls_id), f"class_{int(cls_id)}")).strip()
+        name_norm = raw_name.lower()
+        if name_norm in self.hand_aliases:
+            return "hand", raw_name
+        if name_norm in self.product_aliases:
+            return "product", raw_name
+        # Backward-compatible fallback for 2-class hand/object models.
+        if int(cls_id) == 0:
+            return "hand", raw_name
+        return "product", raw_name
 
     def detect(self, frame: np.ndarray) -> list[dict[str, Any]]:
         """Run YOLO detection on a single frame.
@@ -100,13 +135,14 @@ class YOLODetector:
                 cls_id = int(box.cls[0].cpu().numpy())
                 conf = float(box.conf[0].cpu().numpy())
 
-                # Map class ID to name (0: hand, 1: object/product)
-                class_name = "hand" if cls_id == 0 else "product"
+                class_name, raw_class_name = self._map_class(cls_id)
 
                 detections.append({
                     "box": [x1_norm, y1_norm, x2_norm, y2_norm],
                     "class": class_name,
-                    "confidence": conf
+                    "confidence": conf,
+                    "raw_class_id": int(cls_id),
+                    "raw_class_name": raw_class_name,
                 })
 
         return detections

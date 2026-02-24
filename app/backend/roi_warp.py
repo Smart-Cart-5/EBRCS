@@ -36,3 +36,21 @@ def warp_frame(
     )
     m = cv2.getPerspectiveTransform(src, dst)
     return cv2.warpPerspective(frame, m, (out_w, out_h))
+
+
+def get_warp_matrix(
+    frame_shape: tuple[int, ...],
+    points_norm: list[list[float]],
+    warp_size: tuple[int, int],
+) -> np.ndarray:
+    h, w = frame_shape[:2]
+    src = np.array(
+        [[p[0] * w, p[1] * h] for p in order_points_tl_tr_br_bl(points_norm)],
+        dtype=np.float32,
+    )
+    out_w, out_h = int(warp_size[0]), int(warp_size[1])
+    dst = np.array(
+        [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
+        dtype=np.float32,
+    )
+    return cv2.getPerspectiveTransform(src, dst)

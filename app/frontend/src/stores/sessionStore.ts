@@ -34,6 +34,7 @@ interface SessionStore {
   roiPolygon: number[][] | null; // Normalized ROI polygon coordinates [[x1,y1], [x2,y2], ...]
   detectionBoxes: DetectionBox[]; // YOLO detection results
   warpEnabled: boolean;
+  warpApplied: boolean;
   warpPoints: number[][] | null;
   didSearch: boolean;
   skipReason: string;
@@ -52,6 +53,19 @@ interface SessionStore {
   cartRoiUnavailableReason: string | null;
   lastRoiError: string | null;
   cartRoiInvalidReason: string | null;
+  eventRoiMode: string;
+  eventRoiSource: string;
+  eventRoiReady: boolean;
+  eventRoiBounds: number[] | null;
+  eventRoiAreaRatio: number;
+  eventRoiBoundsOriginal: number[] | null;
+  eventRoiAreaRatioOriginal: number;
+  eventRoiBoundsWarp: number[] | null;
+  eventRoiAreaRatioWarp: number;
+  eventRoiTooLarge: boolean;
+  eventRoiWarnings: string[];
+  virtualScale: number;
+  vdApplied: boolean;
 
   createSession: () => Promise<string>;
   updateFromWsMessage: (data: WsMessage) => void;
@@ -79,6 +93,7 @@ export interface WsMessage {
   last_result_age_ms?: number | null;
   topk_candidates?: TopKCandidate[];
   warp_enabled?: boolean;
+  warp_applied?: boolean;
   warp_points?: number[][] | null;
   cart_roi_confirmed?: boolean;
   cart_roi_preview_ready?: boolean;
@@ -93,6 +108,19 @@ export interface WsMessage {
   cart_roi_unavailable_reason?: string | null;
   last_roi_error?: string | null;
   cart_roi_invalid_reason?: string | null;
+  event_roi_mode?: string;
+  event_roi_source?: string;
+  event_roi_ready?: boolean;
+  event_roi_bounds?: number[] | null;
+  event_roi_area_ratio?: number;
+  event_roi_bounds_original?: number[] | null;
+  event_roi_area_ratio_original?: number;
+  event_roi_bounds_warp?: number[] | null;
+  event_roi_area_ratio_warp?: number;
+  event_roi_too_large?: boolean;
+  event_roi_warnings?: string[];
+  virtual_scale?: number;
+  vd_applied?: boolean;
 }
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
@@ -110,6 +138,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   roiPolygon: null,
   detectionBoxes: [],
   warpEnabled: false,
+  warpApplied: false,
   warpPoints: null,
   didSearch: false,
   skipReason: "init",
@@ -128,6 +157,19 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   cartRoiUnavailableReason: null,
   lastRoiError: null,
   cartRoiInvalidReason: null,
+  eventRoiMode: "full",
+  eventRoiSource: "full_fallback",
+  eventRoiReady: false,
+  eventRoiBounds: null,
+  eventRoiAreaRatio: 0,
+  eventRoiBoundsOriginal: null,
+  eventRoiAreaRatioOriginal: 0,
+  eventRoiBoundsWarp: null,
+  eventRoiAreaRatioWarp: 0,
+  eventRoiTooLarge: false,
+  eventRoiWarnings: [],
+  virtualScale: 1.0,
+  vdApplied: false,
 
   createSession: async () => {
     const { session_id } = await api.createSession();
@@ -167,6 +209,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       lastResultAgeMs: data.last_result_age_ms ?? null,
       topkCandidates: data.topk_candidates ?? [],
       warpEnabled: data.warp_enabled ?? false,
+      warpApplied: data.warp_applied ?? false,
       warpPoints: data.warp_points ?? null,
       cartRoiConfirmed: data.cart_roi_confirmed ?? false,
       cartRoiPreviewReady: data.cart_roi_preview_ready ?? false,
@@ -181,6 +224,19 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       cartRoiUnavailableReason: data.cart_roi_unavailable_reason ?? null,
       lastRoiError: data.last_roi_error ?? null,
       cartRoiInvalidReason: data.cart_roi_invalid_reason ?? null,
+      eventRoiMode: data.event_roi_mode ?? "full",
+      eventRoiSource: data.event_roi_source ?? "full_fallback",
+      eventRoiReady: data.event_roi_ready ?? false,
+      eventRoiBounds: data.event_roi_bounds ?? null,
+      eventRoiAreaRatio: data.event_roi_area_ratio ?? 0,
+      eventRoiBoundsOriginal: data.event_roi_bounds_original ?? null,
+      eventRoiAreaRatioOriginal: data.event_roi_area_ratio_original ?? 0,
+      eventRoiBoundsWarp: data.event_roi_bounds_warp ?? null,
+      eventRoiAreaRatioWarp: data.event_roi_area_ratio_warp ?? 0,
+      eventRoiTooLarge: data.event_roi_too_large ?? false,
+      eventRoiWarnings: data.event_roi_warnings ?? [],
+      virtualScale: data.virtual_scale ?? 1.0,
+      vdApplied: data.vd_applied ?? false,
     });
   },
 
@@ -208,6 +264,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       roiPolygon: null,
       detectionBoxes: [],
       warpEnabled: false,
+      warpApplied: false,
       warpPoints: null,
       didSearch: false,
       skipReason: "init",
@@ -226,6 +283,19 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       cartRoiUnavailableReason: null,
       lastRoiError: null,
       cartRoiInvalidReason: null,
+      eventRoiMode: "full",
+      eventRoiSource: "full_fallback",
+      eventRoiReady: false,
+      eventRoiBounds: null,
+      eventRoiAreaRatio: 0,
+      eventRoiBoundsOriginal: null,
+      eventRoiAreaRatioOriginal: 0,
+      eventRoiBoundsWarp: null,
+      eventRoiAreaRatioWarp: 0,
+      eventRoiTooLarge: false,
+      eventRoiWarnings: [],
+      virtualScale: 1.0,
+      vdApplied: false,
     });
   },
 }));

@@ -221,6 +221,10 @@ async def lifespan(app: FastAPI):
                     model_path=config.YOLO_MODEL_PATH,
                     conf_threshold=config.YOLO_CONF_THRESHOLD,
                     device=device_str,
+                    hand_aliases=[x.strip() for x in str(config.YOLO_HAND_CLASS_ALIASES).split(",") if x.strip()],
+                    product_aliases=[
+                        x.strip() for x in str(config.YOLO_PRODUCT_CLASS_ALIASES).split(",") if x.strip()
+                    ],
                 )
                 logger.info("YOLO detector loaded: %s", config.YOLO_MODEL_PATH)
             except Exception as e:

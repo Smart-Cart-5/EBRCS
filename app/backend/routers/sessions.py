@@ -89,6 +89,17 @@ class CheckoutStartResponse(BaseModel):
     message: str | None = None
 
 
+def _polygon_area_norm(points: list[list[float]]) -> float:
+    if not isinstance(points, list) or len(points) < 3:
+        return 0.0
+    total = 0.0
+    for idx in range(len(points)):
+        x1, y1 = points[idx]
+        x2, y2 = points[(idx + 1) % len(points)]
+        total += float(x1) * float(y2) - float(x2) * float(y1)
+    return abs(total) * 0.5
+
+
 @router.post("/sessions", response_model=SessionResponse)
 async def create_session():
     """Create a new checkout session."""
@@ -131,6 +142,7 @@ async def clear_roi(session_id: str):
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     session.roi_poly_norm = None
+    session.state["_event_roi_override_norm"] = None
     return {"status": "cleared"}
 
 
@@ -230,12 +242,14 @@ async def checkout_start(session_id: str, req: CheckoutStartRequest):
     phase = session.start_checkout_with_mode(effective_mode)
     session.state["_checkout_user_message"] = message
     logger.info(
-        "Checkout start: session=%s requested_mode=%s effective_mode=%s phase=%s reason=%s",
+        "Checkout start: session=%s requested_mode=%s effective_mode=%s phase=%s reason=%s warp_enabled=%s warp_points_ready=%s",
         session_id,
         requested_mode,
         effective_mode,
         phase,
         app_state.cart_roi_unavailable_reason,
+        bool(session.warp_enabled),
+        bool(isinstance(session.warp_points_norm, list) and len(session.warp_points_norm) == 4),
     )
     return CheckoutStartResponse(
         session_id=session_id,
@@ -257,14 +271,51 @@ async def set_warp(session_id: str, req: WarpRequest):
     for pt in req.points:
         if len(pt) != 2:
             raise HTTPException(status_code=422, detail="Each point must be [x, y]")
+    edge_margin = float(getattr(config, "EVENT_ROI_EDGE_WARN_MARGIN", 0.05))
+    too_large_ratio = float(getattr(config, "EVENT_ROI_TOO_LARGE_RATIO", 0.90))
+    normalized_points: list[list[float]] = []
+    near_edge = False
+    for pt in req.points:
+        x = float(pt[0])
+        y = float(pt[1])
+        normalized_points.append([x, y])
+        if x <= edge_margin or x >= (1.0 - edge_margin) or y <= edge_margin or y >= (1.0 - edge_margin):
+            near_edge = True
+    if near_edge:
+        logger.warning("Reject calib4 warp points near edge: session=%s points=%s margin=%.3f", session_id, req.points, edge_margin)
+        raise HTTPException(status_code=422, detail="point_near_edge: 점이 가장자리에 너무 가깝습니다.")
+    area_ratio = _polygon_area_norm(normalized_points)
+    if area_ratio > too_large_ratio:
+        logger.warning(
+            "Reject calib4 warp points too large: session=%s area_ratio=%.4f threshold=%.4f points=%s",
+            session_id,
+            area_ratio,
+            too_large_ratio,
+            req.points,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=f"roi_too_large: area_ratio={area_ratio:.4f} > {too_large_ratio:.4f}",
+        )
     ordered = order_points_tl_tr_br_bl(req.points)
     session.warp_points_norm = ordered
+    # 4-point calibration also drives event ROI when auto ROI is off.
+    if not bool(session.state.get("_cart_roi_auto_enabled", False)):
+        session.roi_poly_norm = [list(p) for p in ordered]
     if req.width and req.height and req.width > 0 and req.height > 0:
         session.warp_size = (int(req.width), int(req.height))
     else:
         session.warp_size = (int(config.WARP_WIDTH), int(config.WARP_HEIGHT))
     if req.enabled is not None:
         session.warp_enabled = bool(req.enabled)
+    logger.info(
+        "Warp updated: session=%s enabled=%s points=%d size=%s auto_mode=%s",
+        session_id,
+        bool(session.warp_enabled),
+        len(session.warp_points_norm or []),
+        session.warp_size,
+        bool(session.state.get("_cart_roi_auto_enabled", False)),
+    )
     return WarpResponse(
         enabled=bool(session.warp_enabled),
         points=session.warp_points_norm,
@@ -278,6 +329,12 @@ async def set_warp_enabled(session_id: str, req: WarpEnabledRequest):
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     session.warp_enabled = bool(req.enabled)
+    logger.info(
+        "Warp enabled changed: session=%s enabled=%s points=%d",
+        session_id,
+        bool(session.warp_enabled),
+        len(session.warp_points_norm or []),
+    )
     return WarpResponse(
         enabled=bool(session.warp_enabled),
         points=session.warp_points_norm,
@@ -293,4 +350,8 @@ async def clear_warp(session_id: str):
     session.warp_enabled = False
     session.warp_points_norm = None
     session.warp_size = (int(config.WARP_WIDTH), int(config.WARP_HEIGHT))
+    session.state["_event_roi_override_norm"] = None
+    # If ROI was tied to 4-point calibration, fallback to full ROI when no explicit ROI exists.
+    if not (isinstance(session.roi_poly_norm, list) and len(session.roi_poly_norm) >= 3):
+        session.roi_poly_norm = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
     return WarpResponse(enabled=False, points=None, size=[int(session.warp_size[0]), int(session.warp_size[1])])

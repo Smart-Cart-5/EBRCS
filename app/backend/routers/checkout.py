@@ -21,7 +21,8 @@ from starlette.websockets import WebSocketState
 
 from backend import config
 from backend.dependencies import app_state
-from backend.roi_warp import warp_frame
+from backend.frame_transforms import apply_virtual_distance, clamp_virtual_scale
+from backend.roi_warp import get_warp_matrix, warp_frame
 from backend.services.session_manager import (
     CheckoutSession,
     PHASE_CHECKOUT_RUNNING,
@@ -120,6 +121,7 @@ def _build_state_snapshot(
         "confidence": round(float(session.state.get("confidence", 0.0)), 4),
         "best_pair": session.state.get("best_pair"),
         "event_state": session.state.get("event_state"),
+        "event_debug": session.state.get("event_debug"),
         "occluded_by_hand": bool(session.state.get("occluded_by_hand", False)),
         "overlap_hand_iou_max": round(float(session.state.get("overlap_hand_iou_max", 0.0)), 4),
         "search_crop_min_side_before": session.state.get("search_crop_min_side_before"),
@@ -188,6 +190,7 @@ def _build_state_snapshot(
             else None
         ),
         "warp_enabled": bool(getattr(session, "warp_enabled", False)),
+        "warp_applied": bool(session.state.get("_warp_applied", False)),
         "warp_points": getattr(session, "warp_points_norm", None),
         "phase": phase,
         "message": message,
@@ -202,6 +205,20 @@ def _build_state_snapshot(
         "checkout_start_mode": checkout_start_mode,
         "cart_roi_available": bool(getattr(app_state, "cart_roi_available", False)),
         "cart_roi_unavailable_reason": getattr(app_state, "cart_roi_unavailable_reason", None),
+        "ws_connected": bool(session.state.get("_ws_connected", False)),
+        "event_roi_mode": str(session.state.get("_event_roi_mode", "full")),
+        "event_roi_source": str(session.state.get("_event_roi_source", "full_fallback")),
+        "event_roi_ready": bool(session.state.get("_event_roi_ready", False)),
+        "event_roi_bounds": session.state.get("_event_roi_bounds"),
+        "event_roi_area_ratio": round(float(session.state.get("_event_roi_area_ratio", 0.0)), 4),
+        "event_roi_bounds_original": session.state.get("_event_roi_bounds_original"),
+        "event_roi_area_ratio_original": round(float(session.state.get("_event_roi_area_ratio_original", 0.0)), 4),
+        "event_roi_bounds_warp": session.state.get("_event_roi_bounds_warp"),
+        "event_roi_area_ratio_warp": round(float(session.state.get("_event_roi_area_ratio_warp", 0.0)), 4),
+        "event_roi_too_large": bool(session.state.get("_event_roi_too_large", False)),
+        "event_roi_warnings": session.state.get("_event_roi_warnings", []),
+        "virtual_scale": float(session.state.get("_virtual_scale", 1.0)),
+        "vd_applied": bool(session.state.get("_vd_applied", False)),
         "last_roi_error": session.state.get("_cart_roi_last_error"),
         "cart_roi_invalid_reason": session.state.get("_cart_roi_invalid_reason"),
     }
@@ -221,6 +238,7 @@ def _process_frame_sync(
     yolo_detector: Any = None,
     cart_roi_segmenter: Any = None,
     ws_profiler: FrameProfiler | None = None,
+    ws_connected: bool | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Run one frame through the checkout pipeline (sync, for thread pool execution).
 
@@ -232,11 +250,58 @@ def _process_frame_sync(
     """
     from checkout_core.frame_processor import process_checkout_frame
 
+    virtual_scale_cfg = clamp_virtual_scale(float(getattr(config, "VIRTUAL_DISTANCE_SCALE", 1.0)))
+    if ws_profiler is not None:
+        with ws_profiler.measure("virtual_distance"):
+            frame, vd_meta = apply_virtual_distance(frame, virtual_scale_cfg)
+    else:
+        frame, vd_meta = apply_virtual_distance(frame, virtual_scale_cfg)
+    vd_applied = bool(vd_meta.get("applied", False))
+    session.state["_virtual_scale"] = float(vd_meta.get("scale", virtual_scale_cfg))
+    session.state["_vd_applied"] = bool(vd_applied)
+
+    # Resolve ROI source first (original space, normalized).
+    roi_polygon_normalized, roi_mode, roi_source, roi_ready = session.resolve_event_roi_norm()
+    session.state["_event_roi_mode"] = roi_mode
+    session.state["_event_roi_source"] = roi_source
+    session.state["_event_roi_ready"] = bool(roi_ready)
+
+    original_h, original_w = frame.shape[:2]
+    roi_poly_original_px: np.ndarray | None = None
+    if isinstance(roi_polygon_normalized, list) and len(roi_polygon_normalized) >= 3:
+        pts = []
+        for x_norm, y_norm in roi_polygon_normalized:
+            pts.append(
+                [
+                    int(max(0.0, min(1.0, float(x_norm))) * original_w),
+                    int(max(0.0, min(1.0, float(y_norm))) * original_h),
+                ]
+            )
+        roi_poly_original_px = np.array(pts, dtype=np.int32)
+
     original_frame = frame
-    warp_active = bool(getattr(session, "warp_enabled", False) and getattr(session, "warp_points_norm", None))
+    warp_matrix: np.ndarray | None = None
+    warp_matrix_inv: np.ndarray | None = None
+    warp_matrix_runtime: np.ndarray | None = None
+    warp_matrix_inv_runtime: np.ndarray | None = None
+    warp_enabled_session = bool(getattr(session, "warp_enabled", False))
+    warp_points_ready = bool(isinstance(getattr(session, "warp_points_norm", None), list) and len(session.warp_points_norm) == 4)
+    warp_active = bool(warp_enabled_session and warp_points_ready)
+    if bool(getattr(config, "CHECKOUT_DEBUG_TICK_LOG", False)) and warp_enabled_session and (not warp_points_ready):
+        logger.warning(
+            "Warp requested but calib4 points missing: session=%s frame_id=%s warp_enabled=%s points=%s",
+            session_id,
+            frame_id,
+            warp_enabled_session,
+            session.warp_points_norm,
+        )
     warp_applied = False
     if warp_active:
         try:
+            warp_matrix = get_warp_matrix(frame.shape, session.warp_points_norm, session.warp_size)
+            warp_matrix_inv = np.linalg.inv(warp_matrix)
+            warp_matrix_runtime = warp_matrix
+            warp_matrix_inv_runtime = warp_matrix_inv
             if ws_profiler is not None:
                 with ws_profiler.measure("warp"):
                     frame = warp_frame(frame, session.warp_points_norm, session.warp_size)
@@ -261,6 +326,11 @@ def _process_frame_sync(
             # Degrade session-level warp mode on hard warp failure.
             session.warp_enabled = False
             warp_applied = False
+            warp_matrix = None
+            warp_matrix_inv = None
+            warp_matrix_runtime = None
+            warp_matrix_inv_runtime = None
+    session.state["_warp_applied"] = bool(warp_applied)
 
     if ws_profiler is not None:
         with ws_profiler.measure("resize"):
@@ -269,8 +339,39 @@ def _process_frame_sync(
         frame = _resize_frame(frame, config.STREAM_TARGET_WIDTH)
     session.frame_count += 1
 
-    # Get ROI polygon coordinates (normalized 0-1)
-    roi_polygon_normalized = getattr(session, "roi_poly_norm", None)
+    # If calibration points are used and warp is applied, map ROI into warped frame coordinates.
+    if warp_applied and warp_matrix is not None:
+        cur_h, cur_w = frame.shape[:2]
+        warp_h = max(1, int(session.warp_size[1]))
+        warp_w = max(1, int(session.warp_size[0]))
+        sx = float(cur_w) / float(warp_w)
+        sy = float(cur_h) / float(warp_h)
+        scale_mat = np.array([[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        warp_matrix_runtime = scale_mat @ warp_matrix
+        try:
+            warp_matrix_inv_runtime = np.linalg.inv(warp_matrix_runtime)
+        except Exception:
+            warp_matrix_inv_runtime = warp_matrix_inv
+        if (
+            roi_source == "calibration_points"
+            and roi_poly_original_px is not None
+            and warp_matrix_runtime is not None
+        ):
+            pts = roi_poly_original_px.astype(np.float32).reshape(-1, 1, 2)
+            pts_warp = cv2.perspectiveTransform(pts, warp_matrix_runtime).reshape(-1, 2)
+            poly_norm: list[list[float]] = []
+            for x, y in pts_warp:
+                poly_norm.append(
+                    [
+                        float(np.clip(float(x) / float(max(1, cur_w - 1)), 0.0, 1.0)),
+                        float(np.clip(float(y) / float(max(1, cur_h - 1)), 0.0, 1.0)),
+                    ]
+                )
+            if len(poly_norm) >= 3:
+                roi_polygon_normalized = poly_norm
+                session.state["_event_roi_override_norm"] = poly_norm
+    else:
+        session.state["_event_roi_override_norm"] = roi_polygon_normalized
 
     auto_mode = session.state.get("_cart_roi_auto_enabled")
     if isinstance(auto_mode, bool):
@@ -279,6 +380,24 @@ def _process_frame_sync(
         requires_calibration = bool(getattr(app_state, "cart_roi_available", False))
     prev_phase = str(session.state.get("phase", ""))
     phase = session.start_checkout(require_roi_calibration=requires_calibration)
+    if bool(getattr(config, "CHECKOUT_DEBUG_TICK_LOG", False)):
+        logger.info(
+            "Checkout tick: session=%s frame_id=%s frame_count=%s phase=%s ws_connected=%s auto_mode=%s roi_confirmed=%s roi_ready=%s roi_mode=%s roi_source=%s warp_enabled=%s warp_points_ready=%s virtual_scale=%.3f vd_applied=%s",
+            session_id,
+            frame_id,
+            int(session.frame_count),
+            phase,
+            ws_connected,
+            auto_mode,
+            bool(session.state.get("_cart_roi_confirmed", False)),
+            bool(roi_ready),
+            roi_mode,
+            roi_source,
+            warp_enabled_session,
+            warp_points_ready,
+            float(session.state.get("_virtual_scale", 1.0)),
+            bool(session.state.get("_vd_applied", False)),
+        )
     if phase != prev_phase:
         logger.info(
             "Session phase changed: session=%s frame_id=%s phase=%s confirmed=%s",
@@ -404,26 +523,186 @@ def _process_frame_sync(
                 session.state.get("_cart_roi_last_error"),
             )
 
-        session.state["skip_reason"] = "roi_calibrating"
-        state_snapshot = _build_state_snapshot(
-            session=session,
-            session_id=session_id,
-            roi_polygon_normalized=roi_polygon_normalized,
-            extra={
-                "phase": PHASE_ROI_CALIBRATING,
-                "cart_roi_preview_ready": bool(isinstance(pending_mask, np.ndarray)),
-                "message": "ROI preview ready. Press OK to confirm or Retry.",
-            },
-        )
-        return display_frame, state_snapshot
+        auto_confirmed = False
+        if (
+            bool(getattr(config, "CHECKOUT_AUTO_CONFIRM_ROI", False))
+            and bool(confirm_enabled)
+            and isinstance(pending_polygon, list)
+            and len(pending_polygon) >= int(getattr(config, "CHECKOUT_AUTO_CONFIRM_ROI_MIN_POLY_POINTS", 3))
+            and float(ratio) >= float(getattr(config, "CHECKOUT_AUTO_CONFIRM_ROI_MIN_RATIO", 0.005))
+        ):
+            auto_confirmed = bool(session.confirm_pending_cart_roi())
+            if auto_confirmed:
+                roi_polygon_normalized, roi_mode, roi_source, roi_ready = session.resolve_event_roi_norm()
+                session.state["_event_roi_mode"] = roi_mode
+                session.state["_event_roi_source"] = roi_source
+                session.state["_event_roi_ready"] = bool(roi_ready)
+                logger.info(
+                    "Checkout ROI auto-confirmed: session=%s frame_id=%s ratio=%.4f points=%d",
+                    session_id,
+                    frame_id,
+                    float(ratio),
+                    int(len(pending_polygon)),
+                )
+
+        if not auto_confirmed:
+            session.state["skip_reason"] = "roi_not_confirmed"
+            if bool(getattr(config, "CHECKOUT_DEBUG_TICK_LOG", False)):
+                logger.info(
+                    "Checkout skip: session=%s frame_id=%s skip_reason=%s confirm_enabled=%s preview_ready=%s invalid_reason=%s",
+                    session_id,
+                    frame_id,
+                    session.state["skip_reason"],
+                    confirm_enabled,
+                    bool(isinstance(pending_mask, np.ndarray)),
+                    invalid_reason,
+                )
+            state_snapshot = _build_state_snapshot(
+                session=session,
+                session_id=session_id,
+                roi_polygon_normalized=roi_polygon_normalized,
+                extra={
+                    "phase": PHASE_ROI_CALIBRATING,
+                    "cart_roi_preview_ready": bool(isinstance(pending_mask, np.ndarray)),
+                    "message": "ROI preview ready. Press OK to confirm or Retry.",
+                },
+            )
+            return display_frame, state_snapshot
+        phase = str(session.state.get("phase", PHASE_CHECKOUT_RUNNING))
 
     if phase != PHASE_CHECKOUT_RUNNING:
         session.force_checkout_running()
+        phase = PHASE_CHECKOUT_RUNNING
 
-    # ROI polygon is computed on the same frame that YOLO sees:
-    # - warp_applied=True: ROI is in warped-frame coordinates
-    # - warp_applied=False: ROI is in original-frame coordinates
+    # Runtime ROI for detector/tracker pipeline (same coordinates as `frame`).
     roi_poly = session.get_roi_polygon(frame.shape)
+
+    def _poly_metrics(poly: np.ndarray | None, h: int, w: int) -> tuple[tuple[int, int, int, int] | None, float, int]:
+        if not (isinstance(poly, np.ndarray) and len(poly) >= 3):
+            return None, 0.0, 0
+        xs = poly[:, 0]
+        ys = poly[:, 1]
+        bounds = (int(np.min(xs)), int(np.min(ys)), int(np.max(xs)), int(np.max(ys)))
+        area = abs(float(cv2.contourArea(poly.astype(np.float32))))
+        ratio = float(area / float(max(1, h * w)))
+        return bounds, ratio, int(len(poly))
+
+    roi_bounds_warp, roi_area_ratio_warp, roi_points_warp = _poly_metrics(
+        roi_poly,
+        int(frame.shape[0]),
+        int(frame.shape[1]),
+    )
+    roi_bounds_original, roi_area_ratio_original, roi_points_original = _poly_metrics(
+        roi_poly_original_px,
+        int(original_h),
+        int(original_w),
+    )
+    # Keep backward-compatible fields as ORIGINAL-space ROI metrics for event diagnostics.
+    roi_bounds = roi_bounds_original if roi_bounds_original is not None else roi_bounds_warp
+    roi_points = roi_points_original if roi_points_original > 0 else roi_points_warp
+    roi_area_ratio = roi_area_ratio_original if roi_points_original > 0 else roi_area_ratio_warp
+    roi_too_large = False
+    roi_warnings: list[str] = []
+    if roi_points_original > 0:
+        if roi_area_ratio_original >= float(getattr(config, "EVENT_ROI_TOO_LARGE_RATIO", 0.90)):
+            roi_too_large = True
+            roi_warnings.append("roi_too_large")
+    elif roi_points_warp > 0:
+        if roi_area_ratio_warp >= float(getattr(config, "EVENT_ROI_TOO_LARGE_RATIO", 0.90)):
+            roi_too_large = True
+            roi_warnings.append("roi_too_large")
+    if roi_points_original > 0 or roi_points_warp > 0:
+        if (
+            roi_source == "calibration_points"
+            and isinstance(session.warp_points_norm, list)
+            and len(session.warp_points_norm) == 4
+        ):
+            margin = float(getattr(config, "EVENT_ROI_EDGE_WARN_MARGIN", 0.05))
+            near_edge = False
+            for pt in session.warp_points_norm:
+                try:
+                    x = float(pt[0]); y = float(pt[1])
+                except Exception:
+                    continue
+                if x <= margin or x >= (1.0 - margin) or y <= margin or y >= (1.0 - margin):
+                    near_edge = True
+                    break
+            if near_edge:
+                roi_warnings.append("calib4_point_near_edge")
+            if roi_bounds_original is not None:
+                bx1, by1, bx2, by2 = roi_bounds_original
+                fw = max(1, int(original_w))
+                fh = max(1, int(original_h))
+                if (
+                    bx1 <= int(fw * margin)
+                    and by1 <= int(fh * margin)
+                    and bx2 >= int(fw * (1.0 - margin))
+                    and by2 >= int(fh * (1.0 - margin))
+                ):
+                    roi_warnings.append("calib4_bbox_near_full_frame")
+        if roi_too_large and bool(getattr(config, "EVENT_ROI_BLOCK_WHEN_TOO_LARGE", False)):
+            logger.warning(
+                "Event ROI blocked (too large): session=%s frame_id=%s mode=%s source=%s area_ratio=%.4f bounds=%s",
+                session_id,
+                frame_id,
+                roi_mode,
+                roi_source,
+                roi_area_ratio_original if roi_points_original > 0 else roi_area_ratio_warp,
+                roi_bounds_original if roi_bounds_original is not None else roi_bounds_warp,
+            )
+            # Keep visibility by forcing full ROI semantics and explicit warning marker.
+            roi_poly = np.array(
+                [[0, 0], [frame.shape[1] - 1, 0], [frame.shape[1] - 1, frame.shape[0] - 1], [0, frame.shape[0] - 1]],
+                dtype=np.int32,
+            )
+            roi_source = "full_fallback"
+            roi_mode = "full"
+            roi_warnings.append("blocked_too_large")
+            session.state["_event_roi_mode"] = roi_mode
+            session.state["_event_roi_source"] = roi_source
+            roi_bounds_warp = (0, 0, int(frame.shape[1] - 1), int(frame.shape[0] - 1))
+            roi_area_ratio_warp = 1.0
+            roi_bounds = roi_bounds_original if roi_bounds_original is not None else roi_bounds_warp
+            roi_area_ratio = roi_area_ratio_original if roi_points_original > 0 else roi_area_ratio_warp
+    session.state["_event_roi_bounds"] = list(roi_bounds) if roi_bounds is not None else None
+    session.state["_event_roi_area_ratio"] = float(roi_area_ratio)
+    session.state["_event_roi_bounds_original"] = (
+        list(roi_bounds_original) if roi_bounds_original is not None else None
+    )
+    session.state["_event_roi_area_ratio_original"] = float(roi_area_ratio_original)
+    session.state["_event_roi_bounds_warp"] = list(roi_bounds_warp) if roi_bounds_warp is not None else None
+    session.state["_event_roi_area_ratio_warp"] = float(roi_area_ratio_warp)
+    session.state["_event_roi_too_large"] = bool(roi_too_large)
+    session.state["_event_roi_warnings"] = list(roi_warnings)
+    if roi_too_large:
+        logger.warning(
+            "Event ROI warning (too large): session=%s frame_id=%s mode=%s source=%s area_ratio=%.4f bounds=%s warnings=%s",
+            session_id,
+            frame_id,
+            roi_mode,
+            roi_source,
+            roi_area_ratio,
+            roi_bounds,
+            roi_warnings,
+        )
+    if bool(getattr(config, "CHECKOUT_DEBUG_TICK_LOG", False)):
+        logger.info(
+            "Event ROI resolved: session=%s frame_id=%s mode=%s source=%s bounds_original=%s area_original=%.4f bounds_warp=%s area_warp=%.4f points(original=%d,warp=%d) too_large=%s warnings=%s warp_applied=%s warp_matrix=%s",
+            session_id,
+            frame_id,
+            roi_mode,
+            roi_source,
+            roi_bounds_original,
+            roi_area_ratio_original,
+            roi_bounds_warp,
+            roi_area_ratio_warp,
+            roi_points_original,
+            roi_points_warp,
+            roi_too_large,
+            roi_warnings,
+            warp_applied,
+            bool(warp_matrix_runtime is not None),
+        )
 
     display_frame = process_checkout_frame(
         frame=frame,
@@ -473,7 +752,28 @@ def _process_frame_sync(
         frame_profiler_override=ws_profiler,
         yolo_detector=yolo_detector,
         cart_roi_segmenter=cart_roi_segmenter,
+        roi_poly_original=roi_poly_original_px,
+        warp_matrix=warp_matrix_runtime,
+        warp_matrix_inv=warp_matrix_inv_runtime,
     )
+    if bool(getattr(config, "CHECKOUT_DEBUG_TICK_LOG", False)):
+        logger.info(
+            "Checkout run: session=%s frame_id=%s phase=%s skip_reason=%s yolo_available=%s detections=%s roi_mode=%s roi_source=%s roi_bounds=%s warp_enabled=%s warp_points_ready=%s warp_applied=%s virtual_scale=%.3f vd_applied=%s",
+            session_id,
+            frame_id,
+            phase,
+            session.state.get("skip_reason"),
+            bool(yolo_detector is not None),
+            len(session.state.get("detection_boxes", []) or []),
+            roi_mode,
+            roi_source,
+            roi_bounds,
+            warp_enabled_session,
+            warp_points_ready,
+            warp_applied,
+            float(session.state.get("_virtual_scale", 1.0)),
+            bool(session.state.get("_vd_applied", False)),
+        )
 
     state_snapshot = _build_state_snapshot(
         session=session,
@@ -490,6 +790,7 @@ async def _process_frame(
     frame_id: int | None = None,
     session_id: str | None = None,
     ws_profiler: FrameProfiler | None = None,
+    ws_connected: bool | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Async wrapper: acquires reader lock and delegates to sync processing.
 
@@ -521,6 +822,7 @@ async def _process_frame(
             yolo_detector,
             cart_roi_segmenter,
             ws_profiler,
+            ws_connected,
         )
 
 
@@ -543,6 +845,7 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
         return
 
     await websocket.accept()
+    session.state["_ws_connected"] = True
     logger.info("WebSocket connected: session=%s", session_id)
 
     # Latest-frame-only queue for minimum latency
@@ -614,6 +917,12 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
                         break
 
                 if data == b"":
+                    if bool(getattr(config, "CHECKOUT_DEBUG_TICK_LOG", False)):
+                        logger.info(
+                            "Checkout skip: session=%s frame_id=%s skip_reason=ws_not_connected",
+                            session_id,
+                            frame_id,
+                        )
                     break  # Disconnected
 
                 # Decode JPEG
@@ -622,6 +931,12 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
                 with ws_frame_profiler.measure("imdecode"):
                     frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 if frame is None:
+                    if bool(getattr(config, "CHECKOUT_DEBUG_TICK_LOG", False)):
+                        logger.info(
+                            "Checkout skip: session=%s frame_id=%s skip_reason=decode_failed",
+                            session_id,
+                            frame_id,
+                        )
                     ws_frame_profiler.finish()
                     continue
 
@@ -632,6 +947,7 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
                     frame_id=frame_id,
                     session_id=session_id,
                     ws_profiler=ws_frame_profiler,
+                    ws_connected=True,
                 )
 
                 # Conditionally encode and send image based on config
@@ -646,6 +962,12 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
                     response = state_snapshot
 
                 if websocket.client_state != WebSocketState.CONNECTED:
+                    if bool(getattr(config, "CHECKOUT_DEBUG_TICK_LOG", False)):
+                        logger.info(
+                            "Checkout skip: session=%s frame_id=%s skip_reason=ws_not_connected",
+                            session_id,
+                            frame_id,
+                        )
                     ws_frame_profiler.finish()
                     break
 
@@ -721,6 +1043,7 @@ async def checkout_ws(websocket: WebSocket, session_id: str):
     except Exception:
         pass
     finally:
+        session.state["_ws_connected"] = False
         receive_task.cancel()
         process_task.cancel()
         logger.info("WebSocket disconnected: session=%s", session_id)
@@ -794,7 +1117,7 @@ async def _process_video_background(
             frame_idx += 1
 
             # Run inference with reader lock
-            await _process_frame(session, frame)
+            await _process_frame(session, frame, ws_connected=False)
 
             task_status["current_frame"] = frame_idx
             task_status["progress"] = round(frame_idx / max(total_frames, 1), 4)

@@ -18,13 +18,13 @@ from checkout_core.inference import build_query_embedding
 try:
     from backend import config as backend_config
     from backend.association import associate_hands_products
-    from backend.event_engine import AddEventEngine
+    from backend.hand_event_engine import HandEventEngine
     from backend.snapshots import SnapshotBuffer
     from backend.utils.profiler import ProfileCollector
 except Exception:  # pragma: no cover - optional in non-backend contexts
     backend_config = None
     associate_hands_products = None
-    AddEventEngine = None
+    HandEventEngine = None
     SnapshotBuffer = None
     ProfileCollector = None
 
@@ -1403,6 +1403,9 @@ def process_checkout_frame(
     frame_profiler_override=None,
     yolo_detector=None,
     cart_roi_segmenter=None,
+    roi_poly_original: np.ndarray | None = None,
+    warp_matrix: np.ndarray | None = None,
+    warp_matrix_inv: np.ndarray | None = None,
 ) -> np.ndarray:
     """Process a single frame and update checkout state in-place.
 
@@ -1490,6 +1493,21 @@ def process_checkout_frame(
                 detections = yolo_detector.detect(frame)
         else:
             detections = yolo_detector.detect(frame)
+        raw_class_counts: dict[str, int] = {}
+        raw_model_class_counts: dict[str, int] = {}
+        for det in detections:
+            cls_key = str(det.get("class", "unknown"))
+            raw_class_counts[cls_key] = int(raw_class_counts.get(cls_key, 0)) + 1
+            raw_model_key = str(det.get("raw_class_name", f"id_{det.get('raw_class_id', 'na')}"))
+            raw_model_class_counts[raw_model_key] = int(raw_model_class_counts.get(raw_model_key, 0)) + 1
+        raw_product_detections = [
+            d for d in detections
+            if d.get("class") == "product" and isinstance(d.get("box"), list) and len(d.get("box")) == 4
+        ]
+        raw_hand_detections = [
+            d for d in detections
+            if d.get("class") == "hand" and isinstance(d.get("box"), list) and len(d.get("box")) == 4
+        ]
         frame_h, frame_w = frame.shape[:2]
         frame_area = max(1.0, float(frame_h * frame_w))
         reject_stats: dict[str, int] = {
@@ -1500,13 +1518,39 @@ def process_checkout_frame(
             "too_wide": 0,
             "edge_touch": 0,
             "roi_out": 0,
+            "roi_out_kept": 0,
             "cart_roi_out": 0,
             "hand_conf_low": 0,
+            "hand_cart_roi_out": 0,
         }
         roi_eval_debug: list[dict[str, float | bool]] = []
         filtered_hands: list[dict[str, Any]] = []
         filtered_products: list[dict[str, Any]] = []
+        fallback_products: list[dict[str, Any]] = []
+        reject_samples: dict[str, list[dict[str, Any]]] = {
+            "conf_low": [],
+            "too_tall": [],
+        }
+        prev_event_debug = state.get("event_debug")
+        candidate_active_prev = False
+        if isinstance(prev_event_debug, dict):
+            for hdbg in list(prev_event_debug.get("hands", [])):
+                if str(hdbg.get("phase", "")).startswith("CANDIDATE_"):
+                    candidate_active_prev = True
+                    break
+        candidate_hand_boxes = [
+            [float(v) for v in d.get("box")]
+            for d in raw_hand_detections
+            if float(d.get("confidence", 0.0)) >= float(hand_conf_min)
+        ]
         cart_roi_mask: np.ndarray | None = None
+        detect_outside_event_roi = bool(getattr(backend_config, "DETECT_OUTSIDE_EVENT_ROI", False))
+        debug_disable_object_roi_gate = bool(getattr(backend_config, "DEBUG_DISABLE_OBJECT_ROI_GATE", False))
+        debug_event_roi_only = bool(getattr(backend_config, "DEBUG_EVENT_ROI_ONLY", False))
+        debug_bypass_object_filter = bool(getattr(backend_config, "DEBUG_BYPASS_OBJECT_FILTER", False))
+        object_keep_if_hand_overlap = bool(getattr(backend_config, "OBJECT_KEEP_IF_HAND_OVERLAP", True))
+        object_keep_hand_overlap_iou = float(getattr(backend_config, "OBJECT_KEEP_HAND_OVERLAP_IOU", 0.1))
+        object_roi_gate_disabled = bool(debug_disable_object_roi_gate or debug_event_roi_only)
         mask_candidate = state.get("_cart_roi_mask")
         if isinstance(mask_candidate, np.ndarray) and mask_candidate.shape[:2] == frame.shape[:2]:
             cart_roi_mask = mask_candidate
@@ -1518,8 +1562,26 @@ def process_checkout_frame(
             if not isinstance(box, list) or len(box) != 4:
                 continue
             x1, y1, x2, y2 = [float(v) for v in box]
+            box_norm = [x1, y1, x2, y2]
 
-            if cart_roi_mask is not None:
+            if cls == "hand":
+                if conf < float(hand_conf_min):
+                    reject_stats["hand_conf_low"] += 1
+                    continue
+                if cart_roi_mask is not None and bool(getattr(backend_config, "HAND_APPLY_CART_ROI_FILTER", False)):
+                    cx_px = int(((x1 + x2) * 0.5) * frame_w)
+                    cy_px = int(((y1 + y2) * 0.5) * frame_h)
+                    cx_px = max(0, min(cx_px, frame_w - 1))
+                    cy_px = max(0, min(cy_px, frame_h - 1))
+                    if int(cart_roi_mask[cy_px, cx_px]) <= 0:
+                        reject_stats["hand_cart_roi_out"] += 1
+                        continue
+                filtered_hands.append(det)
+                continue
+
+            if cls != "product":
+                continue
+            if cart_roi_mask is not None and (not object_roi_gate_disabled):
                 cx_px = int(((x1 + x2) * 0.5) * frame_w)
                 cy_px = int(((y1 + y2) * 0.5) * frame_h)
                 cx_px = max(0, min(cx_px, frame_w - 1))
@@ -1527,19 +1589,21 @@ def process_checkout_frame(
                 if int(cart_roi_mask[cy_px, cx_px]) <= 0:
                     reject_stats["cart_roi_out"] += 1
                     continue
-
-            if cls == "hand":
-                if conf < float(hand_conf_min):
-                    reject_stats["hand_conf_low"] += 1
-                    continue
-                filtered_hands.append(det)
-                continue
-
-            if cls != "product":
-                continue
+            if conf >= max(0.15, float(product_conf_min) * 0.4):
+                fallback_products.append(det)
             if conf < float(product_conf_min):
                 reject_stats["conf_low"] += 1
-                continue
+                if len(reject_samples["conf_low"]) < 4:
+                    reject_samples["conf_low"].append(
+                        {
+                            "conf": round(conf, 4),
+                            "box": [round(v, 4) for v in box_norm],
+                            "w": round(max(0.0, x2 - x1), 4),
+                            "h": round(max(0.0, y2 - y1), 4),
+                        }
+                    )
+                if not debug_bypass_object_filter:
+                    continue
 
             bw_px = max(0.0, (x2 - x1) * frame_w)
             bh_px = max(0.0, (y2 - y1) * frame_h)
@@ -1549,24 +1613,61 @@ def process_checkout_frame(
             box_h_ratio = max(0.0, float(y2 - y1))
             if bbox_area_px < max(1, int(min_product_bbox_area)) or area_ratio < float(product_min_area_ratio):
                 reject_stats["too_small"] += 1
-                continue
+                if not debug_bypass_object_filter:
+                    continue
 
             if box_h_ratio > float(product_max_height_ratio):
                 reject_stats["too_tall"] += 1
-                continue
+                if len(reject_samples["too_tall"]) < 4:
+                    reject_samples["too_tall"].append(
+                        {
+                            "conf": round(conf, 4),
+                            "box": [round(v, 4) for v in box_norm],
+                            "w": round(max(0.0, x2 - x1), 4),
+                            "h": round(max(0.0, y2 - y1), 4),
+                            "aspect": round(float(bw_px / max(1e-6, bh_px)), 4),
+                        }
+                    )
+                keep_by_hand_overlap = False
+                if object_keep_if_hand_overlap:
+                    for hbox in candidate_hand_boxes:
+                        hx1, hy1, hx2, hy2 = hbox
+                        ix1 = max(x1, hx1)
+                        iy1 = max(y1, hy1)
+                        ix2 = min(x2, hx2)
+                        iy2 = min(y2, hy2)
+                        iw = max(0.0, ix2 - ix1)
+                        ih = max(0.0, iy2 - iy1)
+                        inter = iw * ih
+                        if inter <= 0.0:
+                            continue
+                        area_a = max(0.0, (x2 - x1) * (y2 - y1))
+                        area_b = max(0.0, (hx2 - hx1) * (hy2 - hy1))
+                        union = area_a + area_b - inter
+                        iou_h = (inter / union) if union > 1e-9 else 0.0
+                        if iou_h >= object_keep_hand_overlap_iou:
+                            keep_by_hand_overlap = True
+                            break
+                if keep_by_hand_overlap:
+                    reject_stats["too_tall_relaxed"] = int(reject_stats.get("too_tall_relaxed", 0)) + 1
+                elif not debug_bypass_object_filter:
+                    continue
             if box_w_ratio > float(product_max_width_ratio):
                 reject_stats["too_wide"] += 1
-                continue
+                if not debug_bypass_object_filter:
+                    continue
             if float(y1) <= float(product_edge_touch_eps) and float(y2) >= (1.0 - float(product_edge_touch_eps)):
                 reject_stats["edge_touch"] += 1
-                continue
+                if not debug_bypass_object_filter:
+                    continue
 
             aspect = bw_px / max(1e-6, bh_px)
             if aspect < float(product_aspect_ratio_min) or aspect > float(product_aspect_ratio_max):
                 reject_stats["aspect"] += 1
-                continue
+                if not debug_bypass_object_filter:
+                    continue
 
-            if roi_poly is not None:
+            if roi_poly is not None and (not object_roi_gate_disabled):
                 cx = (x1 + x2) * 0.5 * frame_w
                 cy = (y1 + y2) * 0.5 * frame_h
                 inside_by_center = bool(cv2.pointPolygonTest(roi_poly, (cx, cy), False) >= 0)
@@ -1583,12 +1684,58 @@ def process_checkout_frame(
                         }
                     )
                 if not passed_roi:
-                    reject_stats["roi_out"] += 1
-                    continue
+                    if detect_outside_event_roi:
+                        reject_stats["roi_out_kept"] += 1
+                        if len(roi_eval_debug) < 8:
+                            roi_eval_debug.append(
+                                {
+                                    "cx": round(float(cx), 1),
+                                    "cy": round(float(cy), 1),
+                                    "inside_roi_by_center": inside_by_center,
+                                    "roi_iou": round(float(roi_iou), 4),
+                                    "passed_roi": passed_roi,
+                                    "kept_outside_roi": True,
+                                }
+                            )
+                        filtered_products.append(det)
+                        continue
+                    relax_kept = False
+                    if bool(getattr(backend_config, "HAND_EVENT_CANDIDATE_ROI_RELAX", True)) and candidate_active_prev:
+                        pcx = (x1 + x2) * 0.5
+                        pcy = (y1 + y2) * 0.5
+                        near_dist = float(getattr(backend_config, "HAND_EVENT_CANDIDATE_HAND_NEAR_DIST", 0.22))
+                        for hbox in candidate_hand_boxes:
+                            hcx = (float(hbox[0]) + float(hbox[2])) * 0.5
+                            hcy = (float(hbox[1]) + float(hbox[3])) * 0.5
+                            dd = ((pcx - hcx) ** 2 + (pcy - hcy) ** 2) ** 0.5
+                            if dd <= near_dist:
+                                relax_kept = True
+                                break
+                        if relax_kept:
+                            reject_stats["roi_out_relaxed"] = int(reject_stats.get("roi_out_relaxed", 0)) + 1
+                    if not relax_kept:
+                        reject_stats["roi_out"] += 1
+                        continue
 
             filtered_products.append(det)
 
         state["detection_boxes"] = filtered_hands + filtered_products
+        state["_event_object_counts"] = {
+            "objects_raw": int(len(raw_product_detections)),
+            "objects_after_filters": int(len(filtered_products)),
+            "hands_raw": int(len(raw_hand_detections)),
+            "hands_after_filters": int(len(filtered_hands)),
+            "reject_stats": dict(reject_stats),
+            "detect_outside_event_roi": bool(detect_outside_event_roi),
+            "debug_disable_object_roi_gate": bool(debug_disable_object_roi_gate),
+            "debug_event_roi_only": bool(debug_event_roi_only),
+            "debug_bypass_object_filter": bool(debug_bypass_object_filter),
+            "object_roi_gate_disabled": bool(object_roi_gate_disabled),
+            "reject_samples": reject_samples,
+            "hand_conf_min": float(hand_conf_min),
+            "raw_class_counts": dict(raw_class_counts),
+            "raw_model_class_counts": dict(raw_model_class_counts),
+        }
         hands = filtered_hands
         all_products = filtered_products
 
@@ -1597,10 +1744,10 @@ def process_checkout_frame(
             int(getattr(backend_config, "SEARCH_DEBUG_LOG_INTERVAL_MS", 5000)),
             key="_yolo_filter_debug_last_log_ms",
         ):
-            raw_products = len([d for d in detections if d.get("class") == "product"])
-            raw_hands = len([d for d in detections if d.get("class") == "hand"])
+            raw_products = len(raw_product_detections)
+            raw_hands = len(raw_hand_detections)
             logger.info(
-                "YOLO filter: session=%s frame_id=%s warp_on=%s raw_total=%d raw_products=%d raw_hands=%d pass_products=%d pass_hands=%d reject=%s roi_eval=%s",
+                "YOLO filter: session=%s frame_id=%s warp_on=%s raw_total=%d raw_products=%d raw_hands=%d pass_products=%d pass_hands=%d hand_conf_min=%.3f detect_outside_event_roi=%s object_roi_gate_disabled=%s debug_disable_object_roi_gate=%s debug_event_roi_only=%s debug_bypass_object_filter=%s raw_class_counts=%s raw_model_class_counts=%s reject=%s reject_samples=%s roi_eval=%s",
                 session_id,
                 frame_id,
                 warp_on,
@@ -1609,11 +1756,44 @@ def process_checkout_frame(
                 raw_hands,
                 len(filtered_products),
                 len(filtered_hands),
+                float(hand_conf_min),
+                detect_outside_event_roi,
+                object_roi_gate_disabled,
+                debug_disable_object_roi_gate,
+                debug_event_roi_only,
+                debug_bypass_object_filter,
+                raw_class_counts,
+                raw_model_class_counts,
                 reject_stats,
+                reject_samples,
                 roi_eval_debug,
             )
+        if (
+            int(len(raw_product_detections)) > 0
+            and int(len(filtered_products)) == 0
+            and int(reject_stats.get("roi_out", 0) + reject_stats.get("cart_roi_out", 0)) > 0
+        ):
+            roi_bounds = None
+            if isinstance(roi_poly, np.ndarray) and len(roi_poly) >= 3:
+                xs = roi_poly[:, 0]
+                ys = roi_poly[:, 1]
+                roi_bounds = (int(np.min(xs)), int(np.min(ys)), int(np.max(xs)), int(np.max(ys)))
+            logger.warning(
+                "Product detections dropped by ROI gating: session=%s frame_id=%s raw_products=%d filtered_products=%d roi_out=%d cart_roi_out=%d roi_bounds=%s detect_outside_event_roi=%s object_roi_gate_disabled=%s",
+                session_id,
+                frame_id,
+                int(len(raw_product_detections)),
+                int(len(filtered_products)),
+                int(reject_stats.get("roi_out", 0)),
+                int(reject_stats.get("cart_roi_out", 0)),
+                roi_bounds,
+                detect_outside_event_roi,
+                object_roi_gate_disabled,
+            )
 
-        if associate_hands_products is not None:
+        event_mode_enabled = bool(getattr(backend_config, "EVENT_MODE", False))
+        state["best_pair"] = None
+        if not event_mode_enabled and associate_hands_products is not None:
             assoc_matches = associate_hands_products(
                 hands,
                 all_products,
@@ -1622,126 +1802,387 @@ def process_checkout_frame(
                 max_center_dist=getattr(backend_config, "ASSOCIATION_MAX_CENTER_DIST", 0.35),
                 min_score=getattr(backend_config, "ASSOCIATION_MIN_SCORE", 0.1),
             )
-        else:
-            assoc_matches = []
+            if assoc_matches:
+                state["best_pair"] = assoc_matches[0]
+                hb = assoc_matches[0]["hand_box"]
+                pb = assoc_matches[0]["product_box"]
+                h, w = frame.shape[:2]
+                hcx = int(((hb[0] + hb[2]) * 0.5) * w)
+                hcy = int(((hb[1] + hb[3]) * 0.5) * h)
+                pcx = int(((pb[0] + pb[2]) * 0.5) * w)
+                pcy = int(((pb[1] + pb[3]) * 0.5) * h)
+                cv2.line(display_frame, (hcx, hcy), (pcx, pcy), (255, 180, 0), 2)
 
-        if assoc_matches:
-            state["best_pair"] = assoc_matches[0]
-            hb = assoc_matches[0]["hand_box"]
-            pb = assoc_matches[0]["product_box"]
-            h, w = frame.shape[:2]
-            hcx = int(((hb[0] + hb[2]) * 0.5) * w)
-            hcy = int(((hb[1] + hb[3]) * 0.5) * h)
-            pcx = int(((pb[0] + pb[2]) * 0.5) * w)
-            pcy = int(((pb[1] + pb[3]) * 0.5) * h)
-            cv2.line(display_frame, (hcx, hcy), (pcx, pcy), (255, 180, 0), 2)
-        else:
-            state["best_pair"] = None
-
-        event_mode_enabled = bool(getattr(backend_config, "EVENT_MODE", False))
-        if event_mode_enabled and AddEventEngine is not None and SnapshotBuffer is not None:
-            event_engine = state.get("_event_engine")
-            if event_engine is None:
-                event_engine = AddEventEngine(
-                    t_grasp_min_frames=getattr(backend_config, "T_GRASP_MIN_FRAMES", 4),
-                    t_place_stable_frames=getattr(backend_config, "T_PLACE_STABLE_FRAMES", 12),
-                    t_remove_confirm_frames=getattr(backend_config, "T_REMOVE_CONFIRM_FRAMES", 45),
-                    roi_hysteresis_inset_ratio=getattr(backend_config, "ROI_HYSTERESIS_INSET_RATIO", 0.05),
-                    roi_hysteresis_outset_ratio=getattr(backend_config, "ROI_HYSTERESIS_OUTSET_RATIO", 0.05),
+        if event_mode_enabled and not (HandEventEngine is not None and SnapshotBuffer is not None):
+            if bool(getattr(backend_config, "CHECKOUT_DEBUG_TICK_LOG", False)):
+                logger.info(
+                    "Checkout skip: session=%s frame_id=%s skip_reason=event_engine_unavailable hand_engine=%s snapshot_buffer=%s",
+                    session_id,
+                    frame_id,
+                    bool(HandEventEngine is not None),
+                    bool(SnapshotBuffer is not None),
                 )
-                state["_event_engine"] = event_engine
+        if event_mode_enabled and HandEventEngine is not None and SnapshotBuffer is not None:
+            event_engine = state.get("_hand_event_engine")
+            if event_engine is None:
+                event_engine = HandEventEngine(
+                    association_iou_weight=getattr(backend_config, "ASSOCIATION_IOU_WEIGHT", 0.5),
+                    association_dist_weight=getattr(backend_config, "ASSOCIATION_DIST_WEIGHT", 0.5),
+                    association_max_center_dist=getattr(backend_config, "ASSOCIATION_MAX_CENTER_DIST", 0.35),
+                    association_min_score=getattr(
+                        backend_config,
+                        "HAND_EVENT_MIN_ASSOC_SCORE",
+                        getattr(backend_config, "ASSOCIATION_MIN_SCORE", 0.1),
+                    ),
+                    association_min_iou=getattr(backend_config, "HAND_EVENT_MIN_ASSOC_IOU", 0.0),
+                    allow_det_fallback=getattr(backend_config, "HAND_EVENT_ALLOW_DET_FALLBACK", True),
+                    det_fallback_min_score=getattr(backend_config, "HAND_EVENT_DET_FALLBACK_MIN_SCORE", 0.01),
+                    association_top_k=getattr(backend_config, "HAND_EVENT_ASSOC_TOP_K", 3),
+                    association_stable_frames=getattr(backend_config, "HAND_EVENT_ASSOC_STABLE_FRAMES", 1),
+                    add_evidence_frames=getattr(backend_config, "HAND_EVENT_ADD_EVIDENCE_FRAMES", 2),
+                    remove_evidence_frames=getattr(backend_config, "HAND_EVENT_REMOVE_EVIDENCE_FRAMES", 2),
+                    remove_missing_grace_frames=getattr(
+                        backend_config,
+                        "HAND_EVENT_REMOVE_MISSING_GRACE_FRAMES",
+                        3,
+                    ),
+                    candidate_timeout_ms=int(
+                        float(getattr(backend_config, "HAND_EVENT_CANDIDATE_TIMEOUT_S", 1.2)) * 1000.0
+                    ),
+                    cooldown_ms=int(float(getattr(backend_config, "HAND_EVENT_COOLDOWN_S", 0.7)) * 1000.0),
+                    candidate_switch_min_delta=getattr(
+                        backend_config,
+                        "HAND_EVENT_CANDIDATE_SWITCH_MIN_DELTA",
+                        0.08,
+                    ),
+                    track_iou_match_threshold=getattr(
+                        backend_config,
+                        "HAND_EVENT_TRACK_IOU_MATCH_THRESHOLD",
+                        0.05,
+                    ),
+                    track_max_missed_frames=getattr(
+                        backend_config,
+                        "HAND_EVENT_TRACK_MAX_MISSED_FRAMES",
+                        8,
+                    ),
+                    hand_representative_point=getattr(
+                        backend_config,
+                        "HAND_EVENT_HAND_REPRESENTATIVE_POINT",
+                        "center",
+                    ),
+                    object_representative_point=getattr(
+                        backend_config,
+                        "HAND_EVENT_OBJECT_REPRESENTATIVE_POINT",
+                        "bottom_center",
+                    ),
+                    roi_margin_px=getattr(backend_config, "HAND_EVENT_ROI_MARGIN_PX", 0.0),
+                    roi_margin_ratio=getattr(backend_config, "HAND_EVENT_ROI_MARGIN_RATIO", 0.0),
+                )
+                state["_hand_event_engine"] = event_engine
 
             snapshot_buffer = state.get("_snapshot_buffer")
             if snapshot_buffer is None:
                 snapshot_buffer = SnapshotBuffer(max_frames=getattr(backend_config, "SNAPSHOT_MAX_FRAMES", 8))
                 state["_snapshot_buffer"] = snapshot_buffer
+            if bool(getattr(backend_config, "HAND_EVENT_DEBUG_LOG", True)):
+                count_meta = state.get("_event_object_counts", {})
+                logger.info(
+                    "Hand event before_call: session=%s frame_id=%s hands_raw=%s hands_after_filters=%s objects_raw=%s objects_after_filters=%s roi_present=%s warp_on=%s warp_matrix=%s hand_conf_min=%.3f raw_class_counts=%s raw_model_class_counts=%s reject=%s",
+                    session_id,
+                    frame_id,
+                    count_meta.get("hands_raw", len(raw_hand_detections)),
+                    count_meta.get("hands_after_filters", len(hands)),
+                    count_meta.get("objects_raw", len(fallback_products)),
+                    count_meta.get("objects_after_filters", len(all_products)),
+                    bool(roi_poly is not None),
+                    bool(warp_on),
+                    bool(isinstance(warp_matrix, np.ndarray)),
+                    float(count_meta.get("hand_conf_min", hand_conf_min)),
+                    count_meta.get("raw_class_counts", {}),
+                    count_meta.get("raw_model_class_counts", {}),
+                    count_meta.get("reject_stats", {}),
+                )
 
-            event_update = event_engine.update(
-                best_pair=state.get("best_pair"),
-                products=all_products,
-                roi_poly=roi_poly,
-                frame_shape=frame.shape,
+            event_result = event_engine.update(
+                {
+                    "frame_id": int(frame_id if frame_id is not None else frame_count),
+                    "timestamp_ms": int(time.time() * 1000),
+                    "hands": hands,
+                    "objects": all_products,
+                    "objects_fallback": fallback_products,
+                    "roi_poly": roi_poly,
+                    "roi_poly_original": roi_poly_original,
+                    "frame_shape": frame.shape,
+                    "warp_on": bool(warp_on),
+                    "warp_matrix": warp_matrix,
+                    "warp_matrix_inv": warp_matrix_inv,
+                }
             )
-            state["event_state"] = event_update.state
-            state["last_status"] = event_update.status
-
-            if event_update.track_box is not None and event_update.state in (event_engine.GRASP, event_engine.PLACE_CHECK):
-                snapshot_buffer.add(frame, event_update.track_box)
-            elif event_update.state == event_engine.IDLE:
-                snapshot_buffer.clear()
-
-            if event_update.add_confirmed and faiss_index is not None and faiss_index.ntotal > 0:
-                state["did_search"] = True
-                state["skip_reason"] = "searched"
-                crops = snapshot_buffer.best_crops(limit=getattr(backend_config, "SNAPSHOT_MAX_FRAMES", 8))
-                name, best_score, topk_candidates, confidence = _classify_snapshots_with_votes(
-                    crops=crops,
-                    model_bundle=model_bundle,
-                    faiss_index=faiss_index,
-                    labels=labels,
-                    state=state,
-                    match_threshold=match_threshold,
-                    faiss_top_k=faiss_top_k,
-                    frame_profiler=frame_profiler,
-                    frame_id=frame_id,
-                    session_id=session_id,
-                )
-                state["topk_candidates"] = topk_candidates
-                state["confidence"] = confidence
-                _update_last_result_cache(
-                    state,
-                    name=name,
-                    score=best_score,
-                    topk_candidates=topk_candidates,
-                    confidence=confidence,
-                )
-                result_label, is_unknown, _, top1_raw, _ = _apply_unknown_decision(
-                    state,
-                    name_candidate=name,
-                    topk_candidates=topk_candidates,
-                    frame_id=frame_id,
-                    session_id=session_id,
-                )
-
-                if not is_unknown:
-                    state["last_label"] = result_label
-                    state["last_score"] = top1_raw
-                    state["last_status"] = "ADD 확정"
-                    state.setdefault("item_scores", {})[result_label] = top1_raw
-                    billing_items = state.setdefault("billing_items", {})
-                    billing_items[result_label] = int(billing_items.get(result_label, 0)) + 1
-                    state["_last_confirmed_ms"] = int(time.time() * 1000)
-                    state.setdefault("in_cart_sequence", []).append(result_label)
-                else:
-                    state["last_label"] = "UNKNOWN"
-                    state["last_score"] = top1_raw
-                    state["last_status"] = "ADD 미확정(UNKNOWN)"
-                snapshot_buffer.clear()
-            elif event_update.add_confirmed:
-                state["skip_reason"] = "faiss_unavailable"
+            if bool(getattr(backend_config, "HAND_EVENT_WS_DEBUG", True)):
+                ws_debug_payload = dict(event_result.get("ws_debug", {}) or {})
+                ws_debug_payload["object_counts"] = dict(state.get("_event_object_counts", {}))
+                state["event_debug"] = ws_debug_payload
             else:
+                state["event_debug"] = None
+            transitions = list(event_result.get("transitions", []))
+            hand_debug = list(event_result.get("hands", []))
+            associations = list(event_result.get("associations", []))
+            object_tracks = list(event_result.get("object_tracks", []))
+            events = list(event_result.get("events", []))
+            if bool(getattr(backend_config, "HAND_EVENT_DEBUG_LOG", True)):
+                count_meta = state.get("_event_object_counts", {})
+                engine_counts = event_result.get("counts", {}) if isinstance(event_result, dict) else {}
+                last_fail_reason = ",".join(
+                    [
+                        str(h.get("last_fail_reason"))
+                        for h in hand_debug
+                        if str(h.get("last_fail_reason") or "").strip()
+                    ][:3]
+                )
+                logger.info(
+                    "Hand event after_call: session=%s frame_id=%s events=%d transitions=%d hands_raw=%s hands_after_filters=%s hands_tracked=%s objects_raw=%s objects_after_filters=%s objects_tracked=%s objects_fallback=%s last_fail_reason=%s",
+                    session_id,
+                    frame_id,
+                    len(events),
+                    len(transitions),
+                    count_meta.get("hands_raw", len(raw_hand_detections)),
+                    count_meta.get("hands_after_filters", len(hands)),
+                    engine_counts.get("hands_tracked", len(hand_debug)),
+                    count_meta.get("objects_raw", len(fallback_products)),
+                    count_meta.get("objects_after_filters", len(all_products)),
+                    engine_counts.get("objects_tracked", len(object_tracks)),
+                    engine_counts.get("objects_fallback", 0),
+                    (last_fail_reason or "none"),
+                )
+
+            if hand_debug:
+                phases = [str(h.get("phase", "IDLE")) for h in hand_debug]
+                state["event_state"] = ",".join(phases[:3])
+            else:
+                state["event_state"] = "IDLE"
+
+            if transitions:
+                state["last_status"] = str(transitions[-1].get("to", "IDLE"))
+            else:
+                state["last_status"] = "event_waiting"
+
+            # Keep per-track crops only for active candidates (avoid per-frame all-object snapshots).
+            candidate_ids: set[int] = set()
+            for h in hand_debug:
+                phase = str(h.get("phase", ""))
+                cid = h.get("candidate_object_track_id")
+                if phase.startswith("CANDIDATE_") and cid is not None:
+                    candidate_ids.add(int(cid))
+            for oid in candidate_ids:
+                obj = next((o for o in object_tracks if int(o.get("track_id", -1)) == oid), None)
+                if obj is None:
+                    continue
+                box = obj.get("box")
+                if isinstance(box, list) and len(box) == 4:
+                    snapshot_buffer.add(frame, box, track_id=oid)
+
+            if associations:
+                top_assoc = associations[0]
+                topk = list(top_assoc.get("topk", []))
+                hand_track_id = int(top_assoc.get("hand_track_id", -1))
+                stable_object_track_id = top_assoc.get("stable_object_track_id")
+                hand_track = next((h for h in hand_debug if int(h.get("hand_track_id", -1)) == hand_track_id), None)
+                hand_track_box = None
+                if hand_track is not None:
+                    hb = hand_track.get("box")
+                    if isinstance(hb, list) and len(hb) == 4:
+                        hand_track_box = hb
+                if topk:
+                    best = topk[0]
+                    obj_track_id = int(best.get("object_track_id", -1))
+                    obj_track = next((o for o in object_tracks if int(o.get("track_id", -1)) == obj_track_id), None)
+                    if hand_track_box is not None and obj_track is not None:
+                        state["best_pair"] = {
+                            "hand_track_id": hand_track_id,
+                            "object_track_id": obj_track_id,
+                            "score": float(best.get("score", 0.0)),
+                            "hand_box": hand_track_box,
+                            "product_box": obj_track.get("box"),
+                            "stable_object_track_id": stable_object_track_id,
+                        }
+                        hb = hand_track_box
+                        pb = obj_track.get("box")
+                        if isinstance(pb, list) and len(pb) == 4:
+                            h, w = frame.shape[:2]
+                            hcx = int(((hb[0] + hb[2]) * 0.5) * w)
+                            hcy = int(((hb[1] + hb[3]) * 0.5) * h)
+                            pcx = int(((pb[0] + pb[2]) * 0.5) * w)
+                            pcy = int(((pb[1] + pb[3]) * 0.5) * h)
+                            cv2.line(display_frame, (hcx, hcy), (pcx, pcy), (255, 180, 0), 2)
+
+            if bool(getattr(backend_config, "HAND_EVENT_DEBUG_LOG", True)):
+                for h in hand_debug:
+                    logger.info(
+                        "Hand event debug: session=%s frame_id=%s hand=%s rep_kind=%s roi_margin(px=%.2f,ratio=%.4f) rep_point=%s rep_point_warp=%s rep_point_original=%s inside=%s inside_warp=%s inside_original=%s crossing=%s stable_obj=%s top1_obj=%s phase=%s candidate_obj=%s evidence=%s fail=%s",
+                        session_id,
+                        frame_id,
+                        h.get("hand_track_id"),
+                        h.get("rep_point_kind"),
+                        float(h.get("roi_margin_px", 0.0) or 0.0),
+                        float(h.get("roi_margin_ratio", 0.0) or 0.0),
+                        h.get("rep_point"),
+                        h.get("rep_point_warp"),
+                        h.get("rep_point_original"),
+                        h.get("inside_roi"),
+                        h.get("inside_warp"),
+                        h.get("inside_original"),
+                        h.get("crossing"),
+                        h.get("stable_object_track_id"),
+                        h.get("top1_object_track_id"),
+                        h.get("phase"),
+                        h.get("candidate_object_track_id"),
+                        h.get("evidence_frames"),
+                        h.get("last_fail_reason"),
+                    )
+                for a in associations:
+                    logger.info(
+                        "Association debug: session=%s frame_id=%s hand=%s stable_obj=%s counts=%s min(score=%.3f,iou=%.3f) topk=%s",
+                        session_id,
+                        frame_id,
+                        a.get("hand_track_id"),
+                        a.get("stable_object_track_id"),
+                        a.get("counts"),
+                        float(a.get("min_score", 0.0)),
+                        float(a.get("min_iou", 0.0)),
+                        a.get("topk"),
+                    )
+                for t in transitions:
+                    logger.info(
+                        "Event transition: session=%s frame_id=%s hand=%s from=%s to=%s reason=%s cand=%s evidence=%s",
+                        session_id,
+                        frame_id,
+                        t.get("hand_track_id"),
+                        t.get("from"),
+                        t.get("to"),
+                        t.get("reason"),
+                        t.get("candidate_object_track_id"),
+                        t.get("evidence_frames"),
+                    )
+
+            # confirmed ADD/REMOVE only path (no per-frame immediate ADD).
+            track_label_map = state.setdefault("_event_track_label_map", {})
+            for t in transitions:
+                if t.get("to") == "IDLE" and str(t.get("from", "")).startswith("CANDIDATE_"):
+                    cid = t.get("candidate_object_track_id")
+                    if cid is not None:
+                        snapshot_buffer.clear_track(int(cid))
+            for event in events:
+                event_type = str(event.get("event_type", "")).upper()
+                object_track_id = event.get("object_track_id")
+                if event_type == "ADD":
+                    if faiss_index is None or faiss_index.ntotal <= 0:
+                        state["skip_reason"] = "faiss_unavailable"
+                        state["last_status"] = "ADD 후보(검색 불가)"
+                        continue
+                    state["did_search"] = True
+                    state["skip_reason"] = "searched"
+                    crops = snapshot_buffer.best_crops(
+                        limit=getattr(backend_config, "SNAPSHOT_MAX_FRAMES", 8),
+                        track_id=(int(object_track_id) if object_track_id is not None else None),
+                    )
+                    if not crops and object_track_id is not None:
+                        obj_track = next(
+                            (o for o in object_tracks if int(o.get("track_id", -1)) == int(object_track_id)),
+                            None,
+                        )
+                        if obj_track is not None and yolo_detector is not None:
+                            fallback_crop = yolo_detector.extract_crop(frame, obj_track.get("box"))
+                            if fallback_crop is not None:
+                                crops = [fallback_crop]
+                    if not crops:
+                        state["last_status"] = "ADD 후보(크롭 없음)"
+                        continue
+                    name, best_score, topk_candidates, confidence = _classify_snapshots_with_votes(
+                        crops=crops,
+                        model_bundle=model_bundle,
+                        faiss_index=faiss_index,
+                        labels=labels,
+                        state=state,
+                        match_threshold=match_threshold,
+                        faiss_top_k=faiss_top_k,
+                        frame_profiler=frame_profiler,
+                        frame_id=frame_id,
+                        session_id=session_id,
+                    )
+                    state["topk_candidates"] = topk_candidates
+                    state["confidence"] = confidence
+                    _update_last_result_cache(
+                        state,
+                        name=name,
+                        score=best_score,
+                        topk_candidates=topk_candidates,
+                        confidence=confidence,
+                    )
+                    result_label, is_unknown, _, top1_raw, _ = _apply_unknown_decision(
+                        state,
+                        name_candidate=name,
+                        topk_candidates=topk_candidates,
+                        frame_id=frame_id,
+                        session_id=session_id,
+                    )
+                    if not is_unknown:
+                        state["last_label"] = result_label
+                        state["last_score"] = top1_raw
+                        state["last_status"] = "ADD 확정"
+                        state.setdefault("item_scores", {})[result_label] = top1_raw
+                        billing_items = state.setdefault("billing_items", {})
+                        billing_items[result_label] = int(billing_items.get(result_label, 0)) + 1
+                        state["_last_confirmed_ms"] = int(time.time() * 1000)
+                        state.setdefault("in_cart_sequence", []).append(result_label)
+                        if object_track_id is not None:
+                            track_label_map[str(int(object_track_id))] = result_label
+                    else:
+                        state["last_label"] = "UNKNOWN"
+                        state["last_score"] = top1_raw
+                        state["last_status"] = "ADD 미확정(UNKNOWN)"
+                    if object_track_id is not None:
+                        snapshot_buffer.clear_track(int(object_track_id))
+
+                elif event_type == "REMOVE":
+                    remove_label = None
+                    if object_track_id is not None:
+                        remove_label = track_label_map.pop(str(int(object_track_id)), None)
+                    if remove_label is None:
+                        remove_label = _select_remove_label(state)
+                    billing_items = state.setdefault("billing_items", {})
+                    if remove_label and int(billing_items.get(remove_label, 0)) > 0:
+                        billing_items[remove_label] = int(billing_items.get(remove_label, 0)) - 1
+                        if billing_items[remove_label] <= 0:
+                            billing_items.pop(remove_label, None)
+                        sequence = state.setdefault("in_cart_sequence", [])
+                        for i in range(len(sequence) - 1, -1, -1):
+                            if sequence[i] == remove_label:
+                                sequence.pop(i)
+                                break
+                        state["last_label"] = remove_label
+                        state["last_score"] = 0.0
+                        state["last_status"] = "REMOVE 확정"
+                    else:
+                        state["last_status"] = "REMOVE 미확정"
+
+            if not events and state.get("skip_reason") == "pending":
                 state["skip_reason"] = "event_not_confirmed"
 
-            if event_update.remove_confirmed:
-                remove_label = _select_remove_label(state)
-                billing_items = state.setdefault("billing_items", {})
-                if remove_label and int(billing_items.get(remove_label, 0)) > 0:
-                    billing_items[remove_label] = int(billing_items.get(remove_label, 0)) - 1
-                    if billing_items[remove_label] <= 0:
-                        billing_items.pop(remove_label, None)
-                    sequence = state.setdefault("in_cart_sequence", [])
-                    for i in range(len(sequence) - 1, -1, -1):
-                        if sequence[i] == remove_label:
-                            sequence.pop(i)
-                            break
-                    state["last_label"] = remove_label
-                    state["last_score"] = 0.0
-                    state["last_status"] = "REMOVE 확정"
-                else:
-                    state["last_status"] = "REMOVE 미확정"
+            if bool(getattr(backend_config, "HAND_EVENT_DEBUG_OVERLAY", False)):
+                for h in hand_debug:
+                    text = f"H{h.get('hand_track_id')} {h.get('phase')} {h.get('crossing')}"
+                    cv2.putText(
+                        display_frame,
+                        text,
+                        (12, 24 + 18 * int(h.get("hand_track_id", 0) % 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        (0, 255, 255),
+                        1,
+                    )
 
             # In EVENT_MODE, defer embedding/FAISS to event confirmation only.
-            if roi_poly is not None:
+            if roi_poly is not None and (not object_roi_gate_disabled):
                 cv2.polylines(display_frame, [roi_poly], True, (0, 181, 255), 2)
             if frame_profiler is not None:
                 frame_profiler.add_ms("total", (time.perf_counter() - total_start) * 1000.0)
@@ -1796,7 +2237,7 @@ def process_checkout_frame(
                 inside_roi = bool(cv2.pointPolygonTest(roi_poly, (cx, cy), False) >= 0)
                 roi_iou_val = _roi_iou(box, roi_poly, frame.shape)
                 overlap_ratio = _roi_overlap_ratio(box, roi_poly, frame.shape)
-                if not inside_roi and overlap_ratio < float(roi_box_min_overlap):
+                if (not object_roi_gate_disabled) and (not inside_roi) and overlap_ratio < float(roi_box_min_overlap):
                     has_outside_roi = True
                     continue
 
@@ -2125,6 +2566,15 @@ def process_checkout_frame(
         state["detection_boxes"] = []  # No YOLO detections
         state["best_pair"] = None
         state["skip_reason"] = "yolo_not_available"
+        if bool(getattr(backend_config, "EVENT_MODE", False)) and bool(
+            getattr(backend_config, "CHECKOUT_DEBUG_TICK_LOG", False)
+        ):
+            logger.info(
+                "Checkout skip: session=%s frame_id=%s skip_reason=%s event_engine_skipped=true",
+                session_id,
+                frame_id,
+                state["skip_reason"],
+            )
 
         if frame_profiler is not None:
             with frame_profiler.measure("detect"):

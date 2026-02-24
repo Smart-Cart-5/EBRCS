@@ -15,7 +15,7 @@ class SnapshotBuffer:
     def clear(self) -> None:
         self._entries = []
 
-    def add(self, frame: np.ndarray, box: list[float] | None) -> None:
+    def add(self, frame: np.ndarray, box: list[float] | None, *, track_id: int | None = None) -> None:
         if box is None:
             return
         h, w = frame.shape[:2]
@@ -29,14 +29,30 @@ class SnapshotBuffer:
         if crop.size == 0 or crop.shape[0] < 20 or crop.shape[1] < 20:
             return
         area = (x2 - x1) * (y2 - y1)
-        self._entries.append({"area": float(area), "crop": crop.copy()})
+        self._entries.append(
+            {
+                "area": float(area),
+                "crop": crop.copy(),
+                "track_id": (int(track_id) if track_id is not None else None),
+            }
+        )
 
         if len(self._entries) > self.max_frames:
             self._entries = sorted(self._entries, key=lambda x: x["area"], reverse=True)[: self.max_frames]
 
-    def best_crops(self, limit: int | None = None) -> list[np.ndarray]:
+    def clear_track(self, track_id: int) -> None:
+        tid = int(track_id)
+        self._entries = [e for e in self._entries if e.get("track_id") != tid]
+
+    def best_crops(self, limit: int | None = None, *, track_id: int | None = None) -> list[np.ndarray]:
         if not self._entries:
             return []
+        entries = self._entries
+        if track_id is not None:
+            tid = int(track_id)
+            entries = [e for e in entries if e.get("track_id") == tid]
+            if not entries:
+                return []
         n = self.max_frames if limit is None else max(1, int(limit))
-        entries = sorted(self._entries, key=lambda x: x["area"], reverse=True)[:n]
+        entries = sorted(entries, key=lambda x: x["area"], reverse=True)[:n]
         return [entry["crop"] for entry in entries]

@@ -8,15 +8,26 @@ from __future__ import annotations
 
 import time
 import uuid
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
 import numpy as np
 
+logger = logging.getLogger("backend.session_manager")
+
 PHASE_IDLE = "IDLE"
 PHASE_ROI_CALIBRATING = "ROI_CALIBRATING"
 PHASE_CHECKOUT_RUNNING = "CHECKOUT_RUNNING"
+
+
+def _is_full_roi(points: list[list[float]] | None) -> bool:
+    if not isinstance(points, list) or len(points) < 3:
+        return False
+    s = {(round(float(p[0]), 3), round(float(p[1]), 3)) for p in points if isinstance(p, list) and len(p) == 2}
+    full = {(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)}
+    return s == full
 
 
 @dataclass
@@ -38,6 +49,7 @@ class CheckoutSession:
         "confidence": 0.0,
         "best_pair": None,
         "event_state": "IDLE",
+        "event_debug": None,
         "occluded_by_hand": False,
         "overlap_hand_iou_max": 0.0,
         "search_crop_min_side_before": None,
@@ -98,6 +110,21 @@ class CheckoutSession:
         "_cart_roi_last_error": None,
         "_cart_roi_invalid_reason": None,
         "_cart_roi_calib_log_last_ms": 0,
+        "_ws_connected": False,
+        "_event_roi_mode": "full",
+        "_event_roi_source": "full_fallback",
+        "_event_roi_ready": False,
+        "_event_roi_bounds": None,
+        "_event_roi_area_ratio": 0.0,
+        "_event_roi_bounds_original": None,
+        "_event_roi_area_ratio_original": 0.0,
+        "_event_roi_bounds_warp": None,
+        "_event_roi_area_ratio_warp": 0.0,
+        "_event_roi_too_large": False,
+        "_event_roi_warnings": [],
+        "_virtual_scale": 1.0,
+        "_vd_applied": False,
+        "_warp_applied": False,
     })
 
     # OpenCV background subtractor -- per-session, not serializable
@@ -138,6 +165,7 @@ class CheckoutSession:
         self.state["confidence"] = 0.0
         self.state["best_pair"] = None
         self.state["event_state"] = "IDLE"
+        self.state["event_debug"] = None
         self.state["occluded_by_hand"] = False
         self.state["overlap_hand_iou_max"] = 0.0
         self.state["search_crop_min_side_before"] = None
@@ -198,9 +226,27 @@ class CheckoutSession:
         self.state["_cart_roi_last_error"] = None
         self.state["_cart_roi_invalid_reason"] = None
         self.state["_cart_roi_calib_log_last_ms"] = 0
+        self.state["_ws_connected"] = False
+        self.state["_event_roi_mode"] = "full"
+        self.state["_event_roi_source"] = "full_fallback"
+        self.state["_event_roi_ready"] = False
+        self.state["_event_roi_bounds"] = None
+        self.state["_event_roi_area_ratio"] = 0.0
+        self.state["_event_roi_bounds_original"] = None
+        self.state["_event_roi_area_ratio_original"] = 0.0
+        self.state["_event_roi_bounds_warp"] = None
+        self.state["_event_roi_area_ratio_warp"] = 0.0
+        self.state["_event_roi_too_large"] = False
+        self.state["_event_roi_warnings"] = []
+        self.state["_virtual_scale"] = 1.0
+        self.state["_vd_applied"] = False
+        self.state["_warp_applied"] = False
         self.state.pop("_cart_roi_last_debug_save_ms", None)
         self.state.pop("_event_engine", None)
+        self.state.pop("_hand_event_engine", None)
         self.state.pop("_snapshot_buffer", None)
+        self.state.pop("_event_track_label_map", None)
+        self.state.pop("_event_roi_override_norm", None)
         self.frame_count = 0
         self.bg_subtractor = cv2.createBackgroundSubtractorKNN(history=300)
 
@@ -270,8 +316,19 @@ class CheckoutSession:
             # Auto ROI mode starts from fresh calibration result.
             self.roi_poly_norm = None
         else:
-            # Legacy behavior: keep inference running with full-frame ROI.
-            self.roi_poly_norm = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+            # no_auto: prefer calibration(4pt) if present, else keep manual ROI, else full fallback.
+            if isinstance(self.warp_points_norm, list) and len(self.warp_points_norm) == 4:
+                self.roi_poly_norm = [list(p) for p in self.warp_points_norm]
+            elif not (isinstance(self.roi_poly_norm, list) and len(self.roi_poly_norm) >= 3):
+                self.roi_poly_norm = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+        logger.info(
+            "Session ROI mode set: session=%s auto_enabled=%s warp_enabled=%s warp_points_ready=%s phase=%s",
+            self.session_id,
+            bool(enabled),
+            bool(self.warp_enabled),
+            bool(isinstance(self.warp_points_norm, list) and len(self.warp_points_norm) == 4),
+            self.state.get("phase"),
+        )
 
     def start_checkout_with_mode(self, mode: str) -> str:
         start_mode = "auto_roi" if str(mode) == "auto_roi" else "no_roi"
@@ -294,9 +351,16 @@ class CheckoutSession:
             self.state["_cart_roi_pending_ratio"] = 0.0
             self.state["_cart_roi_preview_last_sent_ms"] = 0
             self.roi_poly_norm = None
+            logger.info(
+                "Checkout start(auto_roi): session=%s warp_enabled=%s warp_points_ready=%s phase=%s",
+                self.session_id,
+                bool(self.warp_enabled),
+                bool(isinstance(self.warp_points_norm, list) and len(self.warp_points_norm) == 4),
+                self.state.get("phase"),
+            )
             return PHASE_ROI_CALIBRATING
 
-        # no_roi start: preserve legacy full-frame ROI and run immediately.
+        # no_roi start: use calibration 4pt ROI when available, else manual ROI, else full fallback.
         self.state["_cart_roi_auto_enabled"] = False
         self.state["_checkout_start_mode"] = "no_roi"
         self.state["_checkout_user_message"] = None
@@ -314,16 +378,53 @@ class CheckoutSession:
         self.state["_cart_roi_pending_polygon"] = None
         self.state["_cart_roi_pending_ratio"] = 0.0
         self.state["_cart_roi_preview_last_sent_ms"] = 0
-        self.roi_poly_norm = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+        if isinstance(self.warp_points_norm, list) and len(self.warp_points_norm) == 4:
+            self.roi_poly_norm = [list(p) for p in self.warp_points_norm]
+        elif not (isinstance(self.roi_poly_norm, list) and len(self.roi_poly_norm) >= 3):
+            self.roi_poly_norm = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+        logger.info(
+            "Checkout start(no_roi): session=%s warp_enabled=%s warp_points_ready=%s phase=%s",
+            self.session_id,
+            bool(self.warp_enabled),
+            bool(isinstance(self.warp_points_norm, list) and len(self.warp_points_norm) == 4),
+            self.state.get("phase"),
+        )
         return PHASE_CHECKOUT_RUNNING
+
+    def resolve_event_roi_norm(self) -> tuple[list[list[float]], str, str, bool]:
+        auto_enabled = bool(self.state.get("_cart_roi_auto_enabled", False))
+        cart_confirmed = bool(self.state.get("_cart_roi_confirmed", False))
+        if auto_enabled and cart_confirmed and isinstance(self.roi_poly_norm, list) and len(self.roi_poly_norm) >= 3:
+            return [list(p) for p in self.roi_poly_norm], "auto", "cart_segmenter", True
+
+        # In no_auto mode, calibration points take precedence for event ROI.
+        if isinstance(self.warp_points_norm, list) and len(self.warp_points_norm) == 4:
+            return [list(p) for p in self.warp_points_norm], "calib4", "calibration_points", True
+
+        if isinstance(self.roi_poly_norm, list) and len(self.roi_poly_norm) >= 3 and not _is_full_roi(self.roi_poly_norm):
+            return [list(p) for p in self.roi_poly_norm], "manual", "roi_polygon", True
+
+        full = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+        return full, "full", "full_fallback", False
 
     def get_roi_polygon(self, frame_shape: tuple[int, ...]) -> np.ndarray | None:
         """Convert normalized ROI to pixel coordinates for the given frame."""
-        if not self.roi_poly_norm or len(self.roi_poly_norm) < 3:
+        override = self.state.get("_event_roi_override_norm")
+        if isinstance(override, list) and len(override) >= 3:
+            roi_poly_norm = override
+            roi_mode = str(self.state.get("_event_roi_mode", "override"))
+            roi_source = str(self.state.get("_event_roi_source", "override"))
+            roi_ready = True
+        else:
+            roi_poly_norm, roi_mode, roi_source, roi_ready = self.resolve_event_roi_norm()
+        self.state["_event_roi_mode"] = roi_mode
+        self.state["_event_roi_source"] = roi_source
+        self.state["_event_roi_ready"] = bool(roi_ready)
+        if not roi_poly_norm or len(roi_poly_norm) < 3:
             return None
         h, w = frame_shape[:2]
         pts = []
-        for x_norm, y_norm in self.roi_poly_norm:
+        for x_norm, y_norm in roi_poly_norm:
             x = int(max(0.0, min(1.0, x_norm)) * w)
             y = int(max(0.0, min(1.0, y_norm)) * h)
             pts.append([x, y])

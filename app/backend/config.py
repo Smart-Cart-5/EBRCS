@@ -27,6 +27,14 @@ _DEFAULT_YOLO_PATH = str(PROJECT_ROOT.parent / "smartcart_hand_yolo11_best_arg_b
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", _DEFAULT_YOLO_PATH)
 YOLO_CONF_THRESHOLD = float(os.getenv("YOLO_CONF_THRESHOLD", "0.5"))
 USE_YOLO = os.getenv("USE_YOLO", "true").lower() == "true"
+YOLO_HAND_CLASS_ALIASES = os.getenv(
+    "YOLO_HAND_CLASS_ALIASES",
+    "hand,hands,palm",
+).strip()
+YOLO_PRODUCT_CLASS_ALIASES = os.getenv(
+    "YOLO_PRODUCT_CLASS_ALIASES",
+    "object,product,item,goods",
+).strip()
 
 # Cart ROI segmentation (Roboflow semantic segmentation)
 # Guardrail flag for external API calls. User start mode remains primary.
@@ -86,7 +94,9 @@ SEARCH_SELECT_W_AREA = float(os.getenv("SEARCH_SELECT_W_AREA", "0.4"))
 SEARCH_SELECT_W_ROI = float(os.getenv("SEARCH_SELECT_W_ROI", "0.2"))
 ROI_IOU_MIN = float(os.getenv("ROI_IOU_MIN", "0.15"))
 ROI_CENTER_PASS = os.getenv("ROI_CENTER_PASS", "true").lower() == "true"
-HAND_CONF_MIN = float(os.getenv("HAND_CONF_MIN", "0.5"))
+# Allow HAND_CONF_TH alias for quick runtime tuning in webcam tests.
+HAND_CONF_MIN = float(os.getenv("HAND_CONF_TH", os.getenv("HAND_CONF_MIN", "0.35")))
+HAND_APPLY_CART_ROI_FILTER = os.getenv("HAND_APPLY_CART_ROI_FILTER", "false").lower() == "true"
 HAND_OVERLAP_IOU = float(os.getenv("HAND_OVERLAP_IOU", "0.25"))
 SEARCH_MASK_HAND = os.getenv("SEARCH_MASK_HAND", "false").lower() == "true"
 MIN_PRODUCT_BBOX_AREA = int(os.getenv("MIN_PRODUCT_BBOX_AREA", str(MIN_AREA)))
@@ -95,6 +105,7 @@ MATCH_THRESHOLD = 0.62
 COUNT_COOLDOWN_SECONDS = 3.0  # 중복 방지: 동일 상품 3초 내 재카운트 방지
 ROI_CLEAR_FRAMES = 8
 STREAM_TARGET_WIDTH = 960  # Restored for better quality
+VIRTUAL_DISTANCE_SCALE = float(os.getenv("VIRTUAL_DISTANCE_SCALE", "1.0"))
 STREAM_SEND_IMAGES = (
     os.getenv("STREAM_SEND_IMAGES", "false").lower() == "true"
 )  # Send images in WebSocket responses (default: false, JSON only)
@@ -106,14 +117,55 @@ ASSOCIATION_IOU_WEIGHT = float(os.getenv("ASSOCIATION_IOU_WEIGHT", "0.5"))
 ASSOCIATION_DIST_WEIGHT = float(os.getenv("ASSOCIATION_DIST_WEIGHT", "0.5"))
 ASSOCIATION_MAX_CENTER_DIST = float(os.getenv("ASSOCIATION_MAX_CENTER_DIST", "0.35"))
 ASSOCIATION_MIN_SCORE = float(os.getenv("ASSOCIATION_MIN_SCORE", "0.1"))
-EVENT_MODE = os.getenv("EVENT_MODE", "false").lower() == "true"
-T_GRASP_MIN_FRAMES = int(os.getenv("T_GRASP_MIN_FRAMES", "4"))
-T_PLACE_STABLE_FRAMES = int(os.getenv("T_PLACE_STABLE_FRAMES", "12"))
+EVENT_MODE = os.getenv("EVENT_MODE", "true").lower() == "true"
+HAND_EVENT_ASSOC_TOP_K = int(os.getenv("HAND_EVENT_ASSOC_TOP_K", "3"))
+HAND_EVENT_ASSOC_STABLE_FRAMES = int(os.getenv("HAND_EVENT_ASSOC_STABLE_FRAMES", "1"))
+HAND_EVENT_MIN_ASSOC_SCORE = float(os.getenv("HAND_EVENT_MIN_ASSOC_SCORE", "0.03"))
+HAND_EVENT_MIN_ASSOC_IOU = float(os.getenv("HAND_EVENT_MIN_ASSOC_IOU", "0.0"))
+HAND_EVENT_ALLOW_DET_FALLBACK = os.getenv("HAND_EVENT_ALLOW_DET_FALLBACK", "true").lower() == "true"
+HAND_EVENT_DET_FALLBACK_MIN_SCORE = float(os.getenv("HAND_EVENT_DET_FALLBACK_MIN_SCORE", "0.01"))
+HAND_EVENT_ADD_EVIDENCE_FRAMES = int(os.getenv("HAND_EVENT_ADD_EVIDENCE_FRAMES", "2"))
+HAND_EVENT_REMOVE_EVIDENCE_FRAMES = int(os.getenv("HAND_EVENT_REMOVE_EVIDENCE_FRAMES", "2"))
+HAND_EVENT_REMOVE_MISSING_GRACE_FRAMES = int(os.getenv("HAND_EVENT_REMOVE_MISSING_GRACE_FRAMES", "3"))
+HAND_EVENT_CANDIDATE_TIMEOUT_S = float(os.getenv("HAND_EVENT_CANDIDATE_TIMEOUT_S", "1.2"))
+HAND_EVENT_COOLDOWN_S = float(os.getenv("HAND_EVENT_COOLDOWN_S", "0.7"))
+HAND_EVENT_CANDIDATE_SWITCH_MIN_DELTA = float(
+    os.getenv("HAND_EVENT_CANDIDATE_SWITCH_MIN_DELTA", "0.08")
+)
+HAND_EVENT_TRACK_IOU_MATCH_THRESHOLD = float(
+    os.getenv("HAND_EVENT_TRACK_IOU_MATCH_THRESHOLD", "0.05")
+)
+HAND_EVENT_TRACK_MAX_MISSED_FRAMES = int(os.getenv("HAND_EVENT_TRACK_MAX_MISSED_FRAMES", "8"))
+HAND_EVENT_CANDIDATE_ROI_RELAX = os.getenv("HAND_EVENT_CANDIDATE_ROI_RELAX", "true").lower() == "true"
+HAND_EVENT_CANDIDATE_HAND_NEAR_DIST = float(
+    os.getenv("HAND_EVENT_CANDIDATE_HAND_NEAR_DIST", "0.22")
+)
+HAND_EVENT_HAND_REPRESENTATIVE_POINT = os.getenv("HAND_EVENT_HAND_REPRESENTATIVE_POINT", "center")
+HAND_EVENT_OBJECT_REPRESENTATIVE_POINT = os.getenv(
+    "HAND_EVENT_OBJECT_REPRESENTATIVE_POINT",
+    "bottom_center",
+)
+HAND_EVENT_ROI_MARGIN_PX = float(os.getenv("HAND_EVENT_ROI_MARGIN_PX", "6.0"))
+HAND_EVENT_ROI_MARGIN_RATIO = float(os.getenv("HAND_EVENT_ROI_MARGIN_RATIO", "0.0"))
+HAND_EVENT_DEBUG_LOG = os.getenv("HAND_EVENT_DEBUG_LOG", "true").lower() == "true"
+HAND_EVENT_DEBUG_OVERLAY = os.getenv("HAND_EVENT_DEBUG_OVERLAY", "false").lower() == "true"
+HAND_EVENT_WS_DEBUG = os.getenv("HAND_EVENT_WS_DEBUG", "true").lower() == "true"
+CHECKOUT_DEBUG_TICK_LOG = os.getenv("CHECKOUT_DEBUG_TICK_LOG", "true").lower() == "true"
+CHECKOUT_AUTO_CONFIRM_ROI = os.getenv("CHECKOUT_AUTO_CONFIRM_ROI", "false").lower() == "true"
+CHECKOUT_AUTO_CONFIRM_ROI_MIN_RATIO = float(os.getenv("CHECKOUT_AUTO_CONFIRM_ROI_MIN_RATIO", "0.005"))
+CHECKOUT_AUTO_CONFIRM_ROI_MIN_POLY_POINTS = int(os.getenv("CHECKOUT_AUTO_CONFIRM_ROI_MIN_POLY_POINTS", "3"))
+EVENT_ROI_TOO_LARGE_RATIO = float(os.getenv("EVENT_ROI_TOO_LARGE_RATIO", "0.90"))
+EVENT_ROI_EDGE_WARN_MARGIN = float(os.getenv("EVENT_ROI_EDGE_WARN_MARGIN", "0.05"))
+EVENT_ROI_BLOCK_WHEN_TOO_LARGE = os.getenv("EVENT_ROI_BLOCK_WHEN_TOO_LARGE", "false").lower() == "true"
 SNAPSHOT_MAX_FRAMES = int(os.getenv("SNAPSHOT_MAX_FRAMES", "8"))
-T_REMOVE_CONFIRM_FRAMES = int(os.getenv("T_REMOVE_CONFIRM_FRAMES", "45"))
-ROI_HYSTERESIS_INSET_RATIO = float(os.getenv("ROI_HYSTERESIS_INSET_RATIO", "0.05"))
-ROI_HYSTERESIS_OUTSET_RATIO = float(os.getenv("ROI_HYSTERESIS_OUTSET_RATIO", "0.05"))
 WARP_MODE = os.getenv("WARP_MODE", "false").lower() == "true"
+WARP_AUTO_ENABLE_WITH_CALIB4 = os.getenv("WARP_AUTO_ENABLE_WITH_CALIB4", "false").lower() == "true"
+DETECT_OUTSIDE_EVENT_ROI = os.getenv("DETECT_OUTSIDE_EVENT_ROI", "true").lower() == "true"
+DEBUG_DISABLE_OBJECT_ROI_GATE = os.getenv("DEBUG_DISABLE_OBJECT_ROI_GATE", "false").lower() == "true"
+DEBUG_EVENT_ROI_ONLY = os.getenv("DEBUG_EVENT_ROI_ONLY", "false").lower() == "true"
+DEBUG_BYPASS_OBJECT_FILTER = os.getenv("DEBUG_BYPASS_OBJECT_FILTER", "false").lower() == "true"
+OBJECT_KEEP_IF_HAND_OVERLAP = os.getenv("OBJECT_KEEP_IF_HAND_OVERLAP", "true").lower() == "true"
+OBJECT_KEEP_HAND_OVERLAP_IOU = float(os.getenv("OBJECT_KEEP_HAND_OVERLAP_IOU", "0.1"))
 WARP_WIDTH = int(os.getenv("WARP_WIDTH", "640"))
 WARP_HEIGHT = int(os.getenv("WARP_HEIGHT", "480"))
 WARP_BLACK_MAX_THRESHOLD = int(os.getenv("WARP_BLACK_MAX_THRESHOLD", "5"))

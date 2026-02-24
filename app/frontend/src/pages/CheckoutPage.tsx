@@ -7,6 +7,7 @@ import {
   videoStatusUrl,
   setWarp,
   clearWarp,
+  clearROI,
   setWarpEnabled,
   confirmROI,
   retryROI,
@@ -27,6 +28,39 @@ const DEFAULT_CAPTURE_WIDTH = 640;
 const DEFAULT_JPEG_QUALITY = 0.65;
 const DEFAULT_BUFFERED_AMOUNT_LIMIT = 512 * 1024;
 const ROI_GUIDE_IMAGE_URL = "/roi_guides/cart_reference.jpg";
+const EDGE_MARGIN_NORM = 0.05;
+const MAX_CALIB_AREA_RATIO = 0.90;
+
+type CalibrationClickDebug = {
+  rawClientX: number;
+  rawClientY: number;
+  rectLeft: number;
+  rectTop: number;
+  rectWidth: number;
+  rectHeight: number;
+  normalizedX: number;
+  normalizedY: number;
+  mirroredX: boolean;
+  pointsAfterClick: number[][];
+};
+
+function polygonAreaNorm(points: number[][]): number {
+  if (!Array.isArray(points) || points.length < 3) return 0;
+  let sum = 0;
+  for (let i = 0; i < points.length; i++) {
+    const [x1, y1] = points[i];
+    const [x2, y2] = points[(i + 1) % points.length];
+    sum += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(sum) * 0.5;
+}
+
+function isEdgePoint(pt: number[]): boolean {
+  if (!Array.isArray(pt) || pt.length !== 2) return true;
+  const x = Number(pt[0]);
+  const y = Number(pt[1]);
+  return x <= EDGE_MARGIN_NORM || x >= 1 - EDGE_MARGIN_NORM || y <= EDGE_MARGIN_NORM || y >= 1 - EDGE_MARGIN_NORM;
+}
 
 function getSendFps(): number {
   const raw = Number(import.meta.env.VITE_SEND_FPS ?? import.meta.env.VITE_WS_SEND_FPS);
@@ -44,6 +78,32 @@ function getBufferedAmountLimit(): number {
   const raw = Number(import.meta.env.VITE_WS_BUFFERED_AMOUNT_LIMIT);
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_BUFFERED_AMOUNT_LIMIT;
   return Math.floor(raw);
+}
+
+function clampVirtualScale(scale: number): number {
+  if (!Number.isFinite(scale)) return 1.0;
+  return Math.max(0.3, Math.min(1.0, scale));
+}
+
+function drawVideoWithVirtualDistance(
+  ctx: CanvasRenderingContext2D,
+  video: HTMLVideoElement,
+  width: number,
+  height: number,
+  scale: number,
+): void {
+  const s = clampVirtualScale(scale);
+  if (s >= 0.9999) {
+    ctx.drawImage(video, 0, 0, width, height);
+    return;
+  }
+  const innerW = Math.max(1, Math.round(width * s));
+  const innerH = Math.max(1, Math.round(height * s));
+  const offX = Math.max(0, Math.floor((width - innerW) / 2));
+  const offY = Math.max(0, Math.floor((height - innerH) / 2));
+  ctx.fillStyle = "rgb(0,0,0)";
+  ctx.fillRect(0, 0, width, height);
+  ctx.drawImage(video, offX, offY, innerW, innerH);
 }
 
 export default function CheckoutPage() {
@@ -64,18 +124,21 @@ export default function CheckoutPage() {
   const [startModalUnavailableReason, setStartModalUnavailableReason] = useState<string | null>(null);
   const [roiCalibStartMs, setRoiCalibStartMs] = useState<number | null>(null);
   const [debugPanelOpen, setDebugPanelOpen] = useState(false);
+  const [lastCalibClickDebug, setLastCalibClickDebug] = useState<CalibrationClickDebug | null>(null);
   const [debugView, setDebugView] = useState<{
     sessionId: string | null;
     didSearch: boolean;
     skipReason: string;
     lastResultAgeMs: number | null;
     topkCandidates: TopKCandidate[];
+    savedWarpPoints: number[][];
   }>({
     sessionId: null,
     didSearch: false,
     skipReason: "init",
     lastResultAgeMs: null,
     topkCandidates: [],
+    savedWarpPoints: [],
   });
 
   const {
@@ -94,6 +157,7 @@ export default function CheckoutPage() {
     roiPolygon,
     detectionBoxes,
     warpEnabled,
+    warpApplied,
     warpPoints,
     phase,
     message,
@@ -105,6 +169,17 @@ export default function CheckoutPage() {
     checkoutStartMode,
     cartRoiAvailable,
     cartRoiUnavailableReason,
+    eventRoiMode,
+    eventRoiSource,
+    eventRoiReady,
+    eventRoiBoundsOriginal,
+    eventRoiAreaRatioOriginal,
+    eventRoiBoundsWarp,
+    eventRoiAreaRatioWarp,
+    eventRoiTooLarge,
+    eventRoiWarnings,
+    virtualScale,
+    vdApplied,
   } = useSessionStore();
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -223,33 +298,131 @@ export default function CheckoutPage() {
     const canvas = displayCanvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
-    const xPx = ((e.clientX - rect.left) / Math.max(1, rect.width)) * canvas.width;
-    const yPx = ((e.clientY - rect.top) / Math.max(1, rect.height)) * canvas.height;
-    const x = Math.max(0, Math.min(1, xPx / Math.max(1, canvas.width)));
-    const y = Math.max(0, Math.min(1, yPx / Math.max(1, canvas.height)));
+    const style = window.getComputedStyle(canvas);
+    const transform = style.transform || "";
+    const mirroredX = transform.includes("matrix(") && transform.includes("-1");
+    const rawClientX = e.clientX;
+    const rawClientY = e.clientY;
+    let x = (rawClientX - rect.left) / Math.max(1, rect.width);
+    const y = (rawClientY - rect.top) / Math.max(1, rect.height);
+    if (mirroredX) {
+      x = 1 - x;
+    }
+    x = Math.max(0, Math.min(1, x));
+    const yClamped = Math.max(0, Math.min(1, y));
+    const baseDebug = {
+      rawClientX,
+      rawClientY,
+      rect: {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+      },
+      normalized: { x, y: yClamped },
+      mirroredX,
+    };
+    if (isEdgePoint([x, yClamped])) {
+      toast.error("점이 가장자리에 너무 가깝습니다. 안쪽으로 다시 찍어주세요.");
+      console.warn("[Calib4] reject edge point", baseDebug);
+      return;
+    }
     setCalibrationPoints((prev) => {
       if (prev.length >= 4) return prev;
-      return [...prev, [x, y]];
+      const next = [...prev, [x, yClamped]];
+      const clickDebug: CalibrationClickDebug = {
+        rawClientX,
+        rawClientY,
+        rectLeft: rect.left,
+        rectTop: rect.top,
+        rectWidth: rect.width,
+        rectHeight: rect.height,
+        normalizedX: x,
+        normalizedY: yClamped,
+        mirroredX,
+        pointsAfterClick: next,
+      };
+      setLastCalibClickDebug(clickDebug);
+      console.log("[Calib4] click", { ...baseDebug, points: next });
+      return next;
     });
   }, []);
 
   const applyWarpCalibration = useCallback(async () => {
     if (!sessionId || calibrationPoints.length !== 4) return;
-    await setWarp(sessionId, calibrationPoints, true);
-    setSetupMode(false);
+    const edgePoint = calibrationPoints.find((pt) => isEdgePoint(pt));
+    if (edgePoint) {
+      toast.error("점이 가장자리에 너무 가깝습니다. 4점을 다시 찍어주세요.");
+      console.warn("[Calib4] apply blocked by edge point", { points: calibrationPoints, edgePoint });
+      return;
+    }
+    const areaRatio = polygonAreaNorm(calibrationPoints);
+    if (areaRatio > MAX_CALIB_AREA_RATIO) {
+      toast.error("ROI 면적이 너무 큽니다(거의 풀프레임). 중앙 영역으로 다시 찍어주세요.");
+      console.warn("[Calib4] apply blocked by too-large area", { points: calibrationPoints, areaRatio });
+      return;
+    }
+    try {
+      const res = await setWarp(sessionId, calibrationPoints, true);
+      useSessionStore.setState({
+        warpEnabled: !!res.enabled,
+        warpPoints: res.points ?? null,
+      });
+      console.log("[Calib4] apply saved points", { points: calibrationPoints, areaRatio });
+      toast.success("ROI 4점이 저장되었습니다.");
+      setSetupMode(false);
+    } catch (error) {
+      toast.error(`ROI 저장 실패: ${error instanceof Error ? error.message : String(error)}`);
+      console.error("[Calib4] apply failed", { points: calibrationPoints, areaRatio, error });
+    }
   }, [sessionId, calibrationPoints]);
 
   const resetWarpCalibration = useCallback(async () => {
     setCalibrationPoints([]);
+    setLastCalibClickDebug(null);
     setSetupMode(false);
+    console.log("[Calib4] reset requested -> local points cleared", { pointsLength: 0 });
     if (!sessionId) return;
-    await clearWarp(sessionId);
+    try {
+      const [warpRes] = await Promise.all([clearWarp(sessionId), clearROI(sessionId)]);
+      useSessionStore.setState({
+        warpEnabled: !!warpRes.enabled,
+        warpApplied: false,
+        warpPoints: warpRes.points ?? null,
+        roiPolygon: null,
+        eventRoiBounds: null,
+        eventRoiAreaRatio: 0,
+        eventRoiBoundsOriginal: null,
+        eventRoiAreaRatioOriginal: 0,
+        eventRoiBoundsWarp: null,
+        eventRoiAreaRatioWarp: 0,
+        eventRoiTooLarge: false,
+        eventRoiWarnings: [],
+      });
+      console.log("[Calib4] reset completed -> backend warp/roi cleared");
+      toast.success("ROI/Warp가 초기화되었습니다.");
+    } catch (error) {
+      toast.error(`리셋 실패: ${error instanceof Error ? error.message : String(error)}`);
+      console.error("[Calib4] reset failed", { error });
+    }
   }, [sessionId]);
 
   const toggleWarp = useCallback(async () => {
-    if (!sessionId) return;
-    await setWarpEnabled(sessionId, !warpEnabled);
-  }, [sessionId, warpEnabled]);
+    if (!sessionId) {
+      toast.error("세션이 아직 준비되지 않았습니다. 잠시 후 다시 시도해주세요.");
+      return;
+    }
+    const hasWarpPoints = Array.isArray(warpPoints) && warpPoints.length === 4;
+    if (!warpEnabled && !hasWarpPoints) {
+      toast.error("먼저 4점 캘리브레이션을 적용하세요.");
+      return;
+    }
+    const res = await setWarpEnabled(sessionId, !warpEnabled);
+    useSessionStore.setState({
+      warpEnabled: !!res.enabled,
+      warpPoints: res.points ?? null,
+    });
+  }, [sessionId, warpEnabled, warpPoints]);
 
   const handleConfirmRoi = useCallback(async () => {
     if (!sessionId || confirmingRoi) return;
@@ -331,6 +504,16 @@ export default function CheckoutPage() {
           has_frame: !!data.frame,
           has_roi: !!data.roi_polygon,
           has_pending_roi: !!data.cart_roi_pending_polygon,
+          warp_points: data.warp_points,
+          event_roi_bounds: data.event_roi_bounds,
+          event_roi_area_ratio: data.event_roi_area_ratio,
+          event_roi_bounds_original: data.event_roi_bounds_original,
+          event_roi_area_ratio_original: data.event_roi_area_ratio_original,
+          event_roi_bounds_warp: data.event_roi_bounds_warp,
+          event_roi_area_ratio_warp: data.event_roi_area_ratio_warp,
+          event_roi_warnings: data.event_roi_warnings,
+          virtual_scale: data.virtual_scale,
+          vd_applied: data.vd_applied,
           total_count: data.total_count,
           last_label: data.last_label,
         });
@@ -342,6 +525,7 @@ export default function CheckoutPage() {
             skipReason: data.skip_reason ?? "unknown",
             lastResultAgeMs: data.last_result_age_ms ?? null,
             topkCandidates: data.topk_candidates ?? [],
+            savedWarpPoints: data.warp_points ?? [],
           };
           const now = performance.now();
           const elapsed = now - debugThrottleLastMsRef.current;
@@ -462,11 +646,18 @@ export default function CheckoutPage() {
       const renderFrame = () => {
         renderAnimRef.current = requestAnimationFrame(renderFrame);
 
-        // Draw video to display canvas
-        displayCtx.drawImage(video, 0, 0, displayCanvas.width, displayCanvas.height);
-
         // Read latest state from store (not from closure)
         const state = useSessionStore.getState();
+        const activeVirtualScale = clampVirtualScale(Number(state.virtualScale ?? virtualScale ?? 1.0));
+        const activeVdApplied = Boolean(state.vdApplied ?? vdApplied);
+        // Draw camera feed with the same virtual-distance transform as backend.
+        drawVideoWithVirtualDistance(
+          displayCtx,
+          video,
+          displayCanvas.width,
+          displayCanvas.height,
+          activeVdApplied ? activeVirtualScale : 1.0,
+        );
         const boxes = state.detectionBoxes;
         const roi = state.roiPolygon;
         const label = state.lastLabel;
@@ -525,23 +716,13 @@ export default function CheckoutPage() {
           displayCtx.stroke();
         }
 
-        // Draw calibration points while setup mode is active
-        if (setupModeRef.current) {
+        // Draw calibration points/lines always when points exist (for ROI debugging).
+        {
           const pts = calibrationPointsRef.current;
           if (pts.length > 0) {
             displayCtx.strokeStyle = "rgb(250, 204, 21)";
             displayCtx.fillStyle = "rgb(250, 204, 21)";
             displayCtx.lineWidth = 2;
-            displayCtx.beginPath();
-            pts.forEach((point, i) => {
-              const x = point[0] * displayCanvas.width;
-              const y = point[1] * displayCanvas.height;
-              if (i === 0) displayCtx.moveTo(x, y);
-              else displayCtx.lineTo(x, y);
-              displayCtx.beginPath();
-              displayCtx.arc(x, y, 6, 0, Math.PI * 2);
-              displayCtx.fill();
-            });
             if (pts.length >= 2) {
               displayCtx.beginPath();
               pts.forEach((point, i) => {
@@ -550,8 +731,16 @@ export default function CheckoutPage() {
                 if (i === 0) displayCtx.moveTo(x, y);
                 else displayCtx.lineTo(x, y);
               });
+              if (pts.length >= 4) displayCtx.closePath();
               displayCtx.stroke();
             }
+            pts.forEach((point) => {
+              const x = point[0] * displayCanvas.width;
+              const y = point[1] * displayCanvas.height;
+              displayCtx.beginPath();
+              displayCtx.arc(x, y, 6, 0, Math.PI * 2);
+              displayCtx.fill();
+            });
           }
         }
 
@@ -860,6 +1049,7 @@ export default function CheckoutPage() {
               onClick={() => {
                 setSetupMode(true);
                 setCalibrationPoints([]);
+                setLastCalibClickDebug(null);
               }}
               className="px-3 py-1.5 rounded-lg bg-yellow-500 hover:bg-yellow-400 text-black font-semibold"
             >
@@ -881,14 +1071,37 @@ export default function CheckoutPage() {
             </button>
             <button
               onClick={toggleWarp}
-              disabled={!sessionId}
-              className={`px-3 py-1.5 rounded-lg font-semibold disabled:opacity-50 disabled:cursor-not-allowed ${
+              className={`px-3 py-1.5 rounded-lg font-semibold ${
                 warpEnabled ? "bg-emerald-500 hover:bg-emerald-400" : "bg-gray-600 hover:bg-gray-500"
               }`}
             >
-              Warp {warpEnabled ? "ON" : "OFF"}
+              Warp {warpEnabled ? "끄기" : "켜기"}
             </button>
+            <span className="text-white/90">
+              Warp 상태: req={warpEnabled ? "ON" : "OFF"} / applied={warpApplied ? "ON" : "OFF"}
+            </span>
             <span className="text-white/90">Points: {calibrationPoints.length}/4 (Saved: {warpPoints?.length ?? 0})</span>
+            <span className="text-white/80">Current: {calibrationPoints.length === 0 ? "[]" : JSON.stringify(calibrationPoints)}</span>
+            <span className="text-white/90">
+              Event ROI: {eventRoiMode}/{eventRoiSource} ({eventRoiReady ? "ready" : "fallback"})
+            </span>
+            <span className="text-white/80">
+              VD: scale={Number(virtualScale).toFixed(2)} applied={String(vdApplied)}
+            </span>
+            <span className={`text-white/90 ${eventRoiTooLarge ? "text-red-300 font-semibold" : ""}`}>
+              ROI bounds(orig): {eventRoiBoundsOriginal ? `(${eventRoiBoundsOriginal.join(",")})` : "-"} | area(orig): {eventRoiAreaRatioOriginal.toFixed(3)}
+            </span>
+            <span className="text-white/80">
+              ROI bounds(warp): {eventRoiBoundsWarp ? `(${eventRoiBoundsWarp.join(",")})` : "-"} | area(warp): {eventRoiAreaRatioWarp.toFixed(3)}
+            </span>
+            {eventRoiWarnings.length > 0 && (
+              <span className="text-red-300 font-semibold">ROI warn: {eventRoiWarnings.join(",")}</span>
+            )}
+            {lastCalibClickDebug && (
+              <span className="text-yellow-200">
+                click raw=({Math.round(lastCalibClickDebug.rawClientX)},{Math.round(lastCalibClickDebug.rawClientY)}) norm=({lastCalibClickDebug.normalizedX.toFixed(3)},{lastCalibClickDebug.normalizedY.toFixed(3)})
+              </span>
+            )}
           </div>
 
           {isDebugMode && (
@@ -906,6 +1119,7 @@ export default function CheckoutPage() {
                   <div className="mb-1">did_search: {String(debugView.didSearch)}</div>
                   <div className="mb-1">skip_reason: {debugView.skipReason}</div>
                   <div className="mb-2">last_result_age_ms: {debugView.lastResultAgeMs ?? "-"}</div>
+                  <div className="mb-2">saved_warp_points: {debugView.savedWarpPoints.length === 0 ? "[]" : JSON.stringify(debugView.savedWarpPoints)}</div>
                   <div className="mb-2">
                     {(() => {
                       const top1 = debugView.topkCandidates[0];
