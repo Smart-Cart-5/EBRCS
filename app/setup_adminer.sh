@@ -218,4 +218,6 @@ main() {
     log "Setup log: $SETUP_LOG"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -29,18 +29,24 @@ function buildUrl(path: string): string {
 }
 
 async function parseError(res: Response): Promise<string> {
+  let raw = "";
   try {
-    const data = await res.json();
+    raw = await res.text();
+  } catch {
+    return `HTTP ${res.status}`;
+  }
+
+  if (!raw) {
+    return `HTTP ${res.status}`;
+  }
+
+  try {
+    const data = JSON.parse(raw);
     if (data?.detail) return String(data.detail);
     if (data?.message) return String(data.message);
     return JSON.stringify(data);
   } catch {
-    try {
-      const text = await res.text();
-      return text || `HTTP ${res.status}`;
-    } catch {
-      return `HTTP ${res.status}`;
-    }
+    return raw;
   }
 }
 

@@ -10,6 +10,7 @@ import MyPage from "./pages/MyPage";
 import AdminPurchasesPage from "./pages/AdminPurchasesPage";
 import ChatbotWidget from "./components/ChatbotWidget";
 import { useAuthStore } from "./stores/authStore";
+import { shouldRedirectForAdminRoute } from "./routing/guards";
 
 // User menu items
 const USER_NAV_ITEMS = [
@@ -30,7 +31,6 @@ export default function App() {
   const { pathname } = useLocation();
   const isCheckoutPage = pathname === "/checkout";
   const isAuthPage = pathname === "/login" || pathname === "/signup";
-  const isAdminRoute = pathname.startsWith("/admin");
 
   const { user, clearAuth, isAuthenticated, isAdmin } = useAuthStore();
   const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false);
@@ -69,7 +69,7 @@ export default function App() {
   }
 
   // Block direct access to admin routes for non-admin users.
-  if (isAdminRoute && !isAdmin()) {
+  if (shouldRedirectForAdminRoute(pathname, isAdmin())) {
     return <Navigate to="/" replace />;
   }
 
