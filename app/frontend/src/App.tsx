@@ -8,12 +8,13 @@ import LoginPage from "./pages/LoginPage";
 import SignupPage from "./pages/SignupPage";
 import MyPage from "./pages/MyPage";
 import AdminPurchasesPage from "./pages/AdminPurchasesPage";
+import ChatbotWidget from "./components/ChatbotWidget";
 import { useAuthStore } from "./stores/authStore";
 
 // User menu items
 const USER_NAV_ITEMS = [
   { path: "/", label: "홈", icon: "🏠" },
-  { path: "/checkout", label: "체크아웃", icon: "🛒" },
+  { path: "/checkout", label: "장보GO", icon: "jangbogo" },
   { path: "/validate", label: "영수증 확인", icon: "📋" },
   { path: "/mypage", label: "마이페이지", icon: "👤" },
 ];
@@ -76,15 +77,17 @@ export default function App() {
         {/* Logo */}
         <div className="p-6 border-b border-[var(--color-border)]">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-[var(--color-primary)] flex items-center justify-center text-white text-xl">
-              🏪
-            </div>
+            <img
+              src="/jangbogo.svg"
+              alt="장보GO 로고"
+              className="w-10 h-10 rounded-xl object-cover"
+            />
             <div>
               <h1 className="text-lg font-bold text-[var(--color-text)]">
-                스마트 체크아웃
+                장보GO
               </h1>
               <p className="text-xs text-[var(--color-text-secondary)]">
-                Smart Checkout
+                JangboGO
               </p>
             </div>
           </div>
@@ -104,7 +107,15 @@ export default function App() {
                     : "text-[var(--color-text-secondary)] hover:bg-white hover:text-[var(--color-text)]"
                 }`}
               >
-                <span className="text-lg">{item.icon}</span>
+                {item.icon === "jangbogo" ? (
+                  <img
+                    src="/jangbogo.svg"
+                    alt="장보GO 아이콘"
+                    className="w-5 h-5 rounded object-cover"
+                  />
+                ) : (
+                  <span className="text-lg">{item.icon}</span>
+                )}
                 <span>{item.label}</span>
               </Link>
             );
@@ -143,11 +154,13 @@ export default function App() {
         <header className="lg:hidden bg-white border-b border-[var(--color-border)] px-4 py-3 relative">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-lg bg-[var(--color-primary)] flex items-center justify-center text-white text-lg">
-                🏪
-              </div>
+              <img
+                src="/jangbogo.svg"
+                alt="장보GO 로고"
+                className="w-8 h-8 rounded-lg object-cover"
+              />
               <h1 className="text-base font-bold text-[var(--color-text)]">
-                스마트 체크아웃
+                장보GO
               </h1>
             </div>
 
@@ -218,13 +231,23 @@ export default function App() {
                     : "text-[var(--color-text-secondary)]"
                 }`}
               >
-                <span className="text-xl">{item.icon}</span>
+                {item.icon === "jangbogo" ? (
+                  <img
+                    src="/jangbogo.svg"
+                    alt="장보GO 아이콘"
+                    className="w-6 h-6 rounded object-cover"
+                  />
+                ) : (
+                  <span className="text-xl">{item.icon}</span>
+                )}
                 <span className="text-xs font-medium">{item.label}</span>
               </Link>
             );
           })}
         </div>
       </nav>
+
+      <ChatbotWidget />
     </div>
   );
 }

@@ -134,7 +134,7 @@ def load_db(
         raise FileNotFoundError("labels.npy not found.")
 
     embeddings = np.load(embeddings_path).astype(np.float32)
-    labels = np.load(labels_path)
+    labels = np.load(labels_path, allow_pickle=True)
 
     expected_dim = dino_dim + clip_dim
     if embeddings.shape[1] != expected_dim:

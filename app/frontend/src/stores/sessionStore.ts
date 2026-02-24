@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import * as api from "../api/client";
+import { createSession, type BillingState } from "../api/checkout";
 
 export interface CountEvent {
   product: string;
@@ -29,7 +29,7 @@ interface SessionStore {
   createSession: () => Promise<string>;
   updateFromWsMessage: (data: WsMessage) => void;
   setBilling: (items: Record<string, number>) => void;
-  setBillingState: (state: api.BillingState) => void;
+  setBillingState: (state: BillingState) => void;
   resetSession: () => void;
 }
 
@@ -65,7 +65,7 @@ export const useSessionStore = create<SessionStore>((set) => ({
   currentTrackId: null,
 
   createSession: async () => {
-    const { session_id } = await api.createSession();
+    const { session_id } = await createSession();
     set({
       sessionId: session_id,
       billingItems: {},
@@ -142,7 +142,7 @@ export const useSessionStore = create<SessionStore>((set) => ({
     });
   },
 
-  setBillingState: (state: api.BillingState) => {
+  setBillingState: (state: BillingState) => {
     set({
       billingItems: state.billing_items,
       itemScores: state.item_scores,

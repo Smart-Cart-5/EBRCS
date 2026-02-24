@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { useAuthStore } from "../stores/authStore";
-import { getAllPurchases } from "../api/client";
+import { getAllPurchases } from "../api/purchases";
 
 export default function AdminPurchasesPage() {
   const { token } = useAuthStore();

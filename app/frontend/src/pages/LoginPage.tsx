@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { useNavigate, Link } from "react-router-dom";
-import { login } from "../api/client";
+import { login } from "../api/auth";
 import { useAuthStore } from "../stores/authStore";
 
 export default function LoginPage() {
@@ -29,14 +29,16 @@ export default function LoginPage() {
       <div className="max-w-md w-full space-y-8 p-8 bg-white rounded-2xl shadow-xl border border-[var(--color-border)]">
         {/* Logo */}
         <div className="flex flex-col items-center">
-          <div className="w-16 h-16 rounded-2xl bg-[var(--color-primary)] flex items-center justify-center text-white text-3xl mb-4">
-            🏪
-          </div>
+          <img
+            src="/jangbogo.svg"
+            alt="장보GO 로고"
+            className="w-16 h-16 rounded-2xl object-cover mb-4"
+          />
           <h2 className="text-center text-3xl font-bold text-[var(--color-text)]">
-            로그인
+            장보GO!
           </h2>
           <p className="mt-2 text-center text-sm text-[var(--color-text-secondary)]">
-            EBRCS 스마트 체크아웃 시스템
+            로그인
           </p>
         </div>
 

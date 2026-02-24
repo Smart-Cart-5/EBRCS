@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import toast, { Toaster } from "react-hot-toast";
 import { useSessionStore, type WsMessage } from "../stores/sessionStore";
-import { wsCheckoutUrl, uploadVideo, videoStatusUrl, setROI, getHealth, getBilling } from "../api/client";
+import {
+  wsCheckoutUrl,
+  uploadVideo,
+  videoStatusUrl,
+  setROI,
+  getHealth,
+  getBilling,
+} from "../api/checkout";
 import BillingPanel from "../components/BillingPanel";
 import StatusMetrics from "../components/StatusMetrics";
 import ProductDrawer from "../components/ProductDrawer";
