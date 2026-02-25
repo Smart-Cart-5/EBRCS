@@ -20,6 +20,15 @@ export interface PurchaseResponse {
 export interface PopularProduct {
   name: string;
   total_count: number;
+  picture?: string | null;
+}
+
+export interface DiscountProduct {
+  item_no: string;
+  product_name: string;
+  discount_rate: number;
+  discount_amount: number;
+  picture?: string | null;
 }
 
 export interface DashboardStats {
@@ -73,6 +82,34 @@ export async function getDashboardStats(token: string, periodDays?: number): Pro
   };
 }
 
-export function getPopularProducts(token: string, limit = 5): Promise<PopularProduct[]> {
-  return request<PopularProduct[]>(`/purchases/popular?limit=${limit}`, { token });
+export async function getPopularProducts(token: string, limit = 5): Promise<PopularProduct[]> {
+  const rows = await request<PopularProduct[]>(`/purchases/popular?limit=${limit}`, { token });
+  return (rows ?? []).map((row) => ({
+    ...row,
+    picture: row.picture ?? null,
+  }));
+}
+
+export async function getDiscountCategories(token: string): Promise<string[]> {
+  const rows = await request<string[]>("/purchases/discount-categories", { token });
+  return (rows ?? [])
+    .map((category) => String(category ?? "").trim())
+    .filter((category) => category.length > 0);
+}
+
+export async function getDiscountProducts(
+  token: string,
+  categoryL: string,
+  limit = 5
+): Promise<DiscountProduct[]> {
+  const query = `?category_l=${encodeURIComponent(categoryL)}&limit=${limit}`;
+  const rows = await request<DiscountProduct[]>(`/purchases/discounts${query}`, { token });
+  return (rows ?? []).map((row) => ({
+    ...row,
+    item_no: String(row.item_no ?? ""),
+    product_name: String(row.product_name ?? ""),
+    discount_rate: Number(row.discount_rate ?? 0),
+    discount_amount: Number(row.discount_amount ?? 0),
+    picture: row.picture ?? null,
+  }));
 }
