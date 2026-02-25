@@ -7,6 +7,7 @@ from collections.abc import MutableMapping
 from typing import Any
 import cv2
 import numpy as np
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -19,33 +20,25 @@ except ImportError:
     ObjectTracker = None
 
 # ==========================================================
-# 🚀 [NEW] EasyOCR 엔진 초기화 (PaddleOCR 완전 대체)
+# EasyOCR 엔진 초기화 (동기식 - GPU 가속)
 # ==========================================================
 try:
     import easyocr
     ocr_engine = easyocr.Reader(['ko', 'en'], gpu=True)
     logger.info("✅ [System] EasyOCR 엔진 로드 성공 (GPU 가속 모드)")
-    
-    # 🚨 [추가된 코드] 모델 워밍업: 첫 추론의 엄청난 딜레이를 방지하기 위해 가짜 이미지를 한 번 태웁니다.
-    #logger.info("⚙️ EasyOCR 워밍업(준비 운동) 시작... 잠시만 기다려주세요.")
-    #dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
-    #_ = ocr_engine.readtext(dummy_img)
-    #logger.info("✅ EasyOCR 워밍업 완료! 이제 실시간 추론 준비가 끝났습니다.")
-    
-#except ImportError:
-    #ocr_engine = None
-    #logger.error("❌ [System] EasyOCR 모듈이 없습니다. 터미널에서 'pip install easyocr'을 실행하세요.")
 except Exception as e:
     ocr_engine = None
     logger.error(f"❌ [System] EasyOCR 초기화 중 에러 발생: {e}")
+
+# ==========================================================
+# 누락 방지: 기본 핵심 함수들
 # ==========================================================
 def _calculate_movement_direction(
     centroid_history: list[tuple[float, float]],
-    add_direction: str = "down",  # "down" = y 증가(위→아래 진입) = 담기
+    add_direction: str = "down",  
     min_movement: float = 0.05,
     min_history_points: int = 6,
 ) -> str:
-    """Y축 기준으로만 방향을 판정하여 'add', 'remove', 'unknown'을 반환."""
     min_history_points = max(2, int(min_history_points))
     if len(centroid_history) < min_history_points:
         return "unknown"
@@ -54,14 +47,14 @@ def _calculate_movement_direction(
     early_y = sum(p[1] for p in centroid_history[:n]) / n
     late_y = sum(p[1] for p in centroid_history[-n:]) / n
 
-    dy = late_y - early_y  # 양수 = 아래로 이동, 음수 = 위로 이동
+    dy = late_y - early_y  
 
     if abs(dy) < min_movement:
         return "unknown"
 
     if add_direction == "down":
         return "add" if dy > 0 else "remove"
-    else:  # "up"
+    else:  
         return "add" if dy < 0 else "remove"
 
 
@@ -72,7 +65,6 @@ def _vertical_sign_consistency_ratio(
     add_direction: str,
     min_step_epsilon: float = 0.003,
 ) -> float:
-    """연속 프레임 y 증감 부호가 기대 방향과 얼마나 일관적인지 [0,1]로 반환."""
     if len(centroid_history) < 2:
         return 0.0
 
@@ -105,7 +97,6 @@ def _release_counted_track(
     product_name: str,
     track_id: int | None,
 ) -> None:
-    """REMOVE 성공 시 Track 잠금을 해제해서 같은 물체의 재투입(ADD)을 허용."""
     if track_id is not None:
         counted_tracks.pop(track_id, None)
         return
@@ -204,65 +195,128 @@ def _update_track_lifecycle(
 
 
 # ==========================================================
-# 🔍 [NEW] EasyOCR 정밀 분류기
+# 🔍 동기식 OCR 정밀 분류기 (Fuzzy 제거, Track ID 분리 + CLAHE 적용)
 # ==========================================================
-def _refine_label_with_ocr(crop_img: np.ndarray, base_label: str, track_state: dict[str, Any] | None = None) -> str:
-    """
-    최적화된 OCR 보정 로직:
-    1. 이미 상세 라벨이 확정된 트랙은 연산을 스킵 (속도 향상)
-    2. 이미지 크기에 따른 선택적 확대 (메모리 보호)
-    3. 메모리 강제 해제 유도
-    """
-    # [1] 트랙 기반 스킵 로직: 이미 상세 라벨을 찾았다면 즉시 반환
-    if track_state and track_state.get("ocr_refined_label"):
-        return track_state["ocr_refined_label"]
+def _refine_label_with_ocr(crop_img: np.ndarray, base_label: str, state: dict[str, Any], track_id: int | None = None) -> str:
+    print(f"\n▶️ [OCR 진입] FAISS 라벨: {base_label}, Track ID: {track_id}")
 
-    target_keywords = ["컵밥", "컵반", "국밥", "찌개", "라면"]
-    if ocr_engine is None or not any(k in base_label for k in target_keywords):
+    if "ocr_track_cache" not in state:
+        state["ocr_track_cache"] = {}
+
+    if track_id is not None and track_id in state["ocr_track_cache"]:
+        return state["ocr_track_cache"][track_id]
+
+    target_keywords = ["컵밥", "컵반", "햇반", "햇밥", "혼밥"]
+    if not any(k in base_label for k in target_keywords):
+        return base_label
+
+    if ocr_engine is None:
         return base_label
 
     try:
         h, w = crop_img.shape[:2]
-        
-        # [2] 동적 업스케일링: 작은 이미지(세로 200px 미만)일 때만 확대하여 메모리 OOM 방지
         if h < 200 or w < 200:
-            # INTER_CUBIC 대신 INTER_LINEAR를 사용하여 연산 속도 20% 향상
             analysis_img = cv2.resize(crop_img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
+            h, w = analysis_img.shape[:2]
         else:
             analysis_img = crop_img
             
-        safe_img = np.ascontiguousarray(analysis_img)
+        gray_img = cv2.cvtColor(analysis_img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced_img = clahe.apply(gray_img)
 
-        # [3] OCR 추론
-        results = ocr_engine.readtext(safe_img, detail=1)
-        
-        # 사용 후 메모리 점유를 줄이기 위해 확대 이미지 변수 제거 유도
-        del analysis_img 
+        results = ocr_engine.readtext(enhanced_img, detail=1)
+        del analysis_img, gray_img, enhanced_img 
 
         if not results:
             return base_label
 
-        full_text = "".join([res[1] for res in results]).replace(" ", "")
+        total_area = h * w
+        min_area_threshold = total_area * 0.003
         
-        # [4] 상세 제품명 매칭 로직
-        refined = base_label
-        if any(k in full_text for k in ["황태", "황", "태국"]):
-            refined = "황태국밥 컵반"
-        elif any(k in full_text for k in ["순두", "순부"]):
-            refined = "순두부찌개 컵반"
-        elif any(k in full_text for k in ["닭곰", "곰탕"]):
-            refined = "닭곰탕 컵반"
+        filtered_results = []
+        for (bbox, text, prob) in results:
+            bbox_np = np.array(bbox, dtype=np.int32)
+            if cv2.contourArea(bbox_np) >= min_area_threshold:
+                filtered_results.append((bbox, text, prob))
 
-        # [5] 결과 캐싱: 성공적으로 보정되었다면 트랙 상태에 저장하여 다음 프레임부터 OCR 안 함
-        if refined != base_label and track_state is not None:
-            track_state["ocr_refined_label"] = refined
-            logger.info(f"🎯 [Success] 상세 라벨 확정: {refined} (Track Lock)")
+        if not filtered_results:
+             return base_label
+
+        full_text = ""
+        all_detected_texts = []
+        for (bbox, text, prob) in filtered_results:
+            clean_text = text.replace(" ", "")
+            full_text += clean_text
+            all_detected_texts.append(f"'{clean_text}'({prob:.2f})")
+            
+        print(f"  -> 🔎 [인식 텍스트]: {', '.join(all_detected_texts)}")
+        
+        # 💡 Fuzzy 매칭이 빠졌으므로, 딕셔너리에 오타(항태, 홤태 등)를 다시 추가했습니다.
+        CUPBOP_DB_MAPPING = {
+            "10240_CJ햇반컵반설렁탕밥253g": ["설렁탕"],
+            "15446_CJ햇반컵반스팸마요덮밥219G": ["스팸마요", "스팸", "스햄"],
+            "15447_CJ햇반컵반강된장보리비빔밥280G": ["강된장", "보리비빔", "강된"],
+            "15448_오뚜기컵밥수원식갈비탕밥311G": ["수원식", "갈비탕"],
+            "15449_오뚜기컵밥햄버그덮밥310G": ["햄버그", "함박"],
+            "15450_오뚜기컵밥부산식돼지국밥316G": ["부산식", "돼지국밥"],
+            "15834_한일식품혼면혼밥본고장바지락칼국수_밥276.5G": ["바지락", "바지락칼국수"],
+            "15835_한일식품혼면혼밥본고장김치칼국수_밥274.5G": ["김치칼국수", "김치칼"],
+            "20228_CJ)햇반컵반중화마파두부덮밥270G": ["마파두부", "중화"],
+            "20235_CJ햇반컵반낙지콩나물비빔밥216g": ["낙지", "낙지콩나물"],
+            "25417_CJ햇반컵반미역국밥167G": ["미역", "미역국"],
+            "25418_CJ햇반컵반사골곰탕국밥166G": ["사골", "사골곰탕"],
+            "25419_CJ햇반컵반콩나물해장국밥270G": ["콩나물해장", "해장국"],
+            "25420_CJ햇반컵반황태국밥170G": ["황태", "항태", "홤태", "태국밥", "황태국"],
+            "25421_CJ햇반컵반직화불고기덮밥257G": ["직화불고기", "불고기덮밥", "불고"],
+            "25422_CJ햇반컵반치킨커리덮밥278G": ["치킨커리", "치킨카레"],
+            "25423_CJ햇반컵반고추장나물현미비빔밥229G": ["고추장나물", "현미비빔", "고추장"],
+            "25424_CJ햇반컵반볶은김치덮밥247G": ["볶은김치", "볶은"],
+            "25426_오뚜기컵밥춘천닭갈비덮밥310G": ["닭갈비", "춘천"],
+            "25427_오뚜기컵밥허니갈릭치밥310G": ["허니갈릭", "치밥"],
+            "25428_오뚜기컵밥소시지카레덮밥315G": ["소시지카레", "소세지카레"],
+            "25429_오뚜기컵밥참치마요덮밥247G": ["참치", "참치마요", "치마요"],
+            "25430_오뚜기컵밥소시지야채덮밥280G": ["소시지야채", "소야"],
+            "30202_CJ햇반컵반버섯곤드레비빔밥189g": ["곤드레", "버섯곤드레"],
+            "40221_CJ햇반컵반닭곰탕밥261g": ["닭곰", "곰탕", "닭곰탕"],
+            "50173_CJ햇반컵반육개장국밥": ["육개장", "육개"],
+            "80172_CJ햇반컵반순두부찌개국밥173G": ["순두", "순부", "두부찌"],
+            "80177_CJ햇반컵반김치날치알밥188g": ["날치알", "김치날치"],
+            "80178_CJ햇반컵반버터장조림비빔밥216g": ["버터", "장조림", "버터장조림"],
+            "90205_CJ햇반컵반직화볶음짜장덮밥280G": ["짜장", "볶음짜장", "직화볶음"]
+        }
+
+        refined = base_label
+        
+        is_ottogi = any(k in full_text for k in ["오뚜기", "오뚜", "뚜기"])
+        is_cj = any(k in full_text for k in ["CJ", "씨제이", "햇반", "컵반"])
+
+        if "불닭" in full_text or "불닭마요" in full_text:
+            if is_ottogi:
+                refined = "25425_오뚜기컵밥불닭마요덮밥277g"
+            else:
+                refined = "46090_씨제이)햇반컵반불닭마요덮밥"
+        elif "제육" in full_text:
+            if "철판" in full_text or is_cj:
+                refined = "15445_CJ햇반컵반철판제육덮밥256G"
+            else:
+                refined = "65046_오뚜기컵밥제육덮밥"
+        else:
+            for db_name, keywords in CUPBOP_DB_MAPPING.items():
+                if any(keyword in full_text for keyword in keywords):
+                    refined = db_name
+                    break
+
+        if refined != base_label and track_id is not None:
+            state["ocr_track_cache"][track_id] = refined
+            print(f"  -> 🎯 [보정 완료] Track {track_id}를 '{refined}'로 캐싱합니다.")
 
         return refined
             
     except Exception as e:
-        logger.error(f"OCR 정밀 보정 중 에러: {e}")
+        print(f"  -> ❌ [크리티컬 에러] OCR 구동 중 문제 발생: {e}")
         return base_label
+
 
 def process_checkout_frame(
     *,
@@ -494,9 +548,9 @@ def process_checkout_frame(
                             return display_frame
                             
                     # =========================================================
-                    # 💡 EasyOCR을 통한 최종 정밀 보정
+                    # 💡 EasyOCR을 통한 최종 정밀 보정 (🚨 치명적 파라미터 버그 완벽 수정!)
                     # =========================================================
-                    refined_name = _refine_label_with_ocr(crop, name, track_state) # <-- 수정 (track_state 전달)
+                    refined_name = _refine_label_with_ocr(crop, name, state, track_id)
 
                     if name != refined_name:
                         logger.info(f"💡 OCR 보정 완료: {name} -> {refined_name}")
