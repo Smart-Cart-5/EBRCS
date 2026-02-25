@@ -39,6 +39,14 @@ class CheckoutSession:
         "last_status": "대기",
         "roi_occupied": False,
         "roi_empty_frames": 0,
+        # OCR pending state (컵밥 정밀 인식)
+        "ocr_state": "normal",          # "normal" | "ocr_pending"
+        "ocr_pending_action": None,     # "add" | "remove"
+        "ocr_pending_track_id": None,
+        "ocr_pending_base_label": "",
+        "ocr_pending_since_frame": -1,
+        "ocr_pending_since_time": 0.0,  # wall-clock 기준 타임아웃용 (FPS 독립)
+        "ocr_track_cache": {},          # track_id → OCR 결과
     })
 
     # OpenCV background subtractor -- per-session, not serializable
@@ -111,6 +119,13 @@ class CheckoutSession:
         self.state["last_status"] = "대기"
         self.state["roi_occupied"] = False
         self.state["roi_empty_frames"] = 0
+        self.state["ocr_state"] = "normal"
+        self.state["ocr_pending_action"] = None
+        self.state["ocr_pending_track_id"] = None
+        self.state["ocr_pending_base_label"] = ""
+        self.state["ocr_pending_since_frame"] = -1
+        self.state["ocr_pending_since_time"] = 0.0
+        self.state["ocr_track_cache"] = {}
         self.frame_count = 0
         from checkout_core.frame_processor import create_bg_subtractor
         self.bg_subtractor = create_bg_subtractor()

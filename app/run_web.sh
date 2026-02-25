@@ -27,6 +27,8 @@ fi
 
 # Fix OpenMP duplicate library issue on macOS
 export KMP_DUPLICATE_LIB_OK=TRUE
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 
 # Ensure DB connection/schema is ready before starting web servers.
 echo "Checking DB connectivity/schema..."

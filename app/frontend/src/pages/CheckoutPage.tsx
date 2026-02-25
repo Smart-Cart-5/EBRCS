@@ -89,6 +89,7 @@ export default function CheckoutPage() {
     lastStatus,
     countEvent,
     currentTrackId,
+    ocrPending,
   } = useSessionStore();
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -882,6 +883,26 @@ export default function CheckoutPage() {
                 >
                   정지
                 </button>
+
+                {/* OCR Pending Modal — 컵밥 정밀 인식 대기 */}
+                {ocrPending && (
+                  <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/50">
+                    <div className="bg-white rounded-2xl p-6 mx-4 w-full max-w-sm shadow-2xl text-center space-y-4">
+                      <div className="text-4xl">🔍</div>
+                      <h3 className="font-bold text-gray-900 text-base">
+                        상품 인식이 잘 안됐어요
+                      </h3>
+                      <p className="text-sm text-gray-500 leading-relaxed">
+                        카메라 화면에 상품 앞면을<br />
+                        가까이 비춰주세요
+                      </p>
+                      <div className="flex items-center justify-center gap-2 text-orange-500 text-sm font-medium">
+                        <span className="w-2 h-2 rounded-full bg-orange-500 animate-ping" />
+                        OCR 인식 중...
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {/* 3-Step Guide Modal */}
                 {guideOpen && (

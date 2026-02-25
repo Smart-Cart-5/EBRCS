@@ -25,6 +25,7 @@ interface SessionStore {
   roiPolygon: number[][] | null;
   countEvent: CountEvent | null;
   currentTrackId: string | null;
+  ocrPending: boolean;
 
   createSession: () => Promise<string>;
   updateFromWsMessage: (data: WsMessage) => void;
@@ -44,6 +45,7 @@ export interface WsMessage {
   roi_polygon?: number[][] | null;
   count_event?: CountEvent | null;
   current_track_id?: string | null;
+  ocr_pending?: boolean;
 }
 
 export const useSessionStore = create<SessionStore>((set) => ({
@@ -63,6 +65,7 @@ export const useSessionStore = create<SessionStore>((set) => ({
   roiPolygon: null,
   countEvent: null,
   currentTrackId: null,
+  ocrPending: false,
 
   createSession: async () => {
     const { session_id } = await createSession();
@@ -112,6 +115,7 @@ export const useSessionStore = create<SessionStore>((set) => ({
         roiPolygon: data.roi_polygon ?? null,
         countEvent: data.count_event ?? null,
         currentTrackId: data.current_track_id ?? null,
+        ocrPending: data.ocr_pending ?? false,
       };
     });
   },

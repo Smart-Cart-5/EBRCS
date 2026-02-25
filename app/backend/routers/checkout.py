@@ -123,6 +123,7 @@ def _process_frame_sync(
         "roi_polygon": roi_polygon_normalized,
         "count_event": session.state.get("count_event"),
         "current_track_id": session.state.get("current_track_id"),
+        "ocr_pending": session.state.get("ocr_state") == "ocr_pending",
     }
 
     return display_frame, state_snapshot

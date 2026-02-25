@@ -53,7 +53,7 @@ SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
 MIN_AREA = 2500
 DETECT_EVERY_N_FRAMES = 3  # Smooth display: inference every 3 frames, display all frames
 MATCH_THRESHOLD = 0.62
-COUNT_COOLDOWN_SECONDS = 3.0  # 중복 방지: 동일 상품 3초 내 재카운트 방지
+COUNT_COOLDOWN_SECONDS = 1.5  # 중복 방지: 동일 상품 1.5초 내 재카운트 방지 (track 기반 중복방지가 주요 방어선)
 ROI_CLEAR_FRAMES = 36  # 3초 @ 12FPS (기존 8=0.64초는 너무 짧아 오검출 발생)
 STREAM_TARGET_WIDTH = 960  # Restored for better quality
 STREAM_SEND_IMAGES = os.getenv("STREAM_SEND_IMAGES", "false").lower() == "true"  # Send images in WebSocket responses (default: false, JSON only)
@@ -62,7 +62,7 @@ BG_WARMUP_FRAMES = int(os.getenv("BG_WARMUP_FRAMES", "24"))  # 초반 KNN 잔상
 # DeepSORT Object Tracking (Phase 3)
 # 역할: 기존 인식 로직은 그대로, DeepSORT는 Track ID 기반 중복 방지만 담당
 USE_DEEPSORT = os.getenv("USE_DEEPSORT", "true").lower() == "true"
-DEEPSORT_MAX_AGE = 30       # 물체 소실 후 Track 유지 프레임 수 (30 ≈ 0.5초 @ 60FPS)
+DEEPSORT_MAX_AGE = 12       # 물체 소실 후 Track 유지 프레임 수 (12 ≈ 1.0초 @ 12FPS, 60FPS 기준값 30에서 스케일 조정)
 DEEPSORT_N_INIT = 1         # 즉시 Track 확정 (기존 인식 속도 유지)
 DEEPSORT_MAX_IOU_DISTANCE = 0.9  # IOU 매칭 임계값 (높을수록 이동 중 Track 유지 유리)
 DEEPSORT_EMBEDDER = None    # None = IOU만 사용 (mobilenet 연산 제거 → 속도 유지)
@@ -80,7 +80,7 @@ DIRECTION_SIGN_CONSISTENCY = float(os.getenv("DIRECTION_SIGN_CONSISTENCY", "0.7"
 DIRECTION_SIGN_EPSILON = float(os.getenv("DIRECTION_SIGN_EPSILON", "0.003"))
 FAST_DECISION_MIN_MOVEMENT = float(os.getenv("FAST_DECISION_MIN_MOVEMENT", "0.12"))
 FAST_DECISION_MIN_HISTORY_POINTS = int(os.getenv("FAST_DECISION_MIN_HISTORY_POINTS", "4"))
-FAST_DECISION_SIGN_CONSISTENCY = float(os.getenv("FAST_DECISION_SIGN_CONSISTENCY", "0.85"))
+FAST_DECISION_SIGN_CONSISTENCY = float(os.getenv("FAST_DECISION_SIGN_CONSISTENCY", "0.70"))
 INFER_BURST_TRACK_AGE = int(os.getenv("INFER_BURST_TRACK_AGE", "6"))
 TRACK_MIN_AGE_FRAMES = int(os.getenv("TRACK_MIN_AGE_FRAMES", "6"))
 TRACK_LABEL_WINDOW = int(os.getenv("TRACK_LABEL_WINDOW", "6"))
@@ -90,7 +90,7 @@ SOFT_REENTRY_FRAMES = int(os.getenv("SOFT_REENTRY_FRAMES", "5"))
 OPPOSITE_ACTION_COOLDOWN_SECONDS = float(
     os.getenv("OPPOSITE_ACTION_COOLDOWN_SECONDS", "1.5")
 )
-LABEL_STALE_FRAMES = int(os.getenv("LABEL_STALE_FRAMES", "4"))
+LABEL_STALE_FRAMES = int(os.getenv("LABEL_STALE_FRAMES", "7"))  # DETECT_EVERY_N_FRAMES(3)*2+1: 추론 1회 누락 허용
 
 # 후처리: 무시할 상품 라벨 (FAISS 매칭 결과에서 제외)
 IGNORE_LABELS: set[str] = {

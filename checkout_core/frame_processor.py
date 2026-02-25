@@ -19,6 +19,155 @@ try:
 except ImportError:
     ObjectTracker = None
 
+# ── EasyOCR 엔진 (모듈 레벨 lazy 초기화) ──────────────────────────────────
+# gpu=True → CUDA(서버 T4) 또는 MPS(로컬 Mac) 자동 선택
+_ocr_engine = None
+
+
+def _get_ocr_engine():
+    global _ocr_engine
+    if _ocr_engine is None:
+        try:
+            import easyocr
+            _ocr_engine = easyocr.Reader(['ko', 'en'], gpu=True, verbose=False)
+            logger.info("EasyOCR 엔진 로드 성공")
+        except Exception as exc:
+            logger.warning("EasyOCR 초기화 실패 (OCR 비활성화): %s", exc)
+            _ocr_engine = False  # False = 초기화 시도했지만 실패
+    return _ocr_engine if _ocr_engine else None
+
+
+# ── 컵밥 계열 감지 키워드 ──────────────────────────────────────────────────
+_CUPBOP_TARGET_KEYWORDS: frozenset[str] = frozenset({
+    "컵밥", "컵반", "햇반", "햇밥", "혼밥",
+})
+
+# ── 컵밥 상품 OCR 키워드 → DB 라벨 매핑 ──────────────────────────────────
+_CUPBOP_DB_MAPPING: dict[str, list[str]] = {
+    "25420_CJ햇반컵반황태국밥170G":       ["황태", "항태", "홤태", "태국밥", "황태국"],
+    "15446_CJ햇반컵반스팸마요덮밥219G":   ["스팸마요", "스팸", "스햄"],
+    "15445_CJ햇반컵반철판제육덮밥256G":   ["철판제육", "제육"],
+    "25425_오뚜기컵밥불닭마요덮밥277g":   ["불닭마요", "불닭"],
+    "46090_씨제이)햇반컵반불닭마요덮밥":  ["불닭마요CJ", "불닭CJ"],
+    "15447_CJ햇반컵반소불고기덮밥256G":   ["소불고기", "불고기"],
+    "15443_CJ햇반컵반참치마요덮밥229G":   ["참치마요", "참치"],
+    "15444_CJ햇반컵반김치찌개덮밥256G":   ["김치찌개", "김치"],
+    "25419_CJ햇반컵반차돌된장국밥170G":   ["차돌된장", "된장"],
+    "25421_CJ햇반컵반미역국밥170G":       ["미역국", "미역"],
+    "25422_CJ햇반컵반순두부찌개국밥170G": ["순두부", "순두부찌개"],
+    "25423_CJ햇반컵반육개장국밥170G":     ["육개장"],
+    "25424_CJ햇반컵반갈비탕국밥170G":     ["갈비탕"],
+    "46089_씨제이)햇반컵반스팸마요덮밥":  ["스팸마요CJ"],
+    "46091_씨제이)햇반컵반철판제육덮밥":  ["제육CJ"],
+    "46088_씨제이)햇반컵반소불고기덮밥":  ["소불고기CJ"],
+    "46087_씨제이)햇반컵반참치마요덮밥":  ["참치CJ"],
+    "25426_오뚜기컵밥참치마요덮밥277g":   ["오뚜기참치마요", "오뚜기참치"],
+    "25427_오뚜기컵밥소불고기덮밥277g":   ["오뚜기소불고기"],
+    "25428_오뚜기컵밥김치참치덮밥277g":   ["오뚜기김치참치"],
+    "25429_오뚜기컵밥제육덮밥277g":       ["오뚜기제육"],
+    "25430_오뚜기컵밥황태해장국밥277g":   ["오뚜기황태"],
+    "25431_오뚜기컵밥순두부찌개국밥277g": ["오뚜기순두부"],
+    "25432_오뚜기컵밥육개장국밥277g":     ["오뚜기육개장"],
+    "25433_오뚜기컵밥갈비탕국밥277g":     ["오뚜기갈비탕"],
+    "25434_오뚜기컵밥김치찌개국밥277g":   ["오뚜기김치찌개"],
+    "25435_오뚜기컵밥차돌된장국밥277g":   ["오뚜기차돌"],
+    "25436_오뚜기컵밥미역국밥277g":       ["오뚜기미역"],
+    "25437_동원쎈쿡컵밥소불고기덮밥250g": ["쎈쿡소불고기", "동원소불고기"],
+    "25438_동원쎈쿡컵밥참치마요덮밥250g": ["쎈쿡참치", "동원참치마요"],
+    "25439_동원쎈쿡컵밥제육덮밥250g":     ["쎈쿡제육", "동원제육"],
+    "25440_동원쎈쿡컵밥김치찌개덮밥250g": ["쎈쿡김치", "동원김치"],
+    "25441_동원쎈쿡컵밥불닭마요덮밥250g": ["쎈쿡불닭", "동원불닭"],
+}
+
+
+def _is_cupbop_label(label: str) -> bool:
+    """FAISS 결과 라벨이 컵밥 계열인지 판단."""
+    return any(kw in label for kw in _CUPBOP_TARGET_KEYWORDS)
+
+
+def _refine_label_with_ocr(
+    crop_img: np.ndarray,
+    base_label: str,
+    state: MutableMapping[str, Any],
+    track_id: int | None = None,
+) -> str | None:
+    """컵밥 계열 상품에 대해 OCR로 라벨을 정밀 보정.
+
+    Returns:
+        str : OCR로 확인된 DB 라벨 (키워드 매칭 성공, base_label과 같을 수도 있음)
+        None: OCR 미확인 (텍스트 없음, 키워드 미매칭, 엔진 오류)
+              → 호출 측에서 "아직 못 읽음"으로 판단해 대기 또는 취소
+    """
+    if not _is_cupbop_label(base_label):
+        return base_label  # 컵밥 아닌 상품: 즉시 base_label 반환 (OCR 대상 아님)
+
+    # Track 캐시 확인 (이전에 성공한 OCR 결과 재사용)
+    cache: dict = state.setdefault("ocr_track_cache", {})
+    cache_key = str(track_id) if track_id is not None else None
+    if cache_key and cache_key in cache:
+        return cache[cache_key]
+
+    engine = _get_ocr_engine()
+    if engine is None:
+        return None  # 엔진 없음 → 호출 측에서 처리
+
+    try:
+        h, w = crop_img.shape[:2]
+
+        # 작은 이미지 확대
+        analysis_img = crop_img
+        if h < 200 or w < 200:
+            analysis_img = cv2.resize(crop_img, None, fx=2.0, fy=2.0,
+                                      interpolation=cv2.INTER_LINEAR)
+            h, w = analysis_img.shape[:2]
+
+        # CLAHE 대비 강화
+        gray = cv2.cvtColor(analysis_img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        results = engine.readtext(enhanced, detail=1)
+
+        # 최소 면적 필터 (이미지 면적의 0.3%)
+        min_area = h * w * 0.003
+        filtered = [
+            (bbox, text, prob)
+            for (bbox, text, prob) in results
+            if cv2.contourArea(np.array(bbox, dtype=np.int32)) >= min_area
+        ]
+
+        full_text = "".join(t.replace(" ", "") for _, t, _ in filtered)
+
+        if not full_text:
+            return None  # 텍스트 없음 → 아직 못 읽음
+
+        # 오뚜기 브랜드 여부
+        is_ottogi = "오뚜기" in full_text
+
+        # 불닭 특수 규칙 (브랜드 구분 필요)
+        if "불닭" in full_text:
+            refined = (
+                "25425_오뚜기컵밥불닭마요덮밥277g"
+                if is_ottogi
+                else "46090_씨제이)햇반컵반불닭마요덮밥"
+            )
+            if cache_key:
+                cache[cache_key] = refined
+            return refined
+
+        # 일반 키워드 매핑
+        for db_name, keywords in _CUPBOP_DB_MAPPING.items():
+            if any(kw in full_text for kw in keywords):
+                if cache_key:
+                    cache[cache_key] = db_name
+                logger.info("OCR 보정: %s → %s (text=%r)", base_label, db_name, full_text)
+                return db_name
+
+    except Exception as exc:
+        logger.warning("OCR 처리 중 에러: %s", exc)
+
+    return None  # 키워드 미매칭 → 아직 인식 못함
+
 
 def _calculate_movement_direction(
     centroid_history: list[tuple[float, float]],
@@ -249,6 +398,149 @@ def process_checkout_frame(
     state["count_event"] = None
     state["current_track_id"] = None
     counting_enabled = frame_count > max(0, int(warmup_frames))
+
+    # ── OCR pending 상태 처리 (CP5) ──────────────────────────────────────
+    # 컵밥 상품 방향 판정 완료 후 OCR 확인 대기 중인 경우
+    # 타임아웃을 wall-clock 기반으로 → FPS(캡처 주기) 변경에 무관하게 일정한 대기 시간 보장
+    _OCR_PENDING_TIMEOUT_SEC = 6.0  # 6초 wall-clock: 모달 확인 + 상품 뒤집어 비추는 시간
+    if counting_enabled and state.get("ocr_state") == "ocr_pending":
+        _pending_action = state.get("ocr_pending_action", "add")
+        _pending_label = state.get("ocr_pending_base_label", "")
+        _pending_tid = state.get("ocr_pending_track_id")
+        _pending_since_time = float(state.get("ocr_pending_since_time", time.time()))
+        _elapsed_sec = time.time() - _pending_since_time
+
+        # DeepSORT: 빈 detection으로 update → OCR 대기 중 트랙이 정상 만료되도록
+        # (호출 안 하면 트랙 age가 동결되어 OCR 완료 후 동일 track_id가 새 상품에 재배정됨)
+        if use_tracking and tracker is not None:
+            try:
+                tracker.update(frame, [])
+            except Exception:
+                pass
+
+        # 현재 프레임 crop 추출 (OCR 실행용)
+        _ocr_crop: np.ndarray | None = None
+        _fg_for_ocr = bg_subtractor.apply(frame, learningRate=0)  # 상태 변경 없이 mask만
+        _fg_for_ocr = cv2.erode(_fg_for_ocr, None, iterations=2)
+        _fg_for_ocr = cv2.dilate(_fg_for_ocr, None, iterations=4)
+        _, _fg_for_ocr = cv2.threshold(_fg_for_ocr, 200, 255, cv2.THRESH_BINARY)
+        _cnts_ocr, _ = cv2.findContours(_fg_for_ocr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        _cands_ocr = [c for c in _cnts_ocr if cv2.contourArea(c) > min_area]
+        if _cands_ocr:
+            _ox, _oy, _ow, _oh = cv2.boundingRect(max(_cands_ocr, key=cv2.contourArea))
+            _fh, _fw = frame.shape[:2]
+            _ocr_crop = frame[
+                max(0, _oy): min(_fh, _oy + _oh),
+                max(0, _ox): min(_fw, _ox + _ow),
+            ]
+
+        _resolved_label = _pending_label
+        _do_fire = False
+        _ocr_confirmed: str | None = None
+
+        if _ocr_crop is not None and _ocr_crop.size > 0:
+            _ocr_confirmed = _refine_label_with_ocr(_ocr_crop, _pending_label, state, _pending_tid)
+            if _ocr_confirmed is not None:
+                # OCR 키워드 매칭 성공 → 확인된 라벨로 발화
+                _resolved_label = _ocr_confirmed
+                _do_fire = True
+
+        # 타임아웃 처리: OCR 미확인 상태에서 시간 초과
+        if not _do_fire and _elapsed_sec >= _OCR_PENDING_TIMEOUT_SEC:
+            if _pending_action == "remove":
+                # REMOVE 타임아웃: FAISS 기본 라벨로 제거 시도 (베스트에포트)
+                # → ADD와 달리 REMOVE는 이미 담긴 상품을 꺼내는 것이므로 기본 라벨 fallback 허용
+                _bi_check = state.setdefault("billing_items", {})
+                if int(_bi_check.get(_pending_label, 0)) > 0:
+                    _resolved_label = _pending_label
+                    _do_fire = True
+                    logger.info(
+                        "OCR REMOVE 타임아웃(%.1fs): FAISS 라벨로 제거 시도 (%s)",
+                        _elapsed_sec, _pending_label,
+                    )
+                else:
+                    logger.info(
+                        "OCR REMOVE 타임아웃(%.1fs): 장바구니에 없음 → 취소 (%s)",
+                        _elapsed_sec, _pending_label,
+                    )
+
+            if not _do_fire:
+                # ADD 타임아웃 OR REMOVE이지만 장바구니에 없는 경우 → 취소 + 재시도 허용
+                state["ocr_state"] = "normal"
+                state["ocr_pending_action"] = None
+                state["ocr_pending_track_id"] = None
+                state["ocr_pending_base_label"] = ""
+                state["ocr_pending_since_frame"] = -1
+                state["ocr_pending_since_time"] = 0.0
+                # 쿨다운·track 잠금 해제 → 취소 직후 즉시 재시도 가능
+                state.get("last_action_map", {}).pop(_pending_label, None)
+                _ct = state.get("counted_tracks", {})
+                if _pending_tid is not None:
+                    _ct.pop(_pending_tid, None)
+                    try:
+                        _ct.pop(int(_pending_tid), None)
+                    except (TypeError, ValueError):
+                        pass
+                logger.info(
+                    "OCR pending 타임아웃(%.1fs): OCR 미확인 → 카운트 취소, 재시도 허용 (%s)",
+                    _elapsed_sec, _pending_label,
+                )
+                if roi_poly is not None:
+                    cv2.polylines(display_frame, [roi_poly], True, (0, 181, 255), 2)
+                return display_frame
+
+        if _do_fire:
+            _bi = state.setdefault("billing_items", {})
+            if _pending_action == "remove":
+                if int(_bi.get(_resolved_label, 0)) > 0:
+                    _nq = max(0, int(_bi.get(_resolved_label, 0)) - 1)
+                    if _nq == 0:
+                        _bi.pop(_resolved_label, None)
+                    else:
+                        _bi[_resolved_label] = _nq
+                    _release_counted_track(
+                        state.setdefault("counted_tracks", {}),
+                        product_name=_resolved_label,
+                        track_id=_pending_tid,
+                    )
+                    state["count_event"] = {
+                        "product": _resolved_label,
+                        "track_id": _pending_tid,
+                        "quantity": int(_bi.get(_resolved_label, 0)),
+                        "action": "remove",
+                    }
+            else:
+                _bi[_resolved_label] = int(_bi.get(_resolved_label, 0)) + 1
+                state["count_event"] = {
+                    "product": _resolved_label,
+                    "track_id": _pending_tid,
+                    "quantity": int(_bi.get(_resolved_label, 0)),
+                    "action": "add",
+                }
+            state.setdefault("item_scores", {})[_resolved_label] = state.get("last_score", 0.0)
+            state["ocr_state"] = "normal"
+            state["ocr_pending_action"] = None
+            state["ocr_pending_track_id"] = None
+            state["ocr_pending_base_label"] = ""
+            state["ocr_pending_since_frame"] = -1
+            # last_action_map을 OCR 발화 시각으로 갱신
+            # (방향판정 시각 기준이면 OCR 지연 시간만큼 쿨다운이 소모되어 두 번째 스캔이 차단됨)
+            state.setdefault("last_action_map", {})[_resolved_label] = {
+                "time": time.time(),
+                "action": _pending_action,
+            }
+            logger.info(
+                "OCR COUNT[%s]: %s %s → qty=%d",
+                "OCR" if _resolved_label != _pending_label else "FALLBACK",
+                _pending_action.upper(),
+                _resolved_label,
+                int(state["billing_items"].get(_resolved_label, 0)),
+            )
+
+        if roi_poly is not None:
+            cv2.polylines(display_frame, [roi_poly], True, (0, 181, 255), 2)
+        return display_frame
+    # ── OCR pending 처리 끝 ───────────────────────────────────────────────
 
     # Warm-up 중에는 잔상 학습만 수행하고 카운트 상태는 초기화해 오검출을 억제
     if not counting_enabled:
@@ -548,36 +840,56 @@ def process_checkout_frame(
                                     if _can:
                                         _lam[_name] = {"time": _now, "action": _action}
                                 if _can:
-                                    _bi = state.setdefault("billing_items", {})
-                                    if _action == "remove":
-                                        _nq = max(0, int(_bi.get(_name, 0)) - 1)
-                                        if _nq == 0:
-                                            _bi.pop(_name, None)
-                                        else:
-                                            _bi[_name] = _nq
-                                        _release_counted_track(
-                                            state.setdefault("counted_tracks", {}),
-                                            product_name=_name,
-                                            track_id=track_id,
-                                        )
-                                    else:
-                                        _bi[_name] = int(_bi.get(_name, 0)) + 1
-                                    state["count_event"] = {
-                                        "product": _name,
-                                        "track_id": track_id,
-                                        "quantity": int(_bi.get(_name, 0)),
-                                        "action": _action,
-                                    }
+                                    # direction_committed 먼저 설정 (재판정 방지)
                                     track_state["direction_committed"] = True
                                     track_state["centroid_history"] = []
-                                    logger.info(
-                                        "TRACK COUNT[%s]: %s %s (track=%s) → qty=%d",
-                                        _decision_mode.upper(),
-                                        _action.upper(),
-                                        _name,
-                                        track_id,
-                                        int(_bi.get(_name, 0)),
-                                    )
+
+                                    # ── CP4: 컵밥 계열 → OCR pending 분기 ──
+                                    # OCR 엔진이 사용 가능한 경우에만 pending 모달 진입.
+                                    # 엔진이 없으면(초기화 실패) FAISS 라벨로 즉시 카운트.
+                                    if _is_cupbop_label(_name) and _get_ocr_engine() is not None:
+                                        state["ocr_state"] = "ocr_pending"
+                                        state["ocr_pending_action"] = _action
+                                        state["ocr_pending_track_id"] = track_id
+                                        state["ocr_pending_base_label"] = _name
+                                        state["ocr_pending_since_frame"] = frame_count
+                                        state["ocr_pending_since_time"] = time.time()
+                                        logger.info(
+                                            "OCR PENDING: %s %s (track=%s) → 모달 표시",
+                                            _action.upper(),
+                                            _name,
+                                            track_id,
+                                        )
+                                    else:
+                                        # 일반 상품: 기존 즉시 카운트
+                                        _bi = state.setdefault("billing_items", {})
+                                        if _action == "remove":
+                                            _nq = max(0, int(_bi.get(_name, 0)) - 1)
+                                            if _nq == 0:
+                                                _bi.pop(_name, None)
+                                            else:
+                                                _bi[_name] = _nq
+                                            _release_counted_track(
+                                                state.setdefault("counted_tracks", {}),
+                                                product_name=_name,
+                                                track_id=track_id,
+                                            )
+                                        else:
+                                            _bi[_name] = int(_bi.get(_name, 0)) + 1
+                                        state["count_event"] = {
+                                            "product": _name,
+                                            "track_id": track_id,
+                                            "quantity": int(_bi.get(_name, 0)),
+                                            "action": _action,
+                                        }
+                                        logger.info(
+                                            "TRACK COUNT[%s]: %s %s (track=%s) → qty=%d",
+                                            _decision_mode.upper(),
+                                            _action.upper(),
+                                            _name,
+                                            track_id,
+                                            int(_bi.get(_name, 0)),
+                                        )
                             else:
                                 logger.debug(
                                     "direction consistency reject: track=%s mode=%s action=%s ratio=%.2f required=%.2f",
