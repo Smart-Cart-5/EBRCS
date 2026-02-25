@@ -5,7 +5,7 @@ from typing import Annotated, List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import bindparam, func, text
 from sqlalchemy.orm import Session
 
 from backend import models
@@ -44,6 +44,15 @@ class PurchaseResponse(BaseModel):
 class PopularProduct(BaseModel):
     name: str
     total_count: int
+    picture: str | None = None
+
+
+class DiscountProduct(BaseModel):
+    item_no: str
+    product_name: str
+    discount_rate: float
+    discount_amount: int
+    picture: str | None = None
 
 
 class DailyStat(BaseModel):
@@ -89,14 +98,144 @@ def _aggregate_product_counts(db: Session) -> dict[str, int]:
     return product_counts
 
 
-def _top_popular_products(product_counts: dict[str, int], limit: int = 5) -> list[dict]:
+def _extract_item_no_from_label(label: str) -> str | None:
+    text_label = (label or "").strip()
+    if not text_label:
+        return None
+    if text_label.isdigit():
+        return text_label
+    if "_" not in text_label:
+        return None
+    prefix, _ = text_label.split("_", 1)
+    prefix = prefix.strip()
+    return prefix if prefix.isdigit() else None
+
+
+def _latest_picture_by_item_no(db: Session, item_nos: list[str]) -> dict[str, str]:
+    if not item_nos:
+        return {}
+
+    stmt = text(
+        """
+        SELECT p.item_no, p.picture
+        FROM products p
+        JOIN (
+            SELECT item_no, MAX(id) AS max_id
+            FROM products
+            WHERE item_no IN :item_nos
+            GROUP BY item_no
+        ) latest
+            ON latest.item_no = p.item_no
+           AND latest.max_id = p.id
+        """
+    ).bindparams(bindparam("item_nos", expanding=True))
+
+    rows = db.execute(stmt, {"item_nos": item_nos}).mappings().all()
+    picture_map: dict[str, str] = {}
+    for row in rows:
+        item_no = str(row.get("item_no") or "").strip()
+        picture = str(row.get("picture") or "").strip()
+        if item_no and picture:
+            picture_map[item_no] = picture
+    return picture_map
+
+
+def _top_popular_products(db: Session, product_counts: dict[str, int], limit: int = 5) -> list[dict]:
     safe_limit = max(1, min(limit, 20))
-    return [
-        {"name": name, "total_count": count}
-        for name, count in sorted(product_counts.items(), key=lambda x: x[1], reverse=True)[
-            :safe_limit
-        ]
-    ]
+    top_items = sorted(product_counts.items(), key=lambda x: x[1], reverse=True)[:safe_limit]
+
+    unique_item_nos: list[str] = []
+    for name, _ in top_items:
+        item_no = _extract_item_no_from_label(name)
+        if item_no and item_no not in unique_item_nos:
+            unique_item_nos.append(item_no)
+
+    picture_by_item_no = _latest_picture_by_item_no(db, unique_item_nos)
+
+    result: list[dict] = []
+    for name, count in top_items:
+        item_no = _extract_item_no_from_label(name)
+        result.append(
+            {
+                "name": name,
+                "total_count": count,
+                "picture": picture_by_item_no.get(item_no) if item_no else None,
+            }
+        )
+    return result
+
+
+def _discount_categories(db: Session) -> list[str]:
+    rows = db.execute(
+        text(
+            """
+            SELECT DISTINCT category_l
+            FROM products
+            WHERE category_l IS NOT NULL
+              AND TRIM(category_l) <> ''
+            ORDER BY category_l
+            """
+        )
+    ).mappings().all()
+    return [str(row["category_l"]) for row in rows if row.get("category_l")]
+
+
+def _top_discount_products_by_category(
+    db: Session, category_l: str, limit: int = 5
+) -> list[dict]:
+    safe_limit = max(1, min(limit, 20))
+    category = (category_l or "").strip()
+    if not category:
+        return []
+
+    rows = db.execute(
+        text(
+            """
+            WITH ranked AS (
+                SELECT
+                    p.item_no,
+                    p.product_name,
+                    p.picture,
+                    pd.is_discounted,
+                    pd.discount_rate,
+                    pd.discount_amount,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY p.item_no
+                        ORDER BY
+                            pp.checked_at DESC,
+                            pd.updated_at DESC,
+                            pd.id DESC
+                    ) AS rn_latest
+                FROM products p
+                JOIN product_prices pp ON pp.product_id = p.id
+                JOIN product_discounts pd ON pd.product_price_id = pp.id
+                WHERE p.category_l = :category_l
+            )
+            SELECT item_no, product_name, picture, discount_rate, discount_amount
+            FROM ranked
+            WHERE rn_latest = 1
+              AND is_discounted = 1
+              AND discount_rate IS NOT NULL
+            ORDER BY discount_rate DESC, COALESCE(discount_amount, 0) DESC, product_name ASC
+            LIMIT :limit
+            """
+        ),
+        {"category_l": category, "limit": safe_limit},
+    ).mappings().all()
+
+    result: list[dict] = []
+    for row in rows:
+        picture = str(row.get("picture") or "").strip() or None
+        result.append(
+            {
+                "item_no": str(row.get("item_no") or ""),
+                "product_name": str(row.get("product_name") or ""),
+                "discount_rate": float(row.get("discount_rate") or 0.0),
+                "discount_amount": int(row.get("discount_amount") or 0),
+                "picture": picture,
+            }
+        )
+    return result
 
 
 @router.get("/my", response_model=List[PurchaseResponse])
@@ -168,7 +307,29 @@ def get_popular_products(
     """Get popular products for authenticated users (used by user home popup)."""
     _ = current_user  # Auth required; role does not matter.
     product_counts = _aggregate_product_counts(db)
-    return _top_popular_products(product_counts, limit=limit)
+    return _top_popular_products(db, product_counts, limit=limit)
+
+
+@router.get("/discount-categories", response_model=List[str])
+def get_discount_categories(
+    current_user: Annotated[models.User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    """Get available top-level product categories for discount filtering."""
+    _ = current_user  # Auth required; role does not matter.
+    return _discount_categories(db)
+
+
+@router.get("/discounts", response_model=List[DiscountProduct])
+def get_discount_products(
+    current_user: Annotated[models.User, Depends(get_current_user)],
+    category_l: str,
+    db: Session = Depends(get_db),
+    limit: int = 5,
+):
+    """Get top discounted products for a selected category."""
+    _ = current_user  # Auth required; role does not matter.
+    return _top_discount_products_by_category(db, category_l=category_l, limit=limit)
 
 
 @router.post("", response_model=PurchaseResponse)
@@ -265,7 +426,7 @@ def get_dashboard_stats(
     # Total products sold and popular products
     product_counts = _aggregate_product_counts(db)
     total_products_sold = sum(product_counts.values())
-    popular_products = _top_popular_products(product_counts, limit=5)
+    popular_products = _top_popular_products(db, product_counts, limit=5)
 
     # Recent purchases (last 5)
     recent_purchases_db = (

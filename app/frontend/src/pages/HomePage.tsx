@@ -1,13 +1,24 @@
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { useAuthStore } from "../stores/authStore";
-import { getDashboardStats, getPopularProducts } from "../api/purchases";
+import {
+  getDashboardStats,
+  getDiscountCategories,
+  getDiscountProducts,
+  getPopularProducts,
+} from "../api/purchases";
 
 const PERIOD_OPTIONS = [7, 30, 90] as const;
 type PeriodDays = (typeof PERIOD_OPTIONS)[number];
 
 const formatAmount = (value: number) => `₩${(value ?? 0).toLocaleString("ko-KR")}`;
+const formatDiscountAmount = (value: number) => `₩${Math.max(0, value ?? 0).toLocaleString("ko-KR")}`;
+
+function formatDiscountRate(value: number): string {
+  const safe = Number.isFinite(value) ? Math.max(0, value) : 0;
+  return `${safe.toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1")}%`;
+}
 
 function formatCompactAmount(value: number): string {
   if (value <= 0) return "0";
@@ -35,6 +46,9 @@ export default function HomePage() {
   const { isAdmin, token } = useAuthStore();
   const isAdminUser = isAdmin();
   const [periodDays, setPeriodDays] = useState<PeriodDays>(7);
+  const [failedPopularImages, setFailedPopularImages] = useState<Record<string, true>>({});
+  const [selectedDiscountCategory, setSelectedDiscountCategory] = useState("");
+  const [failedDiscountImages, setFailedDiscountImages] = useState<Record<string, true>>({});
 
   // Fetch dashboard stats for admin
   const { data: stats, isLoading } = useQuery({
@@ -50,10 +64,37 @@ export default function HomePage() {
     enabled: !isAdminUser && !!token,
   });
 
-  const maxUserPopularCount = useMemo(
-    () => Math.max(1, ...userPopularProducts.map((p) => p.total_count)),
-    [userPopularProducts]
-  );
+  const { data: discountCategories = [], isLoading: isDiscountCategoriesLoading } = useQuery({
+    queryKey: ["discount-categories", "user-home", token],
+    queryFn: () => getDiscountCategories(token!),
+    enabled: !isAdminUser && !!token,
+  });
+
+  const { data: discountProducts = [], isLoading: isDiscountProductsLoading } = useQuery({
+    queryKey: ["discount-products", "user-home", token, selectedDiscountCategory],
+    queryFn: () => getDiscountProducts(token!, selectedDiscountCategory, 5),
+    enabled: !isAdminUser && !!token && selectedDiscountCategory.length > 0,
+  });
+
+  useEffect(() => {
+    setFailedPopularImages({});
+  }, [userPopularProducts]);
+
+  useEffect(() => {
+    if (discountCategories.length === 0) {
+      if (selectedDiscountCategory !== "") {
+        setSelectedDiscountCategory("");
+      }
+      return;
+    }
+    if (!discountCategories.includes(selectedDiscountCategory)) {
+      setSelectedDiscountCategory(discountCategories[0]);
+    }
+  }, [discountCategories, selectedDiscountCategory]);
+
+  useEffect(() => {
+    setFailedDiscountImages({});
+  }, [selectedDiscountCategory, discountProducts]);
 
   // Admin Dashboard
   if (isAdminUser) {
@@ -358,37 +399,43 @@ export default function HomePage() {
         </div>
 
         {userPopularProducts.length > 0 ? (
-          <div className="flex gap-3 overflow-x-auto pb-1 snap-x snap-mandatory">
+          <div className="flex gap-1.5 sm:gap-2.5 overflow-x-auto pb-1 snap-x snap-mandatory">
             {userPopularProducts.map((product, index) => {
-              const ratio = Math.max(
-                10,
-                Math.round((product.total_count / maxUserPopularCount) * 100)
-              );
+              const hasPicture = Boolean(product.picture) && !failedPopularImages[product.name];
               return (
                 <div
                   key={product.name}
-                  className="min-w-[220px] sm:min-w-[240px] max-w-[260px] shrink-0 snap-start rounded-xl border border-[var(--color-border)] bg-white p-4"
+                  className="min-w-[100px] sm:min-w-[126px] max-w-[147px] shrink-0 snap-start rounded-xl border border-[var(--color-border)] bg-white p-2.5 sm:p-3.5"
                 >
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="inline-flex w-7 h-7 items-center justify-center rounded-full bg-orange-100 text-orange-700 text-xs font-bold">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="inline-flex w-6 h-6 items-center justify-center rounded-full bg-orange-100 text-orange-700 text-[11px] font-bold">
                       {index + 1}
                     </span>
                     <span className="text-xs font-semibold text-[var(--color-primary)]">
                       {product.total_count}개
                     </span>
                   </div>
-                  <div className="w-12 h-12 rounded-xl bg-[var(--color-primary-light)] text-[var(--color-primary)] flex items-center justify-center text-lg font-bold mb-3">
-                    {(product.name || "?").slice(0, 1)}
-                  </div>
-                  <p className="text-sm font-semibold text-[var(--color-text)] break-words line-clamp-2 min-h-[2.6rem]">
+                  {hasPicture ? (
+                    <img
+                      src={product.picture || ""}
+                      alt={`${product.name} 상품 이미지`}
+                      className="w-16 h-16 sm:w-20 sm:h-20 rounded-xl object-contain bg-white p-1 mb-2.5 border border-[var(--color-border)]"
+                      loading="lazy"
+                      referrerPolicy="no-referrer"
+                      onError={() =>
+                        setFailedPopularImages((prev) =>
+                          prev[product.name] ? prev : { ...prev, [product.name]: true }
+                        )
+                      }
+                    />
+                  ) : (
+                    <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-xl bg-[var(--color-primary-light)] text-[var(--color-primary)] flex items-center justify-center text-base font-bold mb-2.5">
+                      {(product.name || "?").slice(0, 1)}
+                    </div>
+                  )}
+                  <p className="text-[13px] sm:text-sm leading-tight font-semibold text-[var(--color-text)] break-words line-clamp-2 min-h-[2.2rem]">
                     {product.name}
                   </p>
-                  <div className="mt-3 h-2 rounded-full bg-gray-100 overflow-hidden">
-                    <div
-                      className="h-full rounded-full bg-gradient-to-r from-orange-500 to-amber-400"
-                      style={{ width: `${ratio}%` }}
-                    />
-                  </div>
                 </div>
               );
             })}
@@ -398,6 +445,127 @@ export default function HomePage() {
             아직 인기 상품 집계 데이터가 없습니다.
           </div>
         )}
+      </div>
+
+      {/* Discount Top5 by Category */}
+      <div className="bg-white rounded-2xl p-6 border border-[var(--color-border)] shadow-sm">
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div>
+            <h2 className="text-2xl font-bold text-[var(--color-text)] mb-1">
+              카테고리별 할인 상품
+            </h2>
+            <p className="text-sm text-[var(--color-text-secondary)]">
+              선택한 카테고리에서 할인율이 높은 상품 TOP 5
+            </p>
+          </div>
+          {selectedDiscountCategory ? (
+            <span className="inline-flex items-center px-2.5 py-1 rounded-full bg-red-50 text-red-700 text-xs font-semibold">
+              {selectedDiscountCategory}
+            </span>
+          ) : null}
+        </div>
+
+        {isDiscountCategoriesLoading ? (
+          <div className="h-16 rounded-xl border border-dashed border-[var(--color-border)] flex items-center justify-center text-sm text-[var(--color-text-secondary)]">
+            카테고리 로딩 중...
+          </div>
+        ) : discountCategories.length > 0 ? (
+          <div className="flex flex-wrap gap-2">
+            {discountCategories.map((category) => (
+              <label
+                key={category}
+                className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-sm cursor-pointer transition-colors ${
+                  selectedDiscountCategory === category
+                    ? "bg-orange-50 border-orange-300 text-orange-700"
+                    : "bg-white border-[var(--color-border)] text-[var(--color-text)] hover:bg-gray-50"
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 accent-orange-500"
+                  checked={selectedDiscountCategory === category}
+                  onChange={() => setSelectedDiscountCategory(category)}
+                />
+                <span>{category}</span>
+              </label>
+            ))}
+          </div>
+        ) : (
+          <div className="h-16 rounded-xl border border-dashed border-[var(--color-border)] flex items-center justify-center text-sm text-[var(--color-text-secondary)]">
+            표시할 카테고리가 없습니다.
+          </div>
+        )}
+
+        <div className="mt-4">
+          {selectedDiscountCategory && isDiscountProductsLoading ? (
+            <div className="h-28 rounded-xl border border-dashed border-[var(--color-border)] flex items-center justify-center text-sm text-[var(--color-text-secondary)]">
+              할인 상품 로딩 중...
+            </div>
+          ) : discountProducts.length > 0 ? (
+            <div className="space-y-3">
+              {discountProducts.map((product, index) => {
+                const hasPicture =
+                  Boolean(product.picture) && !failedDiscountImages[product.item_no];
+                return (
+                  <div
+                    key={`${selectedDiscountCategory}-${product.item_no}-${index}`}
+                    className="rounded-xl border border-[var(--color-border)] p-3 bg-white"
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="inline-flex w-7 h-7 items-center justify-center rounded-full bg-red-100 text-red-700 text-xs font-bold">
+                        {index + 1}
+                      </span>
+                      {hasPicture ? (
+                        <img
+                          src={product.picture || ""}
+                          alt={`${product.product_name} 상품 이미지`}
+                          className="w-11 h-11 rounded-lg object-cover border border-[var(--color-border)]"
+                          loading="lazy"
+                          referrerPolicy="no-referrer"
+                          onError={() =>
+                            setFailedDiscountImages((prev) =>
+                              prev[product.item_no]
+                                ? prev
+                                : { ...prev, [product.item_no]: true }
+                            )
+                          }
+                        />
+                      ) : (
+                        <div className="w-11 h-11 rounded-lg bg-red-50 text-red-600 flex items-center justify-center text-sm font-bold">
+                          {(product.product_name || "?").slice(0, 1)}
+                        </div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-semibold text-[var(--color-text)] break-words">
+                          {product.product_name}
+                        </p>
+                        <p className="text-xs text-[var(--color-text-secondary)]">
+                          상품코드: {product.item_no}
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-sm font-bold text-red-700">
+                          {formatDiscountRate(product.discount_rate)}
+                        </p>
+                        <p className="text-xs text-[var(--color-text-secondary)]">
+                          할인금액 {formatDiscountAmount(product.discount_amount)}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : selectedDiscountCategory ? (
+            <div className="h-24 rounded-xl border border-dashed border-[var(--color-border)] flex items-center justify-center text-sm text-[var(--color-text-secondary)]">
+              {selectedDiscountCategory} 카테고리의 할인 상품이 없습니다.
+            </div>
+          ) : (
+            <div className="h-24 rounded-xl border border-dashed border-[var(--color-border)] flex items-center justify-center text-sm text-[var(--color-text-secondary)]">
+              카테고리를 선택해 주세요.
+            </div>
+          )}
+        </div>
       </div>
 
       {/* CTA Cards */}
