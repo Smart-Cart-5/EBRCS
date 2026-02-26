@@ -834,9 +834,17 @@ def process_checkout_frame(
                                             _name,
                                         )
                                     else:
-                                        _can = int(
-                                            state.setdefault("billing_items", {}).get(_name, 0)
-                                        ) > 0
+                                        _bi = state.setdefault("billing_items", {})
+                                        if _is_cupbop_label(_name):
+                                            # REMOVE + 컵밥: 임베딩 라벨이 장바구니 라벨과 달라도
+                                            # 장바구니에 컵밥이 하나라도 있으면 OCR pending 진입 허용.
+                                            # 실제 차감은 OCR 확정/최종 검증 단계에서만 수행.
+                                            _can = any(
+                                                int(_qty) > 0 and _is_cupbop_label(str(_label))
+                                                for _label, _qty in _bi.items()
+                                            )
+                                        else:
+                                            _can = int(_bi.get(_name, 0)) > 0
                                     if _can:
                                         _lam[_name] = {"time": _now, "action": _action}
                                 if _can:

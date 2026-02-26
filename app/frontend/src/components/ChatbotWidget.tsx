@@ -40,6 +40,7 @@ declare global {
 const MOBILE_BREAKPOINT = 1024; // Tailwind `lg` breakpoint
 const MOBILE_FAB_SIZE = 64;
 const DESKTOP_FAB_SIZE = 48;
+const DESKTOP_BOTTOM_OFFSET = 24;
 const MOBILE_SIDE_OFFSET = 16;
 const MOBILE_BOTTOM_OFFSET = 80; // same visual level as cart FAB (`bottom-20`)
 
@@ -53,17 +54,23 @@ const getAnchoredMobilePos = () => ({
 
 const getDefaultDesktopPos = () => ({
   x: Math.max(0, window.innerWidth - DESKTOP_FAB_SIZE - 16),
-  y: 16,
+  y: Math.max(8, window.innerHeight - DESKTOP_FAB_SIZE - DESKTOP_BOTTOM_OFFSET),
 });
 
-export default function ChatbotWidget() {
+interface ChatbotWidgetProps {
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  hideMobileTrigger?: boolean;
+}
+
+export default function ChatbotWidget({ open: controlledOpen, onOpenChange, hideMobileTrigger = false }: ChatbotWidgetProps) {
   const sessionId = useSessionStore((s) => s.sessionId);
   const createSession = useSessionStore((s) => s.createSession);
   const billingItems = useSessionStore((s) => s.billingItems);
   const setBilling = useSessionStore((s) => s.setBilling);
   const setBillingState = useSessionStore((s) => s.setBillingState);
 
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [listening, setListening] = useState(false);
@@ -91,6 +98,17 @@ export default function ChatbotWidget() {
   const hasMoved = useRef(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const isOpenControlled = controlledOpen !== undefined;
+  const open = isOpenControlled ? controlledOpen : internalOpen;
+  const shouldShowTrigger = !(hideMobileTrigger && isMobileView);
+
+  const setOpen = useCallback((nextOpen: boolean | ((prevOpen: boolean) => boolean)) => {
+    const resolvedOpen = typeof nextOpen === "function" ? nextOpen(open) : nextOpen;
+    if (!isOpenControlled) {
+      setInternalOpen(resolvedOpen);
+    }
+    onOpenChange?.(resolvedOpen);
+  }, [isOpenControlled, onOpenChange, open]);
 
   const ensureSession = useCallback(async () => {
     if (sessionId) return sessionId;
@@ -117,7 +135,6 @@ export default function ChatbotWidget() {
     dragging.current = true;
     hasMoved.current = false;
     dragOffset.current = { x: e.clientX - pos.x, y: e.clientY - pos.y };
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
   }, [isMobileView, pos]);
 
   useEffect(() => {
@@ -295,36 +312,48 @@ export default function ChatbotWidget() {
   return (
     <>
       {/* Desktop: draggable FAB / Mobile: anchored FAB */}
-      <button
-        type="button"
-        style={{ left: pos.x, top: pos.y }}
-        className={`fixed z-50 rounded-full bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white shadow-lg flex items-center justify-center select-none ${
-          isMobileView
-            ? "w-16 h-16"
-            : "w-12 h-12 cursor-grab active:cursor-grabbing touch-none"
-        }`}
-        aria-label={open ? "챗봇 닫기" : "챗봇 열기"}
-        onPointerDown={onPointerDown}
-        onClick={() => {
-          if (!hasMoved.current) setOpen((v) => !v);
-        }}
-      >
-        <span className={isMobileView ? "text-2xl" : "text-lg"}>
-          {open ? "✕" : "🤖"}
-        </span>
-      </button>
+      {shouldShowTrigger && (
+        <button
+          type="button"
+          style={{ left: pos.x, top: pos.y }}
+          className={`fixed z-30 rounded-full bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white shadow-lg flex items-center justify-center select-none ${
+            isMobileView
+              ? "w-16 h-16"
+              : "w-12 h-12 cursor-grab active:cursor-grabbing touch-none"
+          }`}
+          aria-label={open ? "챗봇 닫기" : "챗봇 열기"}
+          onPointerDown={onPointerDown}
+          onClick={() => {
+            if (!hasMoved.current) setOpen((v) => !v);
+          }}
+        >
+          <span className={isMobileView ? "text-2xl" : "text-lg"}>
+            {open ? "✕" : "🤖"}
+          </span>
+        </button>
+      )}
 
       {/* Chat panel */}
       {open && (
         <div
           style={{ left: Math.max(8, panelX), top: finalPanelY }}
-          className="fixed z-50 w-[min(92vw,360px)] bg-[var(--color-surface)] border border-[var(--color-border)] rounded-2xl shadow-xl overflow-hidden"
+          className="fixed z-30 w-[min(92vw,360px)] bg-[var(--color-surface)] border border-[var(--color-border)] rounded-2xl shadow-xl overflow-hidden"
         >
-          <div className="px-4 py-3 border-b border-[var(--color-border)] bg-[var(--color-primary-light)]">
-            <p className="text-sm font-semibold text-[var(--color-text)]">스마트 챗봇</p>
-            <p className="text-xs text-[var(--color-text-secondary)]">
-              {hasCartItems ? "장바구니 기반 답변 제공" : "장바구니가 비어 있습니다"}
-            </p>
+          <div className="px-4 py-3 border-b border-[var(--color-border)] bg-[var(--color-primary-light)] flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-[var(--color-text)]">스마트 챗봇</p>
+              <p className="text-xs text-[var(--color-text-secondary)]">
+                {hasCartItems ? "장바구니 기반 답변 제공" : "장바구니가 비어 있습니다"}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              className="w-7 h-7 rounded-md border border-[var(--color-border)] bg-white text-[var(--color-text-secondary)] hover:text-[var(--color-text)]"
+              aria-label="챗봇 닫기"
+            >
+              ✕
+            </button>
           </div>
 
           {sessionError && (

@@ -15,8 +15,9 @@ import cv2
 import faiss
 import numpy as np
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 from PIL import Image
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -33,6 +34,143 @@ CLIP_WEIGHT = 0.3
 MIN_IMAGES = 3
 # Allow extra samples for better robustness while keeping an upper bound.
 MAX_IMAGES = 10
+STOCK_COLUMN_CANDIDATES = ("stock", "stock_qty", "inventory", "quantity", "qty")
+
+
+class ProductDetailUpdate(BaseModel):
+    product_name: str | None = None
+    barcd: str | None = None
+    price: int | None = None
+    stock: int | None = None
+    is_discounted: bool | None = None
+    discount_rate: float | None = None
+    discount_amount: int | None = None
+
+
+def _table_columns(db: Session, table_name: str) -> set[str]:
+    try:
+        db_inspector = inspect(db.get_bind())
+        return {
+            str(col.get("name"))
+            for col in db_inspector.get_columns(table_name)
+            if col.get("name")
+        }
+    except Exception:
+        return set()
+
+
+def _table_exists(db: Session, table_name: str) -> bool:
+    try:
+        db_inspector = inspect(db.get_bind())
+        return bool(db_inspector.has_table(table_name))
+    except Exception:
+        return False
+
+
+def _pick_stock_column(product_columns: set[str]) -> str | None:
+    for col in STOCK_COLUMN_CANDIDATES:
+        if col in product_columns:
+            return col
+    return None
+
+
+def _latest_discount_row(
+    db: Session,
+    product_price_id: int,
+    discount_columns: set[str],
+) -> dict[str, object] | None:
+    if "product_price_id" not in discount_columns:
+        return None
+
+    select_cols = [
+        c
+        for c in (
+            "id",
+            "is_discounted",
+            "discount_rate",
+            "discount_amount",
+            "started_at",
+            "ended_at",
+            "updated_at",
+            "created_at",
+        )
+        if c in discount_columns
+    ]
+    if not select_cols:
+        return None
+
+    order_cols = [c for c in ("updated_at", "created_at", "id") if c in discount_columns]
+    if not order_cols:
+        order_cols = [select_cols[0]]
+
+    sql = (
+        f"SELECT {', '.join(f'`{col}`' for col in select_cols)} "
+        "FROM product_discounts "
+        "WHERE `product_price_id` = :ppid "
+        f"ORDER BY {', '.join(f'`{col}` DESC' for col in order_cols)} "
+        "LIMIT 1"
+    )
+
+    row = db.execute(text(sql), {"ppid": int(product_price_id)}).mappings().first()
+    return dict(row) if row else None
+
+
+def _insert_discount_row(
+    db: Session,
+    product_price_id: int,
+    payload: ProductDetailUpdate,
+    discount_columns: set[str],
+) -> None:
+    if "product_price_id" not in discount_columns:
+        raise HTTPException(status_code=422, detail="product_discounts schema missing product_price_id")
+
+    discount_rate = None
+    if payload.discount_rate is not None:
+        if payload.discount_rate < 0:
+            raise HTTPException(status_code=422, detail="discount_rate must be >= 0")
+        discount_rate = float(payload.discount_rate)
+
+    discount_amount = None
+    if payload.discount_amount is not None:
+        if payload.discount_amount < 0:
+            raise HTTPException(status_code=422, detail="discount_amount must be >= 0")
+        discount_amount = int(payload.discount_amount)
+
+    if payload.is_discounted is not None:
+        is_discounted_value = 1 if payload.is_discounted else 0
+    else:
+        is_discounted_value = 1 if (discount_rate or 0) > 0 or (discount_amount or 0) > 0 else 0
+
+    values: dict[str, object] = {"product_price_id": int(product_price_id)}
+    if "is_discounted" in discount_columns:
+        values["is_discounted"] = is_discounted_value
+    if "discount_rate" in discount_columns:
+        values["discount_rate"] = discount_rate
+    if "discount_amount" in discount_columns:
+        values["discount_amount"] = discount_amount
+
+    cols: list[str] = []
+    exprs: list[str] = []
+    params: dict[str, object] = {}
+
+    for col, value in values.items():
+        cols.append(f"`{col}`")
+        key = f"v_{col}"
+        exprs.append(f":{key}")
+        params[key] = value
+
+    if "created_at" in discount_columns:
+        cols.append("`created_at`")
+        exprs.append("CURRENT_TIMESTAMP")
+    if "updated_at" in discount_columns:
+        cols.append("`updated_at`")
+        exprs.append("CURRENT_TIMESTAMP")
+
+    sql = (
+        f"INSERT INTO product_discounts ({', '.join(cols)}) "
+        f"VALUES ({', '.join(exprs)})"
+    )
+    db.execute(text(sql), params)
 
 
 def _pil_to_bgr(img: Image.Image) -> np.ndarray:
@@ -371,6 +509,199 @@ async def list_products(db: Session = Depends(get_db)):
         "products": products,
         "total_embeddings": embedding_total,
     }
+
+
+@router.get("/products/{item_no}/detail")
+async def get_product_detail(item_no: str, db: Session = Depends(get_db)):
+    """Fetch editable product detail for admin popup."""
+    clean_item_no = (item_no or "").strip()
+    if not clean_item_no:
+        raise HTTPException(status_code=422, detail="Item number is required")
+
+    product_row = db.execute(
+        text(
+            """
+            SELECT *
+            FROM products
+            WHERE item_no = :item_no
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ),
+        {"item_no": clean_item_no},
+    ).mappings().first()
+    if not product_row:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    product = dict(product_row)
+    product_columns = _table_columns(db, "products")
+    stock_column = _pick_stock_column(product_columns)
+    stock_value = product.get(stock_column) if stock_column else None
+
+    price_row = db.execute(
+        text(
+            """
+            SELECT id, price, currency, source, checked_at
+            FROM product_prices
+            WHERE product_id = :pid
+            ORDER BY checked_at DESC, id DESC
+            LIMIT 1
+            """
+        ),
+        {"pid": int(product["id"])},
+    ).mappings().first()
+    price = dict(price_row) if price_row else {}
+
+    discount = None
+    discount_available = _table_exists(db, "product_discounts")
+    discount_columns = _table_columns(db, "product_discounts") if discount_available else set()
+    if price.get("id") and discount_available:
+        discount = _latest_discount_row(db, int(price["id"]), discount_columns)
+
+    return {
+        "id": int(product["id"]),
+        "item_no": str(product.get("item_no") or ""),
+        "product_name": str(product.get("product_name") or ""),
+        "barcd": product.get("barcd"),
+        "stock": int(stock_value) if stock_value is not None else None,
+        "stock_column": stock_column,
+        "price": int(price["price"]) if price.get("price") is not None else None,
+        "currency": str(price.get("currency") or "KRW") if price else None,
+        "price_source": price.get("source"),
+        "price_checked_at": price.get("checked_at"),
+        "is_discounted": bool(discount["is_discounted"]) if discount and discount.get("is_discounted") is not None else None,
+        "discount_rate": float(discount["discount_rate"]) if discount and discount.get("discount_rate") is not None else None,
+        "discount_amount": int(discount["discount_amount"]) if discount and discount.get("discount_amount") is not None else None,
+        "discount_updated_at": (discount or {}).get("updated_at"),
+        "available_fields": {
+            "stock": stock_column is not None,
+            "discount": discount_available and "product_price_id" in discount_columns,
+        },
+    }
+
+
+@router.put("/products/{item_no}/detail")
+async def update_product_detail(
+    item_no: str,
+    payload: ProductDetailUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update product metadata/price/discount directly in DB."""
+    clean_item_no = (item_no or "").strip()
+    if not clean_item_no:
+        raise HTTPException(status_code=422, detail="Item number is required")
+
+    product_row = db.execute(
+        text(
+            """
+            SELECT *
+            FROM products
+            WHERE item_no = :item_no
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ),
+        {"item_no": clean_item_no},
+    ).mappings().first()
+    if not product_row:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    product = dict(product_row)
+    product_id = int(product["id"])
+    product_columns = _table_columns(db, "products")
+    stock_column = _pick_stock_column(product_columns)
+
+    updates: list[str] = []
+    params: dict[str, object] = {"id": product_id}
+
+    if payload.product_name is not None:
+        cleaned_name = payload.product_name.strip()
+        if not cleaned_name:
+            raise HTTPException(status_code=422, detail="product_name cannot be empty")
+        updates.append("`product_name` = :product_name")
+        params["product_name"] = cleaned_name
+
+    if payload.barcd is not None:
+        cleaned_barcd = payload.barcd.strip()
+        updates.append("`barcd` = :barcd")
+        params["barcd"] = cleaned_barcd or None
+
+    if payload.stock is not None:
+        if not stock_column:
+            raise HTTPException(status_code=422, detail="Stock column not found in products table")
+        if payload.stock < 0:
+            raise HTTPException(status_code=422, detail="stock must be >= 0")
+        updates.append(f"`{stock_column}` = :stock")
+        params["stock"] = int(payload.stock)
+
+    if updates:
+        if "updated_at" in product_columns:
+            updates.append("`updated_at` = CURRENT_TIMESTAMP")
+        db.execute(
+            text(f"UPDATE products SET {', '.join(updates)} WHERE id = :id"),
+            params,
+        )
+
+    latest_price_id: int | None = None
+    latest_price_row = db.execute(
+        text(
+            """
+            SELECT id, price, currency
+            FROM product_prices
+            WHERE product_id = :pid
+            ORDER BY checked_at DESC, id DESC
+            LIMIT 1
+            """
+        ),
+        {"pid": product_id},
+    ).mappings().first()
+    if latest_price_row:
+        latest_price_id = int(latest_price_row["id"])
+
+    if payload.price is not None:
+        if payload.price <= 0:
+            raise HTTPException(status_code=422, detail="price must be > 0")
+        currency = str((latest_price_row or {}).get("currency") or "KRW")
+        inserted = db.execute(
+            text(
+                """
+                INSERT INTO product_prices (product_id, price, currency, source, checked_at, created_at)
+                VALUES (:product_id, :price, :currency, 'admin_edit', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """
+            ),
+            {
+                "product_id": product_id,
+                "price": int(payload.price),
+                "currency": currency,
+            },
+        )
+        latest_price_id = int(inserted.lastrowid or 0) or latest_price_id
+
+    wants_discount_update = (
+        payload.is_discounted is not None
+        or payload.discount_rate is not None
+        or payload.discount_amount is not None
+    )
+    if wants_discount_update:
+        if latest_price_id is None:
+            raise HTTPException(status_code=422, detail="No price row exists for this product")
+        if not _table_exists(db, "product_discounts"):
+            raise HTTPException(status_code=422, detail="product_discounts table not found")
+        discount_columns = _table_columns(db, "product_discounts")
+        _insert_discount_row(
+            db=db,
+            product_price_id=int(latest_price_id),
+            payload=payload,
+            discount_columns=discount_columns,
+        )
+
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}") from exc
+
+    return {"status": "updated", "item_no": clean_item_no}
 
 
 @router.delete("/products/{item_no}")

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useRef } from "react";
 import { Routes, Route, Link, useLocation, Navigate } from "react-router-dom";
 import HomePage from "./pages/HomePage";
 import CheckoutPage from "./pages/CheckoutPage";
@@ -33,25 +33,67 @@ export default function App() {
   const isAuthPage = pathname === "/login" || pathname === "/signup";
 
   const { user, clearAuth, isAuthenticated, isAdmin } = useAuthStore();
+  const isAdminUser = isAdmin();
+  const shouldRenderChatbot = true;
+  const shouldUseMobileHeaderChatbot = !isCheckoutPage;
   const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false);
+  const [isChatbotOpen, setIsChatbotOpen] = useState(false);
   const profileMenuRef = useRef<HTMLDivElement>(null);
+  const mainRef = useRef<HTMLElement>(null);
+
+  // Force scroll reset for both container and window (iOS may use window scroll).
+  useLayoutEffect(() => {
+    const resetScroll = () => {
+      mainRef.current?.scrollTo({ top: 0, left: 0 });
+      window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    };
+
+    resetScroll();
+    const rafId = window.requestAnimationFrame(resetScroll);
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+    };
+  }, [pathname]);
+
+  // Keep browser from restoring the previous scroll position on route changes.
+  useEffect(() => {
+    if (!("scrollRestoration" in window.history)) {
+      return;
+    }
+
+    const previous = window.history.scrollRestoration;
+    window.history.scrollRestoration = "manual";
+
+    return () => {
+      window.history.scrollRestoration = previous;
+    };
+  }, []);
 
   // Close profile menu when clicking outside
   useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
+    const handleClickOutside = (event: PointerEvent) => {
       if (profileMenuRef.current && !profileMenuRef.current.contains(event.target as Node)) {
         setIsProfileMenuOpen(false);
       }
     };
 
     if (isProfileMenuOpen) {
-      document.addEventListener("mousedown", handleClickOutside);
+      document.addEventListener("pointerdown", handleClickOutside);
     }
 
     return () => {
-      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("pointerdown", handleClickOutside);
     };
   }, [isProfileMenuOpen]);
+
+  // Reset transient overlays when route changes to avoid mobile transition glitches.
+  useEffect(() => {
+    setIsProfileMenuOpen(false);
+    setIsChatbotOpen(false);
+  }, [pathname]);
 
   // Auth pages (login/signup)
   if (isAuthPage) {
@@ -69,17 +111,17 @@ export default function App() {
   }
 
   // Block direct access to admin routes for non-admin users.
-  if (shouldRedirectForAdminRoute(pathname, isAdmin())) {
+  if (shouldRedirectForAdminRoute(pathname, isAdminUser)) {
     return <Navigate to="/" replace />;
   }
 
   // Select menu based on role
-  const NAV_ITEMS = isAdmin() ? ADMIN_NAV_ITEMS : USER_NAV_ITEMS;
+  const NAV_ITEMS = isAdminUser ? ADMIN_NAV_ITEMS : USER_NAV_ITEMS;
 
   return (
     <div className="min-h-screen flex flex-col lg:flex-row">
       {/* Desktop Sidebar - Hidden on mobile */}
-      <aside className="hidden lg:flex w-64 bg-[var(--color-sidebar)] border-r border-[var(--color-border)] flex-col">
+      <aside className="hidden lg:flex w-64 bg-[var(--color-sidebar)] border-r border-[var(--color-border)] flex-col relative z-[70]">
         {/* Logo */}
         <div className="p-6 border-b border-[var(--color-border)]">
           <div className="flex items-center gap-3">
@@ -157,7 +199,7 @@ export default function App() {
 
       {/* Mobile Header - Hidden on checkout page */}
       {!isCheckoutPage && (
-        <header className="lg:hidden bg-white border-b border-[var(--color-border)] px-4 py-3 relative">
+        <header className="lg:hidden bg-white border-b border-[var(--color-border)] px-4 py-3 relative z-40">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <img
@@ -171,47 +213,63 @@ export default function App() {
             </div>
 
             {/* Profile Menu Button */}
-            <div className="relative" ref={profileMenuRef}>
-              <button
-                onClick={() => setIsProfileMenuOpen(!isProfileMenuOpen)}
-                className="w-8 h-8 rounded-full bg-[var(--color-primary-light)] text-[var(--color-primary)] flex items-center justify-center font-semibold text-sm"
-              >
-                {user?.name?.[0] || "U"}
-              </button>
-
-              {/* Dropdown Menu */}
-              {isProfileMenuOpen && (
-                <div className="absolute right-0 top-12 w-64 bg-white rounded-xl shadow-lg border border-[var(--color-border)] overflow-hidden z-50">
-                  {/* User Info */}
-                  <div className="p-4 bg-gray-50 border-b border-[var(--color-border)]">
-                    <p className="text-xs text-gray-500">로그인됨</p>
-                    <p className="text-sm font-semibold text-[var(--color-text)] mt-1">
-                      {user?.name}
-                    </p>
-                    <p className="text-xs text-gray-500 mt-0.5">
-                      {user?.role === "admin" ? "관리자" : "사용자"}
-                    </p>
-                  </div>
-
-                  {/* Logout Button */}
-                  <button
-                    onClick={() => {
-                      clearAuth();
-                      setIsProfileMenuOpen(false);
-                    }}
-                    className="w-full px-4 py-3 text-left text-sm font-medium text-red-600 hover:bg-red-50 transition-colors"
-                  >
-                    로그아웃
-                  </button>
-                </div>
+            <div className="flex items-center gap-2">
+              {shouldUseMobileHeaderChatbot && (
+                <button
+                  type="button"
+                  onClick={() => setIsChatbotOpen((prev) => !prev)}
+                  className="w-8 h-8 rounded-full bg-[var(--color-primary)] text-white flex items-center justify-center text-sm"
+                  aria-label={isChatbotOpen ? "챗봇 닫기" : "챗봇 열기"}
+                >
+                  {isChatbotOpen ? "✕" : "🤖"}
+                </button>
               )}
+
+              <div className="relative" ref={profileMenuRef}>
+                <button
+                  onClick={() => setIsProfileMenuOpen(!isProfileMenuOpen)}
+                  className="w-8 h-8 rounded-full bg-[var(--color-primary-light)] text-[var(--color-primary)] flex items-center justify-center font-semibold text-sm"
+                >
+                  {user?.name?.[0] || "U"}
+                </button>
+
+                {/* Dropdown Menu */}
+                {isProfileMenuOpen && (
+                  <div className="absolute right-0 top-12 w-64 bg-white rounded-xl shadow-lg border border-[var(--color-border)] overflow-hidden z-50">
+                    {/* User Info */}
+                    <div className="p-4 bg-gray-50 border-b border-[var(--color-border)]">
+                      <p className="text-xs text-gray-500">로그인됨</p>
+                      <p className="text-sm font-semibold text-[var(--color-text)] mt-1">
+                        {user?.name}
+                      </p>
+                      <p className="text-xs text-gray-500 mt-0.5">
+                        {user?.role === "admin" ? "관리자" : "사용자"}
+                      </p>
+                    </div>
+
+                    {/* Logout Button */}
+                    <button
+                      onClick={() => {
+                        clearAuth();
+                        setIsProfileMenuOpen(false);
+                      }}
+                      className="w-full px-4 py-3 text-left text-sm font-medium text-red-600 hover:bg-red-50 transition-colors"
+                    >
+                      로그아웃
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </header>
       )}
 
       {/* Main Content */}
-      <main className={`flex-1 overflow-auto ${isCheckoutPage ? 'pb-0 lg:pb-0' : 'pb-16 lg:pb-0'}`}>
+      <main
+        ref={mainRef}
+        className={`flex-1 overflow-auto ${isCheckoutPage ? 'pb-0 lg:pb-0' : 'pb-16 lg:pb-0'}`}
+      >
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/checkout" element={<CheckoutPage />} />
@@ -219,15 +277,16 @@ export default function App() {
           <Route path="/mypage" element={<MyPage />} />
           <Route path="/products" element={<ProductsPage />} />
           <Route path="/admin/purchases" element={<AdminPurchasesPage />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
 
       {/* Mobile Bottom Navigation - Only on mobile */}
-      <nav className="lg:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-[var(--color-border)] safe-area-pb">
-        <div className="grid grid-cols-4 h-16">
-          {NAV_ITEMS.map((item) => {
-            const isActive = pathname === item.path;
-            return (
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-[var(--color-border)] safe-area-pb z-40">
+        <div className="grid h-16" style={{ gridTemplateColumns: `repeat(${NAV_ITEMS.length}, minmax(0, 1fr))` }}>
+            {NAV_ITEMS.map((item) => {
+              const isActive = pathname === item.path;
+              return (
               <Link
                 key={item.path}
                 to={item.path}
@@ -249,11 +308,17 @@ export default function App() {
                 <span className="text-xs font-medium">{item.label}</span>
               </Link>
             );
-          })}
+            })}
         </div>
       </nav>
 
-      <ChatbotWidget />
+      {shouldRenderChatbot && (
+        <ChatbotWidget
+          open={isChatbotOpen}
+          onOpenChange={setIsChatbotOpen}
+          hideMobileTrigger={shouldUseMobileHeaderChatbot}
+        />
+      )}
     </div>
   );
 }

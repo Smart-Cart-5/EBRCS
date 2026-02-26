@@ -8,6 +8,7 @@ import {
   setROI,
   getHealth,
   getBilling,
+  cancelOcrPending,
 } from "../api/checkout";
 import BillingPanel from "../components/BillingPanel";
 import StatusMetrics from "../components/StatusMetrics";
@@ -101,6 +102,7 @@ export default function CheckoutPage() {
   const captureAnimRef = useRef<number>(0); // For capture/send loop
   const renderAnimRef = useRef<number>(0); // For render loop (60 FPS)
   const countFlashRef = useRef<number>(0); // count 이벤트 시 화면 플래시
+  const lastCountEventKeyRef = useRef<string | null>(null); // 중복 toast 방지
 
   // Refs mirroring store values for use inside renderFrame closure.
   // renderFrame is created once and runs continuously, so it captures stale
@@ -270,7 +272,15 @@ export default function CheckoutPage() {
 
   // Show toast + flash when count event fires from backend
   useEffect(() => {
-    if (!countEvent) return;
+    if (!countEvent) {
+      lastCountEventKeyRef.current = null;
+      return;
+    }
+
+    // Deduplicate: backend may send the same event across multiple frames
+    const eventKey = `${countEvent.action}|${countEvent.product}|${countEvent.quantity}|${countEvent.track_id}`;
+    if (eventKey === lastCountEventKeyRef.current) return;
+    lastCountEventKeyRef.current = eventKey;
 
     const isRemove = countEvent.action === "remove";
 
@@ -285,7 +295,7 @@ export default function CheckoutPage() {
 
     if (isRemove) {
       toast(`🔴 ${countEvent.product} ${qtyText}`, {
-        duration: 2500,
+        duration: 1000,
         position: "top-center",
         style: {
           background: "#ef4444",
@@ -297,7 +307,7 @@ export default function CheckoutPage() {
     } else {
       toast.success(`🟢 ${countEvent.product} ${qtyText}`, {
         icon: "🛒",
-        duration: 2500,
+        duration: 1000,
         position: "top-center",
         style: {
           background: "#22c55e",
@@ -721,6 +731,15 @@ export default function CheckoutPage() {
     void startCamera(deviceId);
   }, [connected, startCamera, stopCamera]);
 
+  const handleCancelOcrPending = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      await cancelOcrPending(sessionId);
+    } catch (error) {
+      console.warn("Failed to cancel OCR pending:", error);
+    }
+  }, [sessionId]);
+
   // --- Upload mode ---
   const handleUpload = useCallback(
     async (file: File) => {
@@ -887,7 +906,15 @@ export default function CheckoutPage() {
                 {/* OCR Pending Modal — 컵밥 정밀 인식 대기 */}
                 {ocrPending && (
                   <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/50">
-                    <div className="bg-white rounded-2xl p-6 mx-4 w-full max-w-sm shadow-2xl text-center space-y-4">
+                    <div className="relative bg-white rounded-2xl p-6 mx-4 w-full max-w-sm shadow-2xl text-center space-y-4">
+                      <button
+                        onClick={() => void handleCancelOcrPending()}
+                        className="absolute top-3 right-3 w-8 h-8 rounded-full border border-gray-200 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+                        aria-label="OCR 인식 취소"
+                        title="OCR 인식 취소"
+                      >
+                        ×
+                      </button>
                       <div className="text-4xl">🔍</div>
                       <h3 className="font-bold text-gray-900 text-base">
                         상품 인식이 잘 안됐어요

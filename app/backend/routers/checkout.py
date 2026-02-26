@@ -395,3 +395,38 @@ async def video_status_sse(session_id: str, task_id: str):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/sessions/{session_id}/ocr-cancel")
+async def cancel_ocr_pending(session_id: str):
+    """Cancel OCR pending state for a session (manual user cancel)."""
+    session = app_state.session_manager.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    state = session.state
+    if state.get("ocr_state") != "ocr_pending":
+        return {"status": "noop", "ocr_pending": False}
+
+    pending_label = str(state.get("ocr_pending_base_label") or "")
+    pending_tid = state.get("ocr_pending_track_id")
+
+    state["ocr_state"] = "normal"
+    state["ocr_pending_action"] = None
+    state["ocr_pending_track_id"] = None
+    state["ocr_pending_base_label"] = ""
+    state["ocr_pending_since_frame"] = -1
+    state["ocr_pending_since_time"] = 0.0
+    state["count_event"] = None
+
+    # Release cooldown/track lock so user can retry immediately.
+    state.setdefault("last_action_map", {}).pop(pending_label, None)
+    counted_tracks = state.setdefault("counted_tracks", {})
+    if pending_tid is not None:
+        counted_tracks.pop(pending_tid, None)
+        try:
+            counted_tracks.pop(int(pending_tid), None)
+        except (TypeError, ValueError):
+            pass
+
+    return {"status": "cancelled", "ocr_pending": False}

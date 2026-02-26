@@ -110,13 +110,29 @@ export default function HomePage() {
 
     return (
       <div className="p-4 md:p-6 lg:p-8 max-w-7xl mx-auto space-y-6">
-        <div>
-          <h1 className="text-3xl font-bold text-[var(--color-text)] mb-1">
-            관리자 대시보드
-          </h1>
-          <p className="text-sm md:text-base text-[var(--color-text-secondary)]">
-            매출/주문 추이와 고객 구매 패턴을 한눈에 확인하세요
-          </p>
+        <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+          <div>
+            <h1 className="text-3xl font-bold text-[var(--color-text)] mb-1">
+              관리자 대시보드
+            </h1>
+            <p className="text-sm md:text-base text-[var(--color-text-secondary)]">
+              매출/주문 추이와 고객 구매 패턴을 한눈에 확인하세요
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Link
+              to="/products"
+              className="inline-flex items-center rounded-lg border border-[var(--color-border)] bg-white px-3 py-2 text-sm font-medium text-[var(--color-text)] hover:bg-[var(--color-bg-muted)]"
+            >
+              상품 관리
+            </Link>
+            <Link
+              to="/admin/purchases"
+              className="inline-flex items-center rounded-lg border border-[var(--color-border)] bg-white px-3 py-2 text-sm font-medium text-[var(--color-text)] hover:bg-[var(--color-bg-muted)]"
+            >
+              구매 내역
+            </Link>
+          </div>
         </div>
 
         {isLoading ? (
@@ -125,8 +141,8 @@ export default function HomePage() {
           </div>
         ) : stats ? (
           <>
-            <div className="bg-white rounded-2xl p-5 md:p-6 border border-[var(--color-border)] shadow-sm">
-              <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+            <div className="relative bg-white rounded-2xl p-5 md:p-6 border border-[var(--color-border)] shadow-sm">
+              <div className="relative z-10 flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
                 <div>
                   <h2 className="text-xl md:text-2xl font-bold text-[var(--color-text)]">
                     최근 {periodDays}일 매출/주문 추이

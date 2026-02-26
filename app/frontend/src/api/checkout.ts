@@ -75,6 +75,12 @@ export function videoStatusUrl(sessionId: string, taskId: string) {
   return `/api/sessions/${sessionId}/video-status?task_id=${encodeURIComponent(taskId)}`;
 }
 
+export function cancelOcrPending(sessionId: string): Promise<{ status: string; ocr_pending: boolean }> {
+  return request(`/sessions/${sessionId}/ocr-cancel`, {
+    method: "POST",
+  });
+}
+
 export function getHealth(): Promise<{ status: string; device: string; lora_loaded: boolean; index_vectors: number; active_sessions: number }> {
   return request("/health");
 }

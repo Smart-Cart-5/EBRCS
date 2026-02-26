@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { addProduct, deleteProduct, listProducts } from "../api/products";
+import { addProduct, deleteProduct, getProductDetail, listProducts, updateProductDetail } from "../api/products";
 
 const MIN_IMAGES = 3;
 const RECOMMENDED_MAX_IMAGES = 5;
@@ -29,6 +29,16 @@ export default function ProductsPage() {
     itemNo: string;
     name: string;
   } | null>(null);
+  const [selectedItemNo, setSelectedItemNo] = useState<string | null>(null);
+  const [detailForm, setDetailForm] = useState<{
+    product_name: string;
+    barcd: string;
+    price: string;
+    stock: string;
+    is_discounted: boolean;
+    discount_rate: string;
+    discount_amount: string;
+  } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -43,6 +53,12 @@ export default function ProductsPage() {
     hasValidPrice &&
     images.length >= MIN_IMAGES &&
     images.length <= STABLE_MAX_IMAGES;
+  const formatRateInput = (value: number): string =>
+    value.toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+  const toDiscountedPrice = (price: number, rate: number): number =>
+    Math.max(0, Math.round(price * (1 - rate / 100)));
+  const toDiscountRate = (price: number, discountedPrice: number): number =>
+    Math.max(0, Math.min(100, (1 - discountedPrice / price) * 100));
 
   const { data, isLoading } = useQuery({
     queryKey: ["products"],
@@ -75,6 +91,67 @@ export default function ProductsPage() {
     mutationFn: (itemNoValue: string) => deleteProduct(itemNoValue),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["products"] });
+    },
+  });
+
+  const { data: detail, isLoading: isDetailLoading, isError: isDetailError } = useQuery({
+    queryKey: ["product-detail", selectedItemNo],
+    queryFn: () => getProductDetail(selectedItemNo!),
+    enabled: !!selectedItemNo,
+  });
+
+  const updateDetailMutation = useMutation({
+    mutationFn: () => {
+      if (!selectedItemNo || !detailForm) {
+        throw new Error("수정할 상품이 선택되지 않았습니다.");
+      }
+
+      const payload: {
+        product_name?: string;
+        barcd?: string | null;
+        price?: number;
+        stock?: number;
+        is_discounted?: boolean;
+        discount_rate?: number;
+        discount_amount?: number;
+      } = {};
+
+      const trimmedName = detailForm.product_name.trim();
+      if (trimmedName.length > 0) {
+        payload.product_name = trimmedName;
+      }
+
+      payload.barcd = detailForm.barcd.trim() || null;
+
+      const priceValue = Number(detailForm.price);
+      if (Number.isFinite(priceValue) && priceValue > 0) {
+        payload.price = Math.trunc(priceValue);
+      }
+
+      if (detail?.available_fields.stock) {
+        const stockValue = Number(detailForm.stock);
+        if (Number.isFinite(stockValue) && stockValue >= 0) {
+          payload.stock = Math.trunc(stockValue);
+        }
+      }
+
+      if (detail?.available_fields.discount) {
+        payload.is_discounted = detailForm.is_discounted;
+        const rateValue = Number(detailForm.discount_rate);
+        if (Number.isFinite(rateValue) && rateValue >= 0) {
+          payload.discount_rate = rateValue;
+        }
+        const amountValue = Number(detailForm.discount_amount);
+        if (Number.isFinite(amountValue) && amountValue >= 0) {
+          payload.discount_amount = Math.trunc(amountValue);
+        }
+      }
+
+      return updateProductDetail(selectedItemNo, payload);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["products"] });
+      queryClient.invalidateQueries({ queryKey: ["product-detail", selectedItemNo] });
     },
   });
 
@@ -213,6 +290,19 @@ export default function ProductsPage() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDeviceId]);
+
+  useEffect(() => {
+    if (!detail) return;
+    setDetailForm({
+      product_name: detail.product_name || "",
+      barcd: detail.barcd || "",
+      price: detail.price != null ? String(detail.price) : "",
+      stock: detail.stock != null ? String(detail.stock) : "",
+      is_discounted: detail.is_discounted ?? false,
+      discount_rate: detail.discount_rate != null ? String(detail.discount_rate) : "",
+      discount_amount: detail.discount_amount != null ? String(detail.discount_amount) : "",
+    });
+  }, [detail]);
 
   return (
     <div className="max-w-5xl mx-auto space-y-6">
@@ -425,13 +515,16 @@ export default function ProductsPage() {
                 className="py-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between text-sm"
               >
                 <div>
-                  <p className="font-medium">{p.name}</p>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedItemNo(p.item_no)}
+                    className="font-medium hover:underline text-left"
+                  >
+                    {p.name}
+                  </button>
                   <p className="text-xs text-[var(--color-text-muted)]">상품번호: {p.item_no}</p>
                 </div>
                 <div className="flex items-center gap-3">
-                  <span className="text-[var(--color-text-muted)]">
-                    {p.embedding_count} embeddings
-                  </span>
                   <button
                     className="px-2 py-1 rounded bg-[var(--color-danger)] text-white text-xs"
                     onClick={() => setConfirmDelete({ itemNo: p.item_no, name: p.name })}
@@ -444,12 +537,233 @@ export default function ProductsPage() {
             ))}
           </ul>
         )}
-        {data && (
-          <p className="text-xs text-[var(--color-text-muted)] mt-3">
-            Total embeddings: {data.total_embeddings}
-          </p>
-        )}
       </div>
+
+      {selectedItemNo && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center px-4">
+          <div
+            className="absolute inset-0 bg-black/40"
+            onClick={() => {
+              if (!updateDetailMutation.isPending) {
+                setSelectedItemNo(null);
+                setDetailForm(null);
+              }
+            }}
+          />
+          <div className="relative w-full max-w-lg rounded-xl bg-white border border-[var(--color-border)] p-6 shadow-xl">
+            <div className="flex items-start justify-between gap-3 mb-4">
+              <div>
+                <h4 className="text-lg font-semibold">상품 상세 수정</h4>
+                <p className="text-xs text-[var(--color-text-secondary)] mt-1">
+                  상품번호: {selectedItemNo}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="px-2 py-1 text-sm rounded border border-[var(--color-border)]"
+                onClick={() => {
+                  if (!updateDetailMutation.isPending) {
+                    setSelectedItemNo(null);
+                    setDetailForm(null);
+                  }
+                }}
+              >
+                닫기
+              </button>
+            </div>
+
+            {isDetailLoading ? (
+              <p className="text-sm text-[var(--color-text-muted)] py-8 text-center">로딩 중...</p>
+            ) : isDetailError || !detail || !detailForm ? (
+              <p className="text-sm text-[var(--color-danger)] py-8 text-center">
+                상품 상세 정보를 불러오지 못했습니다.
+              </p>
+            ) : (
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs font-medium mb-1">상품명</label>
+                  <input
+                    type="text"
+                    value={detailForm.product_name}
+                    onChange={(e) => setDetailForm((prev) => (prev ? { ...prev, product_name: e.target.value } : prev))}
+                    className="w-full px-3 py-2 border border-[var(--color-border)] rounded-lg text-sm"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium mb-1">바코드</label>
+                  <input
+                    type="text"
+                    value={detailForm.barcd}
+                    onChange={(e) => setDetailForm((prev) => (prev ? { ...prev, barcd: e.target.value } : prev))}
+                    className="w-full px-3 py-2 border border-[var(--color-border)] rounded-lg text-sm"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium mb-1">가격</label>
+                    <input
+                      type="number"
+                      min={1}
+                      value={detailForm.price}
+                      onChange={(e) =>
+                        setDetailForm((prev) => {
+                          if (!prev) return prev;
+                          const nextPrice = e.target.value;
+                          const next = { ...prev, price: nextPrice };
+                          const priceValue = Number(nextPrice);
+                          const rateValue = Number(prev.discount_rate);
+                          if (
+                            Number.isFinite(priceValue) &&
+                            priceValue > 0 &&
+                            Number.isFinite(rateValue) &&
+                            rateValue >= 0
+                          ) {
+                            next.discount_amount = String(toDiscountedPrice(priceValue, rateValue));
+                          }
+                          return next;
+                        })
+                      }
+                      className="w-full px-3 py-2 border border-[var(--color-border)] rounded-lg text-sm"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium mb-1">
+                      재고{detail.available_fields.stock ? "" : " (DB 컬럼 없음)"}
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={detailForm.stock}
+                      disabled={!detail.available_fields.stock}
+                      onChange={(e) => setDetailForm((prev) => (prev ? { ...prev, stock: e.target.value } : prev))}
+                      className="w-full px-3 py-2 border border-[var(--color-border)] rounded-lg text-sm disabled:bg-gray-100 disabled:text-gray-400"
+                    />
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-[var(--color-border)] p-3 space-y-3">
+                  <p className="text-xs font-semibold">
+                    할인 정보{detail.available_fields.discount ? "" : " (DB 테이블 없음)"}
+                  </p>
+                  <label className="inline-flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={detailForm.is_discounted}
+                      disabled={!detail.available_fields.discount}
+                      onChange={(e) =>
+                        setDetailForm((prev) => (prev ? { ...prev, is_discounted: e.target.checked } : prev))
+                      }
+                    />
+                    할인 적용
+                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium mb-1">할인율(%)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        value={detailForm.discount_rate}
+                        disabled={!detail.available_fields.discount}
+                        onChange={(e) =>
+                          setDetailForm((prev) => {
+                            if (!prev) return prev;
+                            const nextRate = e.target.value;
+                            const next = { ...prev, discount_rate: nextRate };
+                            const priceValue = Number(prev.price);
+                            const rateValue = Number(nextRate);
+                            if (
+                              Number.isFinite(priceValue) &&
+                              priceValue > 0 &&
+                              Number.isFinite(rateValue) &&
+                              rateValue >= 0
+                            ) {
+                              next.discount_amount = String(toDiscountedPrice(priceValue, rateValue));
+                            } else if (nextRate.trim() === "") {
+                              next.discount_amount = "";
+                            }
+                            return next;
+                          })
+                        }
+                        className="w-full px-3 py-2 border border-[var(--color-border)] rounded-lg text-sm disabled:bg-gray-100 disabled:text-gray-400"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium mb-1">할인금액(원)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={detailForm.discount_amount}
+                        disabled={!detail.available_fields.discount}
+                        onChange={(e) =>
+                          setDetailForm((prev) => {
+                            if (!prev) return prev;
+                            const nextAmount = e.target.value;
+                            const next = { ...prev, discount_amount: nextAmount };
+                            const priceValue = Number(prev.price);
+                            const amountValue = Number(nextAmount);
+                            if (
+                              Number.isFinite(priceValue) &&
+                              priceValue > 0 &&
+                              Number.isFinite(amountValue) &&
+                              amountValue >= 0
+                            ) {
+                              next.discount_rate = formatRateInput(toDiscountRate(priceValue, amountValue));
+                            } else if (nextAmount.trim() === "") {
+                              next.discount_rate = "";
+                            }
+                            return next;
+                          })
+                        }
+                        className="w-full px-3 py-2 border border-[var(--color-border)] rounded-lg text-sm disabled:bg-gray-100 disabled:text-gray-400"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {updateDetailMutation.isError && (
+                  <p className="text-sm text-[var(--color-danger)]">
+                    {(updateDetailMutation.error as Error).message}
+                  </p>
+                )}
+
+                {updateDetailMutation.isSuccess && (
+                  <p className="text-sm text-[var(--color-success)]">
+                    상품 정보가 저장되었습니다.
+                  </p>
+                )}
+
+                <div className="flex justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!updateDetailMutation.isPending) {
+                        setSelectedItemNo(null);
+                        setDetailForm(null);
+                      }
+                    }}
+                    className="px-3 py-2 rounded-lg text-sm border border-[var(--color-border)] disabled:opacity-50"
+                    disabled={updateDetailMutation.isPending}
+                  >
+                    취소
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => updateDetailMutation.mutate()}
+                    className="px-3 py-2 rounded-lg text-sm bg-[var(--color-primary)] text-white disabled:opacity-50"
+                    disabled={updateDetailMutation.isPending}
+                  >
+                    {updateDetailMutation.isPending ? "저장 중..." : "저장"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {confirmDelete && (
         <div className="fixed inset-0 z-50 flex items-center justify-center px-4">
