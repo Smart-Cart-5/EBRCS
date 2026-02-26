@@ -1,11 +1,12 @@
-"""Chatbot router – LLM-powered cart assistant using products/product_prices DB.
+"""Chatbot router – LLM-powered shopping assistant using catalog DB tables.
 
 Uses HuggingFace Router API (OpenAI-compatible) for natural-language answers.
-Pulls price data from the same products + product_prices tables used by billing.
+Pulls cart data plus catalog metadata from products/product_prices/product_discounts.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -434,6 +435,495 @@ def _totals(products: list[ProductMeta]) -> dict[str, Any]:
     }
 
 
+_CATALOG_STOPWORDS = {
+    "상품",
+    "정보",
+    "알려줘",
+    "알려",
+    "보여줘",
+    "보여",
+    "뭐야",
+    "뭐",
+    "어떤",
+    "있는",
+    "대해",
+    "가격",
+    "할인",
+    "할인율",
+    "장바구니",
+    "그리고",
+    "또",
+    "좀",
+    "해줘",
+    "주세요",
+}
+_DISCOUNT_QUERY_TOKENS = ("할인", "세일", "할인율", "할인가")
+_PRICE_QUERY_TOKENS = ("가격", "비싼", "저렴", "최고가", "최저가", "금액", "얼마")
+_MAX_CATALOG_MATCH_ROWS = 8
+
+
+def _compact_prompt_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, bool)):
+        return value
+    text_value = str(value).strip()
+    if not text_value:
+        return None
+    if len(text_value) > 180:
+        return f"{text_value[:177]}..."
+    return text_value
+
+
+def _json_for_prompt(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str, indent=2)
+    except Exception:
+        return str(value)
+
+
+def _table_columns(db: Session, table_name: str) -> list[str]:
+    try:
+        db_inspector = inspect(db.get_bind())
+        raw_columns = db_inspector.get_columns(table_name)
+    except Exception:
+        return []
+
+    valid: list[str] = []
+    for col in raw_columns:
+        name = str(col.get("name") or "").strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            valid.append(name)
+    return valid
+
+
+def _extract_catalog_terms(question: str, limit: int = 4) -> list[str]:
+    tokens = re.findall(r"[0-9]{3,}|[A-Za-z]{2,}|[가-힣]{2,}", question or "")
+    terms: list[str] = []
+    seen: set[str] = set()
+    for raw in tokens:
+        token = raw.strip()
+        if not token:
+            continue
+        normalized = token.lower()
+        if normalized in _CATALOG_STOPWORDS:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        terms.append(token)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _query_catalog_products(
+    db: Session,
+    question: str,
+    product_columns: list[str],
+    limit: int = _MAX_CATALOG_MATCH_ROWS,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if not product_columns:
+        return [], []
+
+    terms = _extract_catalog_terms(question)
+    safe_limit = max(1, min(limit, 20))
+
+    preferred = [
+        "item_no",
+        "product_name",
+        "barcd",
+        "category_l",
+        "category_m",
+        "category_s",
+        "category",
+        "brand",
+        "manufacturer",
+        "maker",
+        "origin",
+        "description",
+        "desc",
+        "spec",
+        "specification",
+        "unit",
+    ]
+    searchable = [col for col in preferred if col in product_columns]
+    if not searchable:
+        searchable = [
+            col
+            for col in product_columns
+            if any(
+                key in col.lower()
+                for key in ("name", "item", "bar", "category", "brand", "maker", "origin", "desc", "spec", "unit")
+            )
+        ]
+    if not searchable:
+        searchable = [product_columns[0]]
+
+    params: dict[str, Any] = {}
+    groups: list[str] = []
+    for idx, term in enumerate(terms):
+        like_key = f"kw_{idx}"
+        params[like_key] = f"%{term}%"
+        clauses = [f"p.`{col}` LIKE :{like_key}" for col in searchable]
+        if term.isdigit() and "item_no" in product_columns:
+            exact_key = f"item_no_{idx}"
+            clauses.append(f"p.`item_no` = :{exact_key}")
+            params[exact_key] = term
+        groups.append("(" + " OR ".join(clauses) + ")")
+
+    where_sql = f"WHERE {' AND '.join(groups)}" if groups else ""
+    order_parts: list[str] = []
+    for col in ("updated_at", "created_at", "id"):
+        if col in product_columns:
+            order_parts.append(f"p.`{col}` DESC")
+    if not order_parts:
+        order_parts.append(f"p.`{product_columns[0]}` DESC")
+
+    params["limit"] = safe_limit * 2 if "item_no" in product_columns else safe_limit
+    sql = (
+        "SELECT p.* "
+        "FROM products p "
+        f"{where_sql} "
+        f"ORDER BY {', '.join(order_parts)} "
+        "LIMIT :limit"
+    )
+
+    try:
+        rows = db.execute(text(sql), params).mappings().all()
+    except SQLAlchemyError:
+        return [], terms
+
+    normalized_rows = [dict(row) for row in rows]
+    if "item_no" not in product_columns:
+        return normalized_rows[:safe_limit], terms
+
+    deduped: list[dict[str, Any]] = []
+    seen_item_nos: set[str] = set()
+    for row in normalized_rows:
+        item_no = str(row.get("item_no") or "").strip()
+        key = item_no if item_no else str(row.get("id") or "")
+        if not key or key in seen_item_nos:
+            continue
+        seen_item_nos.add(key)
+        deduped.append(row)
+        if len(deduped) >= safe_limit:
+            break
+
+    return deduped, terms
+
+
+def _latest_price_row(
+    db: Session,
+    product_id: int,
+    price_columns: list[str],
+) -> dict[str, Any]:
+    if not price_columns:
+        return {}
+    if "product_id" not in price_columns or "price" not in price_columns:
+        return {}
+
+    select_cols = [
+        col for col in ("id", "price", "currency", "source", "checked_at", "created_at")
+        if col in price_columns
+    ]
+    if "price" not in select_cols:
+        return {}
+
+    order_cols = [col for col in ("checked_at", "created_at", "id") if col in price_columns]
+    if not order_cols:
+        order_cols = ["price"]
+
+    sql = (
+        f"SELECT {', '.join(f'`{col}`' for col in select_cols)} "
+        "FROM product_prices "
+        "WHERE `product_id` = :pid "
+        f"ORDER BY {', '.join(f'`{col}` DESC' for col in order_cols)} "
+        "LIMIT 1"
+    )
+    row = db.execute(text(sql), {"pid": int(product_id)}).mappings().first()
+    return dict(row) if row else {}
+
+
+def _latest_discount_row(
+    db: Session,
+    product_price_id: int,
+    discount_columns: list[str],
+) -> dict[str, Any]:
+    if not discount_columns:
+        return {}
+    if "product_price_id" not in discount_columns:
+        return {}
+    if (
+        "is_discounted" not in discount_columns
+        and "discount_rate" not in discount_columns
+        and "discount_amount" not in discount_columns
+    ):
+        return {}
+
+    select_cols = [
+        col
+        for col in ("id", "is_discounted", "discount_rate", "discount_amount", "started_at", "ended_at", "updated_at", "created_at")
+        if col in discount_columns
+    ]
+    order_cols = [col for col in ("updated_at", "created_at", "id") if col in discount_columns]
+    if not order_cols:
+        order_cols = [select_cols[0]]
+
+    sql = (
+        f"SELECT {', '.join(f'`{col}`' for col in select_cols)} "
+        "FROM product_discounts "
+        "WHERE `product_price_id` = :ppid "
+        f"ORDER BY {', '.join(f'`{col}` DESC' for col in order_cols)} "
+        "LIMIT 1"
+    )
+    row = db.execute(text(sql), {"ppid": int(product_price_id)}).mappings().first()
+    return dict(row) if row else {}
+
+
+def _catalog_summary(
+    db: Session,
+    product_columns: list[str],
+    discount_columns: list[str],
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    if not product_columns:
+        return summary
+
+    try:
+        if "item_no" in product_columns:
+            total_products = db.execute(
+                text("SELECT COUNT(DISTINCT `item_no`) AS cnt FROM products")
+            ).mappings().first()
+        else:
+            total_products = db.execute(
+                text("SELECT COUNT(*) AS cnt FROM products")
+            ).mappings().first()
+        summary["total_products"] = int(total_products["cnt"]) if total_products else 0
+    except SQLAlchemyError:
+        pass
+
+    for category_col in ("category_l", "category_m", "category_s", "category"):
+        if category_col not in product_columns:
+            continue
+        try:
+            category_row = db.execute(
+                text(
+                    f"SELECT COUNT(DISTINCT `{category_col}`) AS cnt "
+                    "FROM products "
+                    f"WHERE `{category_col}` IS NOT NULL AND TRIM(`{category_col}`) <> ''"
+                )
+            ).mappings().first()
+            summary[f"{category_col}_count"] = int(category_row["cnt"]) if category_row else 0
+        except SQLAlchemyError:
+            continue
+
+    if "is_discounted" in discount_columns:
+        try:
+            discount_row = db.execute(
+                text(
+                    "SELECT COUNT(*) AS cnt "
+                    "FROM product_discounts "
+                    "WHERE `is_discounted` = 1"
+                )
+            ).mappings().first()
+            summary["discount_rows"] = int(discount_row["cnt"]) if discount_row else 0
+        except SQLAlchemyError:
+            pass
+
+    return summary
+
+
+def _discount_snapshot(
+    db: Session,
+    question: str,
+    product_columns: list[str],
+    price_columns: list[str],
+    discount_columns: list[str],
+) -> list[dict[str, Any]]:
+    if not any(token in question for token in _DISCOUNT_QUERY_TOKENS):
+        return []
+    required = {"id", "item_no", "product_name"}
+    if not required.issubset(set(product_columns)):
+        return []
+    if not {"id", "product_id"}.issubset(set(price_columns)):
+        return []
+    if "product_price_id" not in discount_columns:
+        return []
+
+    select_cols = ["p.`item_no` AS item_no", "p.`product_name` AS product_name"]
+    if "discount_rate" in discount_columns:
+        select_cols.append("pd.`discount_rate` AS discount_rate")
+    if "discount_amount" in discount_columns:
+        select_cols.append("pd.`discount_amount` AS discount_amount")
+    if "is_discounted" in discount_columns:
+        where_clause = "WHERE pd.`is_discounted` = 1"
+    else:
+        where_clause = ""
+
+    order_terms: list[str] = []
+    if "discount_rate" in discount_columns:
+        order_terms.append("COALESCE(pd.`discount_rate`, 0) DESC")
+    if "discount_amount" in discount_columns:
+        order_terms.append("COALESCE(pd.`discount_amount`, 0) DESC")
+    order_terms.append("p.`id` DESC")
+
+    sql = (
+        f"SELECT {', '.join(select_cols)} "
+        "FROM products p "
+        "JOIN product_prices pp ON pp.`product_id` = p.`id` "
+        "JOIN product_discounts pd ON pd.`product_price_id` = pp.`id` "
+        f"{where_clause} "
+        f"ORDER BY {', '.join(order_terms)} "
+        "LIMIT :limit"
+    )
+    try:
+        rows = db.execute(text(sql), {"limit": 8}).mappings().all()
+    except SQLAlchemyError:
+        return []
+
+    deduped: list[dict[str, Any]] = []
+    seen_item_nos: set[str] = set()
+    for row in rows:
+        item_no = str(row.get("item_no") or "").strip()
+        if item_no and item_no in seen_item_nos:
+            continue
+        if item_no:
+            seen_item_nos.add(item_no)
+        compact = {
+            key: _compact_prompt_value(value)
+            for key, value in dict(row).items()
+            if _compact_prompt_value(value) is not None
+        }
+        if compact:
+            deduped.append(compact)
+    return deduped[:5]
+
+
+def _price_snapshot(
+    db: Session,
+    question: str,
+    product_columns: list[str],
+    price_columns: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    if not any(token in question for token in _PRICE_QUERY_TOKENS):
+        return {}
+    required_product_cols = {"id", "item_no", "product_name"}
+    if not required_product_cols.issubset(set(product_columns)):
+        return {}
+    if not {"product_id", "price"}.issubset(set(price_columns)):
+        return {}
+
+    select_cols = ["p.`item_no` AS item_no", "p.`product_name` AS product_name", "pp.`price` AS price"]
+    if "currency" in price_columns:
+        select_cols.append("pp.`currency` AS currency")
+
+    def _fetch(order: str) -> list[dict[str, Any]]:
+        sql = (
+            f"SELECT {', '.join(select_cols)} "
+            "FROM products p "
+            "JOIN product_prices pp ON pp.`product_id` = p.`id` "
+            f"ORDER BY pp.`price` {order}, p.`id` DESC "
+            "LIMIT :limit"
+        )
+        try:
+            rows = db.execute(text(sql), {"limit": 8}).mappings().all()
+        except SQLAlchemyError:
+            return []
+
+        deduped: list[dict[str, Any]] = []
+        seen_item_nos: set[str] = set()
+        for row in rows:
+            item_no = str(row.get("item_no") or "").strip()
+            if item_no and item_no in seen_item_nos:
+                continue
+            if item_no:
+                seen_item_nos.add(item_no)
+            compact = {
+                key: _compact_prompt_value(value)
+                for key, value in dict(row).items()
+                if _compact_prompt_value(value) is not None
+            }
+            if compact:
+                deduped.append(compact)
+        return deduped[:5]
+
+    expensive = _fetch("DESC")
+    cheap = _fetch("ASC")
+    result: dict[str, list[dict[str, Any]]] = {}
+    if expensive:
+        result["expensive_top5"] = expensive
+    if cheap:
+        result["cheap_top5"] = cheap
+    return result
+
+
+def _build_catalog_context(db: Session, question: str) -> dict[str, Any]:
+    product_columns = _table_columns(db, "products")
+    if not product_columns:
+        return {"available": False}
+
+    price_columns = _table_columns(db, "product_prices")
+    discount_columns = _table_columns(db, "product_discounts")
+
+    product_rows, terms = _query_catalog_products(db, question, product_columns, _MAX_CATALOG_MATCH_ROWS)
+    matched_rows: list[dict[str, Any]] = []
+
+    for row in product_rows:
+        compact_row: dict[str, Any] = {}
+        for col in product_columns:
+            value = _compact_prompt_value(row.get(col))
+            if value is not None:
+                compact_row[col] = value
+
+        product_id = row.get("id")
+        if product_id is not None and price_columns:
+            try:
+                price_row = _latest_price_row(db, int(product_id), price_columns)
+            except SQLAlchemyError:
+                price_row = {}
+            if price_row:
+                compact_row["latest_price"] = _compact_prompt_value(price_row.get("price"))
+                compact_row["latest_currency"] = _compact_prompt_value(price_row.get("currency"))
+                compact_row["latest_price_source"] = _compact_prompt_value(price_row.get("source"))
+                compact_row["latest_price_checked_at"] = _compact_prompt_value(price_row.get("checked_at"))
+
+                if discount_columns and price_row.get("id") is not None:
+                    try:
+                        discount_row = _latest_discount_row(db, int(price_row["id"]), discount_columns)
+                    except SQLAlchemyError:
+                        discount_row = {}
+                    if discount_row:
+                        compact_row["is_discounted"] = _compact_prompt_value(discount_row.get("is_discounted"))
+                        compact_row["discount_rate"] = _compact_prompt_value(discount_row.get("discount_rate"))
+                        compact_row["discount_amount"] = _compact_prompt_value(discount_row.get("discount_amount"))
+                        compact_row["discount_updated_at"] = _compact_prompt_value(discount_row.get("updated_at"))
+
+        matched_rows.append({k: v for k, v in compact_row.items() if v is not None})
+
+    context: dict[str, Any] = {
+        "available": True,
+        "schema": {
+            "products": product_columns,
+            "product_prices": price_columns,
+            "product_discounts": discount_columns,
+        },
+        "summary": _catalog_summary(db, product_columns, discount_columns),
+        "search_terms": terms,
+        "matched_products": matched_rows[:_MAX_CATALOG_MATCH_ROWS],
+    }
+
+    discount_rows = _discount_snapshot(db, question, product_columns, price_columns, discount_columns)
+    if discount_rows:
+        context["discount_snapshot"] = discount_rows
+
+    price_rows = _price_snapshot(db, question, product_columns, price_columns)
+    if price_rows:
+        context["price_snapshot"] = price_rows
+
+    return context
+
+
 # ---------------------------------------------------------------------------
 # LLM answer generator
 # ---------------------------------------------------------------------------
@@ -442,6 +932,7 @@ def _answer_question(
     question: str,
     products: list[ProductMeta],
     total: dict[str, Any],
+    catalog_context: dict[str, Any] | None = None,
 ) -> str:
     q = question.strip()
     if not q:
@@ -465,14 +956,42 @@ def _answer_question(
         f"가격 미등록: {unpriced_text}"
     )
 
+    catalog_schema_text = "카탈로그 스키마 정보 없음"
+    catalog_summary_text = "카탈로그 요약 정보 없음"
+    catalog_matches_text = "질문 관련 카탈로그 데이터 없음"
+    catalog_discount_text = "할인 스냅샷 없음"
+    catalog_price_text = "가격 스냅샷 없음"
+
+    if catalog_context and catalog_context.get("available"):
+        catalog_schema_text = _json_for_prompt(catalog_context.get("schema") or {})
+        catalog_summary_text = _json_for_prompt(catalog_context.get("summary") or {})
+        catalog_matches_text = _json_for_prompt(catalog_context.get("matched_products") or [])
+        catalog_discount_text = _json_for_prompt(catalog_context.get("discount_snapshot") or [])
+        catalog_price_text = _json_for_prompt(catalog_context.get("price_snapshot") or {})
+
     prompt = f"""
-아래는 사용자의 장바구니 상품 목록과 가격 정보입니다.
+아래는 사용자의 장바구니 정보와 카탈로그 DB 스냅샷입니다.
 
 상품 목록:
 {cart_text}
 
 합계:
 {total_text}
+
+카탈로그 스키마:
+{catalog_schema_text}
+
+카탈로그 요약:
+{catalog_summary_text}
+
+질문 관련 카탈로그 데이터:
+{catalog_matches_text}
+
+할인 스냅샷:
+{catalog_discount_text}
+
+가격 스냅샷:
+{catalog_price_text}
 
 사용자 질문:
 {q}
@@ -481,6 +1000,8 @@ def _answer_question(
 - 가격이 미등록인 상품에 대해서는 '가격 정보가 DB에 아직 등록되지 않았습니다'라고 안내하세요.
 - 상품 목록에 없는 제품을 물어보면 '장바구니에 해당 상품이 없습니다'라고 안내하세요.
 - 장바구니가 비어있으면 '현재 장바구니가 비어있습니다. 상품을 담아주세요.'라고 안내하세요.
+- 질문이 장바구니가 아닌 카탈로그(DB) 정보 관련이면 카탈로그 데이터 기준으로 답변하세요.
+- 카탈로그 데이터에서 확인되지 않는 내용은 '현재 DB에서 확인되지 않습니다'라고 명확히 말하세요.
 """
 
     # --- HuggingFace Router API (OpenAI-compatible) ---
@@ -780,7 +1301,8 @@ async def query_chatbot(req: ChatbotRequest, db: Session = Depends(get_db)):
             f"현재 총 수량은 {total['total_count']}개이고 총 금액은 {total['total_price']:,}원입니다."
         )
     else:
-        answer = _answer_question(req.question, products, total)
+        catalog_context = _build_catalog_context(db, req.question)
+        answer = _answer_question(req.question, products, total, catalog_context)
 
     return {
         "answer": answer,

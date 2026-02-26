@@ -101,6 +101,7 @@ export default function CheckoutPage() {
   const captureAnimRef = useRef<number>(0); // For capture/send loop
   const renderAnimRef = useRef<number>(0); // For render loop (60 FPS)
   const countFlashRef = useRef<number>(0); // count 이벤트 시 화면 플래시
+  const lastCountEventKeyRef = useRef<string | null>(null); // 중복 toast 방지
 
   // Refs mirroring store values for use inside renderFrame closure.
   // renderFrame is created once and runs continuously, so it captures stale
@@ -270,7 +271,15 @@ export default function CheckoutPage() {
 
   // Show toast + flash when count event fires from backend
   useEffect(() => {
-    if (!countEvent) return;
+    if (!countEvent) {
+      lastCountEventKeyRef.current = null;
+      return;
+    }
+
+    // Deduplicate: backend may send the same event across multiple frames
+    const eventKey = `${countEvent.action}|${countEvent.product}|${countEvent.quantity}|${countEvent.track_id}`;
+    if (eventKey === lastCountEventKeyRef.current) return;
+    lastCountEventKeyRef.current = eventKey;
 
     const isRemove = countEvent.action === "remove";
 

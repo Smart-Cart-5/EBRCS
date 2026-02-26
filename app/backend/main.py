@@ -11,8 +11,9 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 # --- Streamlit shim MUST be imported before checkout_core ---
@@ -120,10 +121,24 @@ def create_app() -> FastAPI:
             "active_sessions": app_state.session_manager.active_count,
         }
 
-    # Serve frontend static files in production (Docker)
+    # Serve frontend static files with SPA fallback for client-side routing
     static_dir = Path(os.getenv("STATIC_DIR", "frontend/dist"))
     if static_dir.is_dir():
-        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="frontend")
+
+        @app.get("/{full_path:path}")
+        async def serve_spa(full_path: str) -> FileResponse:
+            # Never intercept API paths (shouldn't happen but guard against it)
+            if full_path.startswith("api"):
+                raise HTTPException(status_code=404)
+            # Serve the exact file if it exists (JS, CSS, images, etc.)
+            file = static_dir / full_path
+            if file.is_file():
+                return FileResponse(str(file))
+            # SPA fallback: all unknown routes serve index.html so React Router works
+            index = static_dir / "index.html"
+            if index.is_file():
+                return FileResponse(str(index))
+            raise HTTPException(status_code=404)
 
     return app
 
