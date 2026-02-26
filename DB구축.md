@@ -45,7 +45,7 @@ cd EBRCS
 cp .env.example .env
 ```
 
-`.env`에서 `DATABASE_URL`을 Docker 로컬 MySQL로 설정:
+`.env`에서 `DATABASE_URL`을 Docker 로컬 MySQL로 설정 (DB명 `mydb`는 EC2와 동일):
 
 ```env
 DATABASE_URL=mysql+pymysql://ebrcs_app:ebrcs_pass@127.0.0.1:3307/mydb
@@ -82,6 +82,12 @@ cd app
 접속:
 - Frontend: `http://localhost:5173`
 - Backend Docs: `http://127.0.0.1:8000/docs`
+- **Adminer (DB 웹 UI)**: `http://localhost:8081`
+  - System: MySQL
+  - Server: `mysql`
+  - Username: `ebrcs_app`
+  - Password: `ebrcs_pass`
+  - Database: `mydb`
 
 ---
 
