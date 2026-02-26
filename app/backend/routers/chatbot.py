@@ -438,6 +438,10 @@ def _totals(products: list[ProductMeta]) -> dict[str, Any]:
 _CATALOG_STOPWORDS = {
     "상품",
     "정보",
+    "성분",
+    "현재",
+    "기준",
+    "관련",
     "알려줘",
     "알려",
     "보여줘",
@@ -450,6 +454,20 @@ _CATALOG_STOPWORDS = {
     "가격",
     "할인",
     "할인율",
+    "영양",
+    "영양소",
+    "영양정보",
+    "영양성분",
+    "칼로리",
+    "열량",
+    "단백질",
+    "탄수화물",
+    "지방",
+    "포화지방",
+    "트랜스지방",
+    "당류",
+    "당",
+    "나트륨",
     "장바구니",
     "그리고",
     "또",
@@ -459,7 +477,42 @@ _CATALOG_STOPWORDS = {
 }
 _DISCOUNT_QUERY_TOKENS = ("할인", "세일", "할인율", "할인가")
 _PRICE_QUERY_TOKENS = ("가격", "비싼", "저렴", "최고가", "최저가", "금액", "얼마")
+_NUTRITION_QUERY_TOKENS = (
+    "영양",
+    "영양소",
+    "영양정보",
+    "영양성분",
+    "칼로리",
+    "열량",
+    "단백질",
+    "탄수화물",
+    "지방",
+    "포화지방",
+    "트랜스지방",
+    "당류",
+    "당",
+    "나트륨",
+)
+_NUTRITION_RANK_QUERY_TOKENS = (
+    "제일 높은",
+    "가장 높은",
+    "최고",
+    "top",
+    "탑",
+    "순위",
+    "랭킹",
+)
 _MAX_CATALOG_MATCH_ROWS = 8
+_NUTRIENT_ALIAS_MAP: dict[str, tuple[str, ...]] = {
+    "칼로리": ("칼로리", "열량", "에너지", "kcal", "calorie", "㎉"),
+    "단백질": ("단백질", "protein"),
+    "탄수화물": ("탄수화물", "탄수", "carbohydrate", "carb", "carbs"),
+    "지방": ("지방", "총지방", "fat"),
+    "포화지방": ("포화지방", "saturated"),
+    "트랜스지방": ("트랜스지방", "trans"),
+    "당류": ("당류", "총당류", "당", "당분", "sugar"),
+    "나트륨": ("나트륨", "소듐", "sodium"),
+}
 
 
 def _compact_prompt_value(value: Any) -> Any:
@@ -533,6 +586,16 @@ def _query_catalog_products(
         "item_no",
         "product_name",
         "barcd",
+        "nutrition_info",
+        "nutrition",
+        "nutrients",
+        "kcal",
+        "calories",
+        "protein",
+        "carbohydrate",
+        "fat",
+        "sodium",
+        "sugar",
         "category_l",
         "category_m",
         "category_s",
@@ -554,7 +617,27 @@ def _query_catalog_products(
             for col in product_columns
             if any(
                 key in col.lower()
-                for key in ("name", "item", "bar", "category", "brand", "maker", "origin", "desc", "spec", "unit")
+                for key in (
+                    "name",
+                    "item",
+                    "bar",
+                    "category",
+                    "brand",
+                    "maker",
+                    "origin",
+                    "desc",
+                    "spec",
+                    "unit",
+                    "nutrition",
+                    "nutri",
+                    "kcal",
+                    "calorie",
+                    "protein",
+                    "carb",
+                    "fat",
+                    "sodium",
+                    "sugar",
+                )
             )
         ]
     if not searchable:
@@ -566,6 +649,15 @@ def _query_catalog_products(
         like_key = f"kw_{idx}"
         params[like_key] = f"%{term}%"
         clauses = [f"p.`{col}` LIKE :{like_key}" for col in searchable]
+        if "product_name" in product_columns:
+            normalized_term = re.sub(r"[\s\-_]+", "", term)
+            if normalized_term:
+                norm_key = f"kw_norm_{idx}"
+                params[norm_key] = f"%{normalized_term}%"
+                clauses.append(
+                    "REPLACE(REPLACE(REPLACE(p.`product_name`, ' ', ''), '-', ''), '_', '') "
+                    f"LIKE :{norm_key}"
+                )
         if term.isdigit() and "item_no" in product_columns:
             exact_key = f"item_no_{idx}"
             clauses.append(f"p.`item_no` = :{exact_key}")
@@ -581,20 +673,25 @@ def _query_catalog_products(
         order_parts.append(f"p.`{product_columns[0]}` DESC")
 
     params["limit"] = safe_limit * 2 if "item_no" in product_columns else safe_limit
-    sql = (
-        "SELECT p.* "
-        "FROM products p "
-        f"{where_sql} "
-        f"ORDER BY {', '.join(order_parts)} "
-        "LIMIT :limit"
-    )
+
+    def _run_catalog_query(where_clause: str) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT p.* "
+            "FROM products p "
+            f"{where_clause} "
+            f"ORDER BY {', '.join(order_parts)} "
+            "LIMIT :limit"
+        )
+        rows = db.execute(text(sql), params).mappings().all()
+        return [dict(row) for row in rows]
 
     try:
-        rows = db.execute(text(sql), params).mappings().all()
+        normalized_rows = _run_catalog_query(where_sql)
+        if not normalized_rows and len(groups) > 1:
+            fallback_where = f"WHERE {' OR '.join(groups)}"
+            normalized_rows = _run_catalog_query(fallback_where)
     except SQLAlchemyError:
         return [], terms
-
-    normalized_rows = [dict(row) for row in rows]
     if "item_no" not in product_columns:
         return normalized_rows[:safe_limit], terms
 
@@ -858,6 +955,94 @@ def _price_snapshot(
     return result
 
 
+def _maybe_json(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text_value = value.strip()
+    if not text_value:
+        return value
+    if not (
+        (text_value.startswith("{") and text_value.endswith("}"))
+        or (text_value.startswith("[") and text_value.endswith("]"))
+    ):
+        return value
+    try:
+        return json.loads(text_value)
+    except Exception:
+        return value
+
+
+def _nutrition_snapshot(
+    db: Session,
+    question: str,
+    product_columns: list[str],
+) -> dict[str, Any]:
+    if not any(token in question for token in _NUTRITION_QUERY_TOKENS):
+        return {}
+    if not product_columns:
+        return {}
+
+    nutrition_columns = [
+        col
+        for col in product_columns
+        if any(
+            key in col.lower()
+            for key in (
+                "nutrition",
+                "nutri",
+                "kcal",
+                "calorie",
+                "protein",
+                "carb",
+                "fat",
+                "sodium",
+                "sugar",
+            )
+        )
+    ]
+    if not nutrition_columns:
+        return {}
+
+    matched_rows, terms = _query_catalog_products(
+        db=db,
+        question=question,
+        product_columns=product_columns,
+        limit=_MAX_CATALOG_MATCH_ROWS,
+    )
+    if not matched_rows:
+        return {"nutrition_columns": nutrition_columns, "search_terms": terms, "products": []}
+
+    payload_rows: list[dict[str, Any]] = []
+    for row in matched_rows:
+        compact: dict[str, Any] = {}
+        for base_col in ("item_no", "product_name"):
+            if base_col in product_columns:
+                base_val = _compact_prompt_value(row.get(base_col))
+                if base_val is not None:
+                    compact[base_col] = base_val
+
+        for col in nutrition_columns:
+            raw_value = row.get(col)
+            if raw_value is None:
+                continue
+            parsed = _maybe_json(raw_value)
+            if isinstance(parsed, (dict, list)):
+                compact[col] = parsed
+                continue
+            value = _compact_prompt_value(parsed)
+            if value is not None:
+                compact[col] = value
+
+        if compact:
+            payload_rows.append(compact)
+
+    return {
+        "nutrition_columns": nutrition_columns,
+        "search_terms": terms,
+        "products": payload_rows,
+    }
+
+
 def _build_catalog_context(db: Session, question: str) -> dict[str, Any]:
     product_columns = _table_columns(db, "products")
     if not product_columns:
@@ -921,12 +1106,473 @@ def _build_catalog_context(db: Session, question: str) -> dict[str, Any]:
     if price_rows:
         context["price_snapshot"] = price_rows
 
+    nutrition_rows = _nutrition_snapshot(db, question, product_columns)
+    if nutrition_rows:
+        context["nutrition_snapshot"] = nutrition_rows
+
+    nutrition_rank_rows = _nutrition_rank_snapshot(db, question, product_columns)
+    if nutrition_rank_rows:
+        context["nutrition_rank_snapshot"] = nutrition_rank_rows
+
     return context
 
 
 # ---------------------------------------------------------------------------
 # LLM answer generator
 # ---------------------------------------------------------------------------
+
+def _normalize_query_token(value: str) -> str:
+    return re.sub(r"[^0-9a-z가-힣]+", "", (value or "").lower())
+
+
+def _detect_requested_nutrients(question: str) -> list[str]:
+    normalized_question = _normalize_query_token((question or "").lower())
+    requested_nutrients: list[str] = []
+    for nutrient_name, aliases in _NUTRIENT_ALIAS_MAP.items():
+        normalized_aliases = [
+            _normalize_query_token(alias)
+            for alias in aliases
+            if _normalize_query_token(alias)
+        ]
+        if normalized_aliases and any(alias in normalized_question for alias in normalized_aliases):
+            requested_nutrients.append(nutrient_name)
+    return requested_nutrients
+
+
+def _is_nutrition_rank_query(question: str) -> bool:
+    lowered = (question or "").lower()
+    if not any(token in lowered for token in _NUTRITION_QUERY_TOKENS):
+        return False
+    return any(token in lowered for token in _NUTRITION_RANK_QUERY_TOKENS)
+
+
+def _extract_category_terms_for_rank(question: str, max_terms: int = 3) -> list[str]:
+    tokens = re.findall(r"[A-Za-z]{2,}|[가-힣]{2,}", question or "")
+    nutrient_tokens = {
+        _normalize_query_token(token)
+        for token in _NUTRITION_QUERY_TOKENS
+        if _normalize_query_token(token)
+    }
+    for aliases in _NUTRIENT_ALIAS_MAP.values():
+        nutrient_tokens.update(
+            _normalize_query_token(alias)
+            for alias in aliases
+            if _normalize_query_token(alias)
+        )
+
+    ranking_stopwords = {
+        "제일",
+        "가장",
+        "높은",
+        "낮은",
+        "최고",
+        "최저",
+        "top",
+        "탑",
+        "순위",
+        "랭킹",
+        "카테고리",
+        "카테고리별",
+        "별",
+        "상품",
+        "제품",
+        "알려",
+        "알려줘",
+        "뭐야",
+        "무엇",
+        "정보",
+    }
+    ranking_stopwords.update(_CATALOG_STOPWORDS)
+    ranking_stopwords_norm = {
+        _normalize_query_token(token)
+        for token in ranking_stopwords
+        if _normalize_query_token(token)
+    }
+    ranking_stopwords_norm.update(nutrient_tokens)
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        normalized = _normalize_query_token(token)
+        if not normalized:
+            continue
+        if normalized in ranking_stopwords_norm:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        terms.append(token.strip())
+        if len(terms) >= max_terms:
+            break
+    return terms
+
+
+def _numeric_from_text(value: str) -> float | None:
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)", value or "")
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def _flatten_nutrition_pairs(value: Any, parent_key: str = "") -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            key = str(k).strip()
+            if isinstance(v, (dict, list)):
+                pairs.extend(_flatten_nutrition_pairs(v, key or parent_key))
+            else:
+                pairs.append((key or parent_key, str(v).strip()))
+        return pairs
+    if isinstance(value, list):
+        for item in value:
+            pairs.extend(_flatten_nutrition_pairs(item, parent_key))
+        return pairs
+    text_value = str(value).strip()
+    if text_value:
+        pairs.append((parent_key, text_value))
+    return pairs
+
+
+def _collect_nutrition_pairs(product_row: dict[str, Any]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for key, raw_value in product_row.items():
+        if key in {"item_no", "product_name"}:
+            continue
+        parsed = _maybe_json(raw_value)
+        if isinstance(parsed, (dict, list)):
+            pairs.extend(_flatten_nutrition_pairs(parsed, str(key)))
+            continue
+        value = str(parsed).strip()
+        if value:
+            pairs.append((str(key), value))
+    return pairs
+
+
+def _nutrition_rank_snapshot(
+    db: Session,
+    question: str,
+    product_columns: list[str],
+) -> dict[str, Any]:
+    if not _is_nutrition_rank_query(question):
+        return {}
+    if not product_columns or "product_name" not in product_columns:
+        return {}
+
+    requested_nutrients = _detect_requested_nutrients(question)
+    if not requested_nutrients:
+        return {}
+    target_nutrient = requested_nutrients[0]
+
+    nutrition_columns = [
+        col
+        for col in product_columns
+        if any(
+            key in col.lower()
+            for key in (
+                "nutrition",
+                "nutri",
+                "kcal",
+                "calorie",
+                "protein",
+                "carb",
+                "fat",
+                "sodium",
+                "sugar",
+            )
+        )
+    ]
+    if not nutrition_columns:
+        return {}
+
+    category_cols = [col for col in ("category_s", "category_m", "category_l", "category") if col in product_columns]
+
+    select_cols: list[str] = []
+    for col in ("item_no", "product_name"):
+        if col in product_columns:
+            select_cols.append(f"p.`{col}`")
+    for col in category_cols:
+        select_cols.append(f"p.`{col}`")
+    for col in nutrition_columns:
+        alias = f"p.`{col}`"
+        if alias not in select_cols:
+            select_cols.append(alias)
+
+    nutrition_exists = " OR ".join(
+        f"(p.`{col}` IS NOT NULL AND TRIM(CAST(p.`{col}` AS CHAR)) <> '')"
+        for col in nutrition_columns
+    )
+    where_parts = [f"({nutrition_exists})"]
+
+    category_terms = _extract_category_terms_for_rank(question, max_terms=3)
+    params: dict[str, Any] = {}
+    if category_terms:
+        for idx, term in enumerate(category_terms):
+            key = f"cat_kw_{idx}"
+            params[key] = f"%{term}%"
+            term_clauses: list[str] = [f"p.`product_name` LIKE :{key}"]
+            for col in category_cols:
+                term_clauses.append(f"p.`{col}` LIKE :{key}")
+            where_parts.append("(" + " OR ".join(term_clauses) + ")")
+
+    order_parts: list[str] = []
+    for col in ("updated_at", "created_at", "id"):
+        if col in product_columns:
+            order_parts.append(f"p.`{col}` DESC")
+    if not order_parts:
+        order_parts.append(f"p.`{product_columns[0]}` DESC")
+
+    params["limit"] = 5000 if category_terms else 2000
+    sql = (
+        f"SELECT {', '.join(select_cols)} "
+        "FROM products p "
+        f"WHERE {' AND '.join(where_parts)} "
+        f"ORDER BY {', '.join(order_parts)} "
+        "LIMIT :limit"
+    )
+
+    try:
+        rows = db.execute(text(sql), params).mappings().all()
+    except SQLAlchemyError:
+        return {}
+
+    scored_rows: list[dict[str, Any]] = []
+    for row in rows:
+        row_dict = dict(row)
+        nutrition_pairs = _collect_nutrition_pairs(row_dict)
+        if not nutrition_pairs:
+            continue
+
+        nutrient_value = _extract_nutrient_value_from_pairs(
+            nutrient_name=target_nutrient,
+            aliases=_NUTRIENT_ALIAS_MAP[target_nutrient],
+            pairs=nutrition_pairs,
+        )
+        if nutrient_value is None:
+            continue
+        nutrient_numeric = _numeric_from_text(nutrient_value)
+        if nutrient_numeric is None:
+            continue
+
+        category_label = ""
+        for col in ("category_s", "category_m", "category_l", "category"):
+            value = str(row_dict.get(col) or "").strip()
+            if value:
+                category_label = value
+                break
+
+        scored_rows.append(
+            {
+                "item_no": str(row_dict.get("item_no") or "").strip(),
+                "product_name": str(row_dict.get("product_name") or "").strip(),
+                "category": category_label or "기타",
+                "nutrient_value": nutrient_value,
+                "nutrient_numeric": nutrient_numeric,
+            }
+        )
+
+    if not scored_rows:
+        return {}
+
+    scored_rows.sort(key=lambda item: item.get("nutrient_numeric", 0), reverse=True)
+    category_wise = "카테고리별" in (question or "") or "카테고리 별" in (question or "")
+
+    if category_wise:
+        best_by_category: dict[str, dict[str, Any]] = {}
+        for row in scored_rows:
+            category_key = str(row.get("category") or "기타").strip() or "기타"
+            if category_key not in best_by_category:
+                best_by_category[category_key] = row
+        results = list(best_by_category.values())[:8]
+    else:
+        deduped: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for row in scored_rows:
+            key = str(row.get("item_no") or "").strip() or str(row.get("product_name") or "").strip()
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(row)
+            if len(deduped) >= 5:
+                break
+        results = deduped
+
+    return {
+        "target_nutrient": target_nutrient,
+        "category_terms": category_terms,
+        "category_wise": category_wise,
+        "results": results,
+    }
+
+
+def _format_nutrient_value(key: str, value: str) -> str | None:
+    cleaned = (value or "").strip().strip('"').strip("'")
+    if not cleaned:
+        return None
+    number_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(kcal|㎉|g|mg|ml|%)?", cleaned, flags=re.IGNORECASE)
+    if not number_match:
+        return cleaned
+
+    number = number_match.group(1)
+    unit = number_match.group(2)
+    if unit:
+        return f"{number}{unit}"
+
+    key_unit = re.search(r"\(([^)]+)\)", key or "")
+    if key_unit and key_unit.group(1).strip():
+        return f"{number}{key_unit.group(1).strip()}"
+    return number
+
+
+def _extract_nutrient_value_from_pairs(
+    nutrient_name: str,
+    aliases: tuple[str, ...],
+    pairs: list[tuple[str, str]],
+) -> str | None:
+    normalized_aliases = [_normalize_query_token(alias) for alias in aliases if _normalize_query_token(alias)]
+    if not normalized_aliases:
+        return None
+
+    for key, value in pairs:
+        key_norm = _normalize_query_token(key)
+        if key_norm and any(alias in key_norm for alias in normalized_aliases):
+            formatted = _format_nutrient_value(key, value)
+            if formatted:
+                return formatted
+
+    combined = " | ".join(f"{k}:{v}" for k, v in pairs if k or v)
+    for alias in aliases:
+        alias_pattern = re.escape(alias)
+        patterns = (
+            rf"{alias_pattern}\s*(?:\([^)]*\))?\s*\"?\s*[:：]\s*\"?([0-9]+(?:\.[0-9]+)?\s*(?:kcal|㎉|g|mg|ml|%)?)",
+            rf"{alias_pattern}\s*\"?\s*([0-9]+(?:\.[0-9]+)?\s*(?:kcal|㎉|g|mg|ml|%)?)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, combined, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+    return None
+
+
+def _product_match_score(product_row: dict[str, Any], terms: list[str]) -> int:
+    if not terms:
+        return 0
+    product_name = _normalize_query_token(str(product_row.get("product_name") or ""))
+    item_no = _normalize_query_token(str(product_row.get("item_no") or ""))
+    score = 0
+    for term in terms:
+        norm_term = _normalize_query_token(term)
+        if not norm_term:
+            continue
+        if product_name.startswith(norm_term):
+            score += 5
+        elif norm_term in product_name:
+            score += 3
+        if item_no and norm_term == item_no:
+            score += 4
+    return score
+
+
+def _answer_nutrition_direct(question: str, catalog_context: dict[str, Any] | None) -> str | None:
+    if not any(token in question for token in _NUTRITION_QUERY_TOKENS):
+        return None
+    if not catalog_context or not catalog_context.get("available"):
+        return None
+
+    nutrition_snapshot = catalog_context.get("nutrition_snapshot")
+    if not isinstance(nutrition_snapshot, dict):
+        return None
+
+    raw_products = nutrition_snapshot.get("products")
+    if not isinstance(raw_products, list):
+        return "요청하신 상품의 영양 정보는 현재 DB에서 확인되지 않습니다."
+
+    products = [row for row in raw_products if isinstance(row, dict)]
+    if not products:
+        return "요청하신 상품의 영양 정보는 현재 DB에서 확인되지 않습니다."
+
+    rank_snapshot = catalog_context.get("nutrition_rank_snapshot")
+    if isinstance(rank_snapshot, dict):
+        rank_results = rank_snapshot.get("results")
+        if isinstance(rank_results, list) and rank_results:
+            target_nutrient = str(rank_snapshot.get("target_nutrient") or "영양소").strip()
+            category_wise = bool(rank_snapshot.get("category_wise"))
+            if category_wise:
+                lines: list[str] = []
+                for row in rank_results:
+                    if not isinstance(row, dict):
+                        continue
+                    category = str(row.get("category") or "기타").strip() or "기타"
+                    product_name = str(row.get("product_name") or "상품명 없음").strip()
+                    nutrient_value = str(row.get("nutrient_value") or "").strip()
+                    if nutrient_value:
+                        lines.append(f"{category}: {product_name} ({nutrient_value})")
+                if lines:
+                    return f"카테고리별 {target_nutrient} 최고 상품입니다.\n- " + "\n- ".join(lines)
+
+            top = rank_results[0] if isinstance(rank_results[0], dict) else {}
+            if top:
+                category_terms = rank_snapshot.get("category_terms")
+                category_scope = ""
+                if isinstance(category_terms, list):
+                    tokens = [str(term).strip() for term in category_terms if str(term).strip()]
+                    if tokens:
+                        category_scope = f"{', '.join(tokens)} 기준 "
+                product_name = str(top.get("product_name") or "상품명 없음").strip()
+                nutrient_value = str(top.get("nutrient_value") or "").strip()
+                if nutrient_value:
+                    return f"{category_scope}{target_nutrient}가 가장 높은 상품은 {product_name} ({nutrient_value})입니다."
+
+    search_terms = nutrition_snapshot.get("search_terms")
+    terms = search_terms if isinstance(search_terms, list) else _extract_catalog_terms(question, limit=6)
+    products = sorted(products, key=lambda row: _product_match_score(row, terms), reverse=True)
+
+    requested_nutrients = _detect_requested_nutrients(question)
+
+    if not requested_nutrients:
+        first_product = products[0]
+        product_name = str(first_product.get("product_name") or "해당 상품").strip()
+        nutrition_pairs = _collect_nutrition_pairs(first_product)
+        if not nutrition_pairs:
+            return f"{product_name}의 영양 정보는 현재 DB에서 확인되지 않습니다."
+        preview = ", ".join(
+            f"{k}: {v}" if k else v
+            for k, v in nutrition_pairs
+            if (k or v)
+        )
+        if not preview:
+            return f"{product_name}의 영양 정보는 현재 DB에서 확인되지 않습니다."
+        return f"{product_name} 영양 정보: {preview}"
+
+    answers: list[str] = []
+    for product_row in products[:3]:
+        product_name = str(product_row.get("product_name") or "해당 상품").strip()
+        nutrition_pairs = _collect_nutrition_pairs(product_row)
+        if not nutrition_pairs:
+            continue
+        found_parts: list[str] = []
+        for nutrient_name in requested_nutrients:
+            value = _extract_nutrient_value_from_pairs(
+                nutrient_name=nutrient_name,
+                aliases=_NUTRIENT_ALIAS_MAP[nutrient_name],
+                pairs=nutrition_pairs,
+            )
+            if value is not None:
+                found_parts.append(f"{nutrient_name}: {value}")
+        if found_parts:
+            answers.append(f"{product_name} 기준 {', '.join(found_parts)}")
+
+    if answers:
+        if len(answers) == 1:
+            return f"{answers[0]}입니다."
+        return "질문하신 영양 정보입니다.\n- " + "\n- ".join(answers)
+
+    fallback_product = str(products[0].get("product_name") or "해당 상품").strip()
+    return f"{fallback_product}의 {', '.join(requested_nutrients)} 정보는 현재 DB에서 확인되지 않습니다."
+
 
 def _answer_question(
     question: str,
@@ -937,6 +1583,9 @@ def _answer_question(
     q = question.strip()
     if not q:
         return "질문을 입력해 주세요. 예: '총 금액 얼마야?'"
+    direct_nutrition = _answer_nutrition_direct(q, catalog_context)
+    if direct_nutrition:
+        return direct_nutrition
 
     # Build context for LLM
     cart_lines: list[str] = []
@@ -961,6 +1610,7 @@ def _answer_question(
     catalog_matches_text = "질문 관련 카탈로그 데이터 없음"
     catalog_discount_text = "할인 스냅샷 없음"
     catalog_price_text = "가격 스냅샷 없음"
+    catalog_nutrition_text = "영양 스냅샷 없음"
 
     if catalog_context and catalog_context.get("available"):
         catalog_schema_text = _json_for_prompt(catalog_context.get("schema") or {})
@@ -968,6 +1618,7 @@ def _answer_question(
         catalog_matches_text = _json_for_prompt(catalog_context.get("matched_products") or [])
         catalog_discount_text = _json_for_prompt(catalog_context.get("discount_snapshot") or [])
         catalog_price_text = _json_for_prompt(catalog_context.get("price_snapshot") or {})
+        catalog_nutrition_text = _json_for_prompt(catalog_context.get("nutrition_snapshot") or {})
 
     prompt = f"""
 아래는 사용자의 장바구니 정보와 카탈로그 DB 스냅샷입니다.
@@ -993,6 +1644,9 @@ def _answer_question(
 가격 스냅샷:
 {catalog_price_text}
 
+영양 스냅샷:
+{catalog_nutrition_text}
+
 사용자 질문:
 {q}
 
@@ -1001,6 +1655,8 @@ def _answer_question(
 - 상품 목록에 없는 제품을 물어보면 '장바구니에 해당 상품이 없습니다'라고 안내하세요.
 - 장바구니가 비어있으면 '현재 장바구니가 비어있습니다. 상품을 담아주세요.'라고 안내하세요.
 - 질문이 장바구니가 아닌 카탈로그(DB) 정보 관련이면 카탈로그 데이터 기준으로 답변하세요.
+- 카탈로그 질문에서는 장바구니 상태를 먼저 언급하지 말고, 질문한 상품 정보부터 답변하세요.
+- 영양소/칼로리 질문은 nutrition 관련 DB 컬럼(예: nutrition_info) 값을 우선 사용해 답하세요.
 - 카탈로그 데이터에서 확인되지 않는 내용은 '현재 DB에서 확인되지 않습니다'라고 명확히 말하세요.
 """
 
@@ -1087,7 +1743,7 @@ def _answer_question(
 async def get_chatbot_suggestions(session_id: str | None = None):
     """Return a set of quick-action suggestion chips."""
     suggestions = [
-        "지금 장바구니 총 금액은 얼마야?",
+        "과자 중에서 할인율이 제일 큰 상품이 뭐야?",
         "가장 많이 담긴 상품은 뭐야?",
     ]
 
