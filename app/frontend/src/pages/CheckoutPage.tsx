@@ -294,7 +294,7 @@ export default function CheckoutPage() {
 
     if (isRemove) {
       toast(`🔴 ${countEvent.product} ${qtyText}`, {
-        duration: 2500,
+        duration: 1000,
         position: "top-center",
         style: {
           background: "#ef4444",
@@ -306,7 +306,7 @@ export default function CheckoutPage() {
     } else {
       toast.success(`🟢 ${countEvent.product} ${qtyText}`, {
         icon: "🛒",
-        duration: 2500,
+        duration: 1000,
         position: "top-center",
         style: {
           background: "#22c55e",
