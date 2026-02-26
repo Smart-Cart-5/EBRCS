@@ -146,9 +146,9 @@ EBRCS/
 │
 ├── data/                  # 모델 & 임베딩 데이터
 │   ├── adapter_config.json    # LoRA 설정 (Git 포함)
-│   ├── adapter_model.safetensors  # LoRA 가중치 (별도 다운로드)
-│   ├── embeddings.npy     # 상품 임베딩 (웹 UI 등록 시 자동 생성)
-│   ├── labels.npy         # 상품 레이블 (웹 UI 등록 시 자동 생성)
+│   ├── adapter_model.safetensors  # LoRA 가중치 (선택, 별도 수령)
+│   ├── embeddings.npy     # 상품 임베딩 DB (서버 시작 필수, 별도 수령)
+│   ├── labels.npy         # 상품 라벨 (서버 시작 필수, 별도 수령)
 │   └── faiss_index.bin    # FAISS 인덱스 (서버 시작 시 자동 생성)
 │
 ├── db/                    # DB 시드 관리
@@ -400,50 +400,41 @@ UPDATE users SET role = 'admin' WHERE username = 'admin';
 
 ## 📦 데이터 준비
 
-> **💡 중요**: 웹앱은 **빈 DB에서도 시작 가능**합니다!
->
-> 상품 등록 방법:
-> 1. **웹 UI 실시간 등록** (권장 ⭐) - 운영 중 언제든지 추가 가능
-> 2. **오프라인 배치 생성** (선택) - 초기 대량 데이터 준비용
+> **⚠️ 중요**: `embeddings.npy`와 `labels.npy`는 **서버 시작 전에 반드시 존재해야** 합니다.
+> 파일이 없으면 FastAPI 서버가 startup 시 `FileNotFoundError`로 크래시됩니다.
 
-### Option 1: 웹 UI에서 상품 등록 (권장 ⭐)
+### 파일별 상태 정리
+
+| 파일 | Git 포함 | 필수 여부 | 생성 방법 |
+|------|---------|---------|---------|
+| `adapter_config.json` | ✅ | 필수 | git에 포함 |
+| `adapter_model.safetensors` | ❌ | **선택** | EC2/팀원에게 별도 수령 (없으면 기본 DINO 모델로 동작) |
+| `embeddings.npy` | ❌ | **필수** | EC2/팀원에게 수령하거나 상품 임베딩 사전 생성 필요 |
+| `labels.npy` | ❌ | **필수** | 동상 |
+| `faiss_index.bin` | ❌ | 자동 | 서버 시작 시 embeddings.npy로부터 자동 생성 |
+| `ebrcs.db` | ❌ | 자동 | setup_db.sh 실행 시 자동 생성 |
+
+### embeddings.npy / labels.npy 확보 방법
+
+현재 팀의 EC2에 임베딩 DB가 이미 구축되어 있으므로, 파일을 복사해서 사용합니다:
+
+```bash
+# EC2에서 로컬로 복사
+scp -i your-key.pem ubuntu@YOUR_EC2_IP:~/ebrcs_streaming/data/embeddings.npy data/
+scp -i your-key.pem ubuntu@YOUR_EC2_IP:~/ebrcs_streaming/data/labels.npy data/
+```
+
+파일이 준비된 후에는 서버 시작 시 FAISS 인덱스(`faiss_index.bin`)가 자동으로 생성됩니다.
+
+### 상품 추가 (웹 UI)
+
+서버 실행 중에는 웹 UI에서 상품을 추가할 수 있습니다. 추가 시 `embeddings.npy`, `labels.npy`, `faiss_index.bin`이 **증분 업데이트**되므로 서버 재시작이 불필요합니다.
 
 **웹앱 실행 후**:
 1. 브라우저에서 `http://localhost:5173` 접속
 2. **"상품 등록"** 페이지 이동
 3. 상품명 입력 + 이미지 1-3장 업로드
 4. **즉시 인식 가능!** (서버 재시작 불필요)
-
-**특징**:
-- ✅ 실시간 업데이트
-- ✅ 사용자 친화적 GUI
-- ✅ 증분 업데이트로 빠름 (전체 재구축 안함)
-- ✅ 운영 중에도 안전하게 추가 가능
-
----
-
-### 필수 파일 확인
-
-#### 🪟 Windows
-```cmd
-dir data\
-```
-
-#### 🍎 macOS / 🐧 Linux
-```bash
-ls -lh data/
-```
-
-**필수 파일** (나머지는 자동 생성):
-- ✅ `adapter_config.json` - LoRA 설정 (Git 포함)
-- 📥 `adapter_model.safetensors` - LoRA 가중치 (**다운로드 필요**)
-
-**자동 생성 파일** (없어도 서버 시작 가능):
-- `embeddings.npy` - 상품 임베딩 (웹 UI 등록 시 자동 생성)
-- `labels.npy` - 상품 레이블 (웹 UI 등록 시 자동 생성)
-- `faiss_index.bin` - FAISS 인덱스 (서버 시작 시 자동 생성)
-
-> **💡 빈 DB로 시작하면**: 첫 번째 상품 등록 시 자동으로 파일들이 생성됩니다!
 
 ---
 
