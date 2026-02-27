@@ -1,4 +1,4 @@
-# 🛒 EBRCS - Embedding-Based Real-time Checkout System
+# 🛒 장보GO(임베딩기반 실시간 체크아웃 시스템)
 
 <p align="center">
   <img src="app/frontend/public/jangbogo.svg" alt="장보고 로고" width="320" />
