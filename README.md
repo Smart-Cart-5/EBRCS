@@ -1,5 +1,9 @@
 # 🛒 EBRCS - Embedding-Based Real-time Checkout System
 
+<p align="center">
+  <img src="app/frontend/public/jangbogo.svg" alt="장보고 로고" width="320" />
+</p>
+
 **AI 기반 실시간 무인 계산 시스템**
 
 DINOv3 + CLIP 하이브리드 임베딩을 활용한 상품 자동 인식 및 계산 시스템입니다.
@@ -509,9 +513,22 @@ UPDATE users SET role = 'admin' WHERE username = 'admin';
 # EC2에서 로컬로 복사
 scp -i your-key.pem ubuntu@YOUR_EC2_IP:~/ebrcs_streaming/data/embeddings.npy data/
 scp -i your-key.pem ubuntu@YOUR_EC2_IP:~/ebrcs_streaming/data/labels.npy data/
+scp -i your-key.pem ubuntu@YOUR_EC2_IP:~/ebrcs_streaming/data/adapter_model.safetensors data/
 ```
 
 파일이 준비된 후에는 서버 시작 시 FAISS 인덱스(`faiss_index.bin`)가 자동으로 생성됩니다.
+
+### DATA_DIR 환경변수 설정 (필수)
+
+`config.py`는 기본적으로 `app/data/`를 데이터 경로로 사용하지만, 실제 파일은 **프로젝트 루트의 `data/`** 에 위치합니다.
+반드시 `.env`에 절대 경로를 지정해야 합니다:
+
+```env
+# 예시 (본인 경로에 맞게 수정)
+DATA_DIR=/Users/yourname/projects/EBRCS/data
+```
+
+설정하지 않으면 서버 시작 시 `FileNotFoundError: embeddings.npy` 크래시가 발생합니다.
 
 ### 상품 추가 (웹 UI)
 
@@ -636,6 +653,10 @@ HUGGINGFACE_HUB_TOKEN=your_huggingface_token_here
 # JWT 인증용 비밀 키 (랜덤 문자열 생성 권장)
 SECRET_KEY=your_random_secret_key_here
 
+# 데이터 디렉토리 (embeddings.npy, labels.npy 등 위치)
+# 기본값은 app/data/ → 프로젝트 루트의 data/ 를 직접 지정해야 함
+DATA_DIR=/absolute/path/to/project/data
+
 # DB 연결 (미설정 시 SQLite 사용)
 # DATABASE_URL=sqlite:///data/ebrcs.db
 # DATABASE_URL=mysql+pymysql://<USER>:<PASSWORD>@127.0.0.1:3306/mydb
@@ -656,13 +677,11 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 `backend/config.py`:
 ```python
-MATCH_THRESHOLD = 0.62        # FAISS 매칭 임계값
-MIN_AREA = 2500              # 최소 객체 면적
-DETECT_EVERY_N_FRAMES = 5    # 프레임 스킵
-COUNT_COOLDOWN_SECONDS = 3.0 # 중복 방지 쿨다운
-ROI_CLEAR_FRAMES = 8         # ROI 클리어 프레임
-DINO_WEIGHT = 0.7            # DINO 임베딩 가중치
-CLIP_WEIGHT = 0.3            # CLIP 임베딩 가중치
+MATCH_THRESHOLD = 0.62           # FAISS 매칭 임계값
+MIN_AREA = 2500                  # 최소 객체 면적
+DETECT_EVERY_N_FRAMES = 3        # 추론 주기 (매 3프레임마다 추론, 모든 프레임 표시)
+COUNT_COOLDOWN_SECONDS = 1.5     # 중복 방지 쿨다운
+ROI_CLEAR_FRAMES = 36            # ROI 클리어 프레임 (~3초 @ 12FPS)
 ```
 
 `checkout_core/frame_processor.py`:
@@ -751,7 +770,22 @@ server: {
 }
 ```
 
-### 6. Port 이미 사용 중 오류
+### 6. macOS에서 서버 시작 즉시 SIGSEGV 크래시 (OpenMP 충돌)
+
+**증상**: `run_web.sh` 실행 직후 Python 프로세스가 `SIGSEGV` 또는 `Illegal instruction` 으로 즉시 종료
+
+**원인**: PyTorch와 다른 라이브러리가 각각 `libomp.dylib`를 중복 로드하면서 충돌
+
+**해결** (`run_web.sh`에 이미 적용됨):
+```bash
+export KMP_DUPLICATE_LIB_OK=TRUE
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+```
+
+`.env` 파일에 설정하면 **효과 없음** — 라이브러리가 Python 시작 전에 이미 로드되므로, 반드시 셸 레벨(`run_web.sh`)에서 `export` 해야 합니다.
+
+### 7. Port 이미 사용 중 오류
 
 #### 🪟 Windows
 ```cmd
@@ -781,9 +815,19 @@ kill -9 $(lsof -ti:8000)
 
 #### 1️⃣ EC2 준비
 
-- **인스턴스 타입**: t3.large 이상 권장 (GPU 있으면 g4dn.xlarge)
-- **OS**: Ubuntu 22.04 LTS 또는 24.04 LTS
-- **스토리지**: 30GB 이상
+**실제 운영 환경 (권장 사양)**
+
+| 항목 | 값 |
+|------|-----|
+| 인스턴스 타입 | `g4dn.xlarge` (NVIDIA T4 GPU 포함) |
+| vCPU | 4 |
+| 메모리 | 16 GiB |
+| GPU | NVIDIA T4 × 1 |
+| 스토리지 | 256 GB 이상 |
+| OS | Ubuntu 24.04 LTS |
+
+> **GPU가 없는 환경**에서도 CPU 추론으로 동작하지만, 실시간 체크아웃 성능이 크게 저하됩니다 (~350ms/frame → 1–2s/frame).
+
 - **보안 그룹**:
   - SSH (22) - 내 IP만
   - HTTP (80) - 0.0.0.0/0
