@@ -19,6 +19,7 @@ const captureIntervalRaw = Number(import.meta.env.VITE_CAPTURE_INTERVAL_MS || 80
 const CAPTURE_INTERVAL_MS = Number.isFinite(captureIntervalRaw)
   ? Math.max(33, captureIntervalRaw)
   : 80;
+const DEFAULT_CAMERA_ZOOM = 1.6;
 const FULLSCREEN_ROI = [
   [0.0, 0.0], // Top-left
   [1.0, 0.0], // Top-right
@@ -160,24 +161,24 @@ export default function CheckoutPage() {
     const min = Number(zoomCap.min);
     const max = Number(zoomCap.max);
     const step = Math.max(0.01, Number(zoomCap.step ?? 0.1));
-    const current = typeof settings.zoom === "number"
-      ? settings.zoom
-      : min;
+    const defaultZoom = Math.min(Math.max(DEFAULT_CAMERA_ZOOM, min), max);
 
     setZoomSupported(true);
     setZoomMin(min);
     setZoomMax(max);
     setZoomStep(step);
-    setZoomValue(current);
+    setZoomValue(defaultZoom);
     setCameraHint(max > min ? "줌 슬라이더로 화각을 조절할 수 있습니다." : "현재 렌즈는 고정 화각입니다.");
 
     if (max > min) {
       try {
         await track.applyConstraints({
-          advanced: [{ zoom: current } as unknown as MediaTrackConstraintSet],
+          advanced: [{ zoom: defaultZoom } as unknown as MediaTrackConstraintSet],
         });
       } catch (error) {
         console.warn("Failed to apply initial zoom:", error);
+        const current = typeof settings.zoom === "number" ? settings.zoom : min;
+        setZoomValue(current);
       }
     }
   }, []);

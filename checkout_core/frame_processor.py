@@ -260,7 +260,7 @@ def _release_counted_track(
 
 def create_bg_subtractor():
     return cv2.createBackgroundSubtractorKNN(
-        history=300,
+        history=80,
         dist2Threshold=500,
         detectShadows=False,
     )

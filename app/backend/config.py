@@ -51,7 +51,7 @@ SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
 
 # Inference constants (mirrors checkout_core / pages/2_Checkout.py)
 MIN_AREA = 2500
-DETECT_EVERY_N_FRAMES = 3  # Smooth display: inference every 3 frames, display all frames
+DETECT_EVERY_N_FRAMES = 2  # Smooth display: inference every 2 frames, display all frames
 MATCH_THRESHOLD = 0.62
 COUNT_COOLDOWN_SECONDS = 1.5  # 중복 방지: 동일 상품 1.5초 내 재카운트 방지 (track 기반 중복방지가 주요 방어선)
 ROI_CLEAR_FRAMES = 36  # 3초 @ 12FPS (기존 8=0.64초는 너무 짧아 오검출 발생)

@@ -469,6 +469,17 @@ _CATALOG_STOPWORDS = {
     "당",
     "나트륨",
     "장바구니",
+    "위치",
+    "위치가",
+    "위치는",
+    "어디",
+    "어디야",
+    "어디에",
+    "어디서",
+    "코너",
+    "어디있어",
+    "어디있지",
+    "어디있나요",
     "그리고",
     "또",
     "좀",
@@ -491,9 +502,16 @@ _LOCATION_QUERY_TOKENS = (
 )
 _LOCATION_TERM_STOPWORDS = {
     "위치",
+    "위치가",
+    "위치는",
     "어디",
     "어디야",
     "어디에",
+    "어디서",
+    "어딘지",
+    "어디있어",
+    "어디있지",
+    "어디있나요",
     "코너",
     "몇번",
     "몇",
@@ -1537,6 +1555,51 @@ def _product_match_score(product_row: dict[str, Any], terms: list[str]) -> int:
     return score
 
 
+def _extract_location_terms(question: str, raw_terms: list[str] | None) -> list[str]:
+    terms = raw_terms if isinstance(raw_terms, list) else _extract_catalog_terms(question, limit=6)
+    normalized_location_tokens = {
+        _normalize_query_token(token)
+        for token in _LOCATION_QUERY_TOKENS
+        if _normalize_query_token(token)
+    }
+
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        text_term = str(term).strip()
+        normalized_term = _normalize_query_token(text_term)
+        if not normalized_term:
+            continue
+        if normalized_term in _LOCATION_TERM_STOPWORDS:
+            continue
+        if any(token and token in normalized_term for token in normalized_location_tokens):
+            continue
+        if normalized_term in seen:
+            continue
+        seen.add(normalized_term)
+        filtered.append(text_term)
+    return filtered
+
+
+def _row_contains_all_location_terms(product_row: dict[str, Any], terms: list[str]) -> bool:
+    if not terms:
+        return False
+
+    normalized_name = _normalize_query_token(str(product_row.get("product_name") or ""))
+    normalized_item_no = _normalize_query_token(str(product_row.get("item_no") or ""))
+    if not normalized_name and not normalized_item_no:
+        return False
+
+    for term in terms:
+        normalized_term = _normalize_query_token(str(term))
+        if not normalized_term:
+            continue
+        if normalized_term in normalized_name or normalized_term in normalized_item_no:
+            continue
+        return False
+    return True
+
+
 def _is_location_query(question: str) -> bool:
     lowered = (question or "").lower()
     return any(token in lowered for token in _LOCATION_QUERY_TOKENS)
@@ -1589,13 +1652,13 @@ def _answer_corner_location_direct(question: str, catalog_context: dict[str, Any
     if not product_rows:
         return "질문하신 상품을 찾지 못했습니다."
 
-    raw_terms = catalog_context.get("search_terms")
-    terms = raw_terms if isinstance(raw_terms, list) else _extract_catalog_terms(question, limit=6)
-    terms = [
-        str(term).strip()
-        for term in terms
-        if _normalize_query_token(str(term)) not in _LOCATION_TERM_STOPWORDS
-    ]
+    terms = _extract_location_terms(
+        question=question,
+        raw_terms=catalog_context.get("search_terms"),
+    )
+    if not terms:
+        return "질문하신 상품을 찾지 못했습니다."
+
     scored_products = sorted(
         [
             (row, _product_match_score(row, terms))
@@ -1609,6 +1672,8 @@ def _answer_corner_location_direct(question: str, catalog_context: dict[str, Any
     seen_keys: set[str] = set()
     for row, score in scored_products:
         if terms and score <= 0:
+            continue
+        if not _row_contains_all_location_terms(row, terms):
             continue
         category = str(
             row.get("category_l")

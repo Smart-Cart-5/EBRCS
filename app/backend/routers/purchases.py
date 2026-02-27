@@ -375,6 +375,34 @@ def create_purchase(
     }
 
 
+@router.delete("/{purchase_id}")
+def delete_purchase(
+    purchase_id: int,
+    current_user: Annotated[models.User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    """Delete a purchase record owned by the current user (or by admin)."""
+    purchase = (
+        db.query(models.PurchaseHistory)
+        .filter(models.PurchaseHistory.id == purchase_id)
+        .first()
+    )
+    if purchase is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Purchase not found",
+        )
+    if current_user.role != "admin" and purchase.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not allowed to delete this purchase",
+        )
+
+    db.delete(purchase)
+    db.commit()
+    return {"status": "deleted", "id": purchase_id}
+
+
 @router.get("/dashboard", response_model=DashboardStats)
 def get_dashboard_stats(
     current_user: Annotated[models.User, Depends(get_current_user)],
