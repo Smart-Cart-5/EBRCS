@@ -14,8 +14,8 @@ REM  - Change values here without touching system env
 REM ============================================================
 
 REM Data dir
-REM You said 1536-dim embeddings/labels are in repo_root\data2, so keep DATA_DIR as data2.
-set "DATA_DIR=%REPO_ROOT%\data2"
+REM You said 1536-dim embeddings/labels are in repo_root\data, so keep DATA_DIR as data2.
+set "DATA_DIR=%REPO_ROOT%\data"
 
 REM Core modes:
 set "EVENT_MODE=false"
