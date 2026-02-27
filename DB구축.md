@@ -11,9 +11,11 @@
 
 | 테이블 | 설명 |
 |---|---|
-| `products` | 상품 목록 (267개) |
-| `product_prices` | 상품 가격 (178개) |
-| `product_discounts` | 할인 정보 (177개) |
+| `products` | 상품 목록 |
+| `product_prices` | 상품 가격 |
+| `product_discounts` | 할인 정보 |
+| `store_corners` | 매장 코너 레이아웃 |
+| `category_corner_map` | 카테고리 → 코너 매핑 |
 | `users` | 사용자 계정 (smoke test 계정 제외) |
 | `purchase_history` | 구매 이력 |
 
@@ -144,8 +146,8 @@ cd app && ./setup_db.sh && cd ..
 
 | 스크립트 | 용도 |
 |---|---|
-| `db/export_full_seed.sh` | EC2 → 시드 파일로 전체 내보내기 |
-| `db/import_full_seed.sh` | 시드 파일 → 로컬 MySQL로 전체 가져오기 |
+| `db/export_full_seed.sh` | EC2 → 시드 파일로 전체 7개 테이블 내보내기 |
+| `db/import_full_seed.sh` | 시드 파일 → 로컬 MySQL로 전체 7개 테이블 가져오기 |
 | `db/start_local_mysql.sh` | Docker MySQL 컨테이너 시작 |
 | `db/stop_local_mysql.sh` | Docker MySQL 컨테이너 종료 |
 | `app/setup_db.sh` | DB 스키마 생성 (테이블 없으면 생성) |
