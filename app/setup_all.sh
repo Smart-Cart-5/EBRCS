@@ -25,6 +25,42 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+# ── Step 0: Docker Desktop 확인 및 설치 ──────────────────────────────────────
+echo "▶ Step 0: Checking Docker..."
+if ! command -v docker >/dev/null 2>&1; then
+    echo "  Docker not found."
+    if command -v brew >/dev/null 2>&1; then
+        echo "  Installing Docker Desktop via Homebrew..."
+        brew install --cask docker
+    else
+        echo "  ❌ Homebrew not found. Please install Docker Desktop manually:"
+        echo "     https://www.docker.com/products/docker-desktop/"
+        exit 1
+    fi
+fi
+
+# Docker Desktop이 설치됐지만 데몬이 안 켜져 있으면 자동 시작
+if ! docker info >/dev/null 2>&1; then
+    echo "  Docker daemon not running. Starting Docker Desktop..."
+    open -a Docker 2>/dev/null || true
+    echo "  Waiting for Docker daemon (up to 60s)..."
+    for i in $(seq 1 30); do
+        if docker info >/dev/null 2>&1; then
+            echo "  ✅ Docker daemon is ready."
+            break
+        fi
+        sleep 2
+        if [ "$i" -eq 30 ]; then
+            echo "  ❌ Docker daemon did not start in time."
+            echo "     Please start Docker Desktop manually and re-run."
+            exit 1
+        fi
+    done
+else
+    echo "  ✅ Docker is running."
+fi
+echo ""
+
 # ── Step 1: 로컬 Docker MySQL 기동 + 스키마 + 시드 ────────────────────────────
 if [ "$SKIP_DB" = "false" ]; then
     echo "▶ Step 1/3: Setting up local Docker MySQL..."

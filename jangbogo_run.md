@@ -10,30 +10,26 @@
 |------|------|----------|
 | Python | 3.11+ | `python3 --version` |
 | Node.js | 20.19.0+ | `node --version` |
-| Docker Desktop | 최신 | `docker --version` |
 | Git | 2.0+ | `git --version` |
 
-> Docker Desktop이 **실행 중**이어야 합니다 (MySQL 컨테이너 기동에 필요).
+> **Docker Desktop**은 `setup_all` 스크립트가 자동으로 설치하고 기동합니다.
+> - macOS: Homebrew(`brew`)가 필요합니다. 없으면 [brew.sh](https://brew.sh) 먼저 설치.
+> - Windows: `winget`이 필요합니다 (Windows 10 1709+ 기본 포함).
 
 ---
 
 ## 0단계 — data 파일 준비 (필수)
 
-서버 시작 전 아래 파일이 프로젝트 루트 `data/` 폴더에 있어야 합니다.
+아래 파일들은 팀원에게 전달받아 프로젝트 루트 `data/` 폴더에 넣어주세요.
 
-| 파일 | 필수 여부 | 확보 방법 |
-|------|---------|----------|
-| `embeddings.npy` | **필수** | 팀원에게 수령 |
-| `labels.npy` | **필수** | 팀원에게 수령 |
-| `adapter_model.safetensors` | 선택 | 팀원에게 수령 (없으면 기본 DINO로 동작) |
-| `adapter_config.json` | 자동 | Git에 포함됨 |
-| `faiss_index.bin` | 자동 | 서버 시작 시 자동 생성 |
+| 파일 | 설명 |
+|------|------|
+| `embeddings.npy` | 상품 임베딩 DB (필수) |
+| `labels.npy` | 상품 라벨 (필수) |
+| `adapter_model.safetensors` | LoRA 가중치 (선택, 없으면 기본 DINO로 동작) |
+| `db/seeds/full_seed_latest.sql.gz` | DB 시드 데이터 (필수) |
 
-```bash
-# EC2에서 복사하는 경우
-scp -i your-key.pem ubuntu@<EC2_IP>:~/ebrcs_streaming/data/embeddings.npy data/
-scp -i your-key.pem ubuntu@<EC2_IP>:~/ebrcs_streaming/data/labels.npy data/
-```
+> `adapter_config.json`과 `faiss_index.bin`은 자동 처리됩니다 (Git 포함 / 서버 시작 시 자동 생성).
 
 ---
 
